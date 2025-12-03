@@ -59,6 +59,8 @@ struct JsFullGame {
     world_bounds: Option<JsWorldBounds>,
     #[serde(default)]
     clock: Option<JsClock>,
+    #[serde(default)]
+    variant: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -249,6 +251,7 @@ impl Engine {
             fullmove_number: 1,
             material_score: 0,
             game_rules,
+            variant: js_game.variant.clone(),
             hash: 0, // Will be computed below
             hash_stack: Vec::with_capacity(js_game.move_history.len().saturating_add(8)),
             null_moves: 0,
@@ -448,6 +451,7 @@ impl Engine {
         #[cfg(target_arch = "wasm32")]
         {
             use crate::log;
+            let variant = self.game.variant.as_deref().unwrap_or("unknown");
             if let Some(clock) = self.clock {
                 let side = match self.game.turn {
                     PlayerColor::White => "w",
@@ -455,13 +459,19 @@ impl Engine {
                     PlayerColor::Neutral => "n",
                 };
                 log(&format!(
-                    "info timealloc side {} wtime {} btime {} winc {} binc {} limit {}",
-                    side, clock.wtime, clock.btime, clock.winc, clock.binc, effective_limit
+                    "info timealloc side {} wtime {} btime {} winc {} binc {} limit {} variant {}",
+                    side,
+                    clock.wtime,
+                    clock.btime,
+                    clock.winc,
+                    clock.binc,
+                    effective_limit,
+                    variant
                 ));
             } else {
                 log(&format!(
-                    "info timealloc no_clock requested_limit {} effective_limit {}",
-                    time_limit_ms, effective_limit
+                    "info timealloc no_clock requested_limit {} effective_limit {} variant {}",
+                    time_limit_ms, effective_limit, variant
                 ));
             }
         }
