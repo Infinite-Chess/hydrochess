@@ -26,24 +26,24 @@ pub const DEFAULT_LMR_DIVISOR: usize = 3; // ln(moves) * ln(depth) / divisor
 
 // History Leaf Pruning (Fruit-style)
 pub const DEFAULT_HLP_MAX_DEPTH: usize = 3;
-pub const DEFAULT_HLP_MIN_MOVES: usize = 5;
+pub const DEFAULT_HLP_MIN_MOVES: usize = 4;
 pub const DEFAULT_HLP_HISTORY_REDUCE: i32 = 300;
 pub const DEFAULT_HLP_HISTORY_LEAF: i32 = 0;
 
 // Late Move Pruning thresholds by depth [0, 1, 2, 3, 4]
-pub const DEFAULT_LMP_THRESHOLD: [usize; 5] = [0, 4, 8, 12, 16];
+pub const DEFAULT_LMP_THRESHOLD: [usize; 5] = [0, 4, 7, 11, 16];
 
 // Aspiration Window
-pub const DEFAULT_ASPIRATION_WINDOW: i32 = 50;
+pub const DEFAULT_ASPIRATION_WINDOW: i32 = 45;
 pub const DEFAULT_ASPIRATION_FAIL_MULT: i32 = 4; // Window *= this on fail
 pub const DEFAULT_ASPIRATION_MAX_WINDOW: i32 = 1000;
 
 // Futility margins by depth [0, 1, 2, 3]
-pub const DEFAULT_FUTILITY_MARGIN: [i32; 4] = [0, 100, 200, 300];
+pub const DEFAULT_FUTILITY_MARGIN: [i32; 4] = [0, 95, 190, 285];
 
 // Reverse Futility Pruning
-pub const DEFAULT_RFP_MAX_DEPTH: usize = 3;
-pub const DEFAULT_RFP_MARGIN_PER_DEPTH: i32 = 120;
+pub const DEFAULT_RFP_MAX_DEPTH: usize = 4;
+pub const DEFAULT_RFP_MARGIN_PER_DEPTH: i32 = 105;
 
 // Internal Iterative Reductions
 pub const DEFAULT_IIR_MIN_DEPTH: usize = 4;
@@ -58,7 +58,7 @@ pub const DEFAULT_SORT_KILLER2: i32 = 800000;
 pub const DEFAULT_SORT_COUNTERMOVE: i32 = 600000;
 
 // SEE threshold for "winning" captures
-pub const DEFAULT_SEE_WINNING_THRESHOLD: i32 = -90;
+pub const DEFAULT_SEE_WINNING_THRESHOLD: i32 = -80;
 
 // History heuristic
 pub const DEFAULT_MAX_HISTORY: i32 = 4000;
@@ -76,7 +76,7 @@ pub const DEFAULT_CAPTURE_HISTORY_DIVISOR: i32 = 10;
 pub const DEFAULT_REPETITION_PENALTY: i32 = 8;
 
 // Quiescence
-pub const DEFAULT_DELTA_MARGIN: i32 = 200;
+pub const DEFAULT_DELTA_MARGIN: i32 = 180;
 
 // Time management
 pub const DEFAULT_STABILITY_FACTOR_BASE: f64 = 1.1;

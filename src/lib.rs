@@ -89,6 +89,17 @@ pub struct JsMoveWithEval {
     pub eval: i32, // centipawn score from side-to-move's perspective
 }
 
+/// A single PV line for MultiPV output
+#[derive(Serialize, Deserialize)]
+pub struct JsPVLine {
+    pub from: String, // "x,y"
+    pub to: String,   // "x,y"
+    pub promotion: Option<String>,
+    pub eval: i32,       // centipawn score from side-to-move's perspective
+    pub depth: usize,    // depth searched
+    pub pv: Vec<String>, // full PV as array of "x,y->x,y" strings
+}
+
 #[derive(Deserialize)]
 struct JsFullGame {
     board: JsBoard,
@@ -617,6 +628,57 @@ impl Engine {
         } else {
             JsValue::NULL
         }
+    }
+
+    /// MultiPV-enabled timed search. Returns an array of PV lines (best moves with their
+    /// evaluations and full PVs).
+    ///
+    /// Parameters:
+    /// - `time_limit_ms`: Maximum time to think in milliseconds
+    /// - `multi_pv`: Number of best moves to return (default 1). Must be >= 1.
+    /// - `silent`: If true, suppress info output during search
+    ///
+    /// When `multi_pv` is 1, this has zero overhead compared to `get_best_move_with_time`.
+    /// For `multi_pv` > 1, subsequent PV lines are found by re-searching the position
+    /// with previously found best moves excluded.
+    #[wasm_bindgen]
+    pub fn get_best_moves_multipv(
+        &mut self,
+        time_limit_ms: u32,
+        multi_pv: Option<usize>,
+        silent: Option<bool>,
+    ) -> JsValue {
+        let effective_limit = self.effective_time_limit_ms(time_limit_ms);
+        let silent = silent.unwrap_or(false);
+        let multi_pv = multi_pv.unwrap_or(1).max(1);
+
+        let result =
+            search::get_best_moves_multipv(&mut self.game, 50, effective_limit, multi_pv, silent);
+
+        // Convert to JS-friendly format
+        let js_lines: Vec<JsPVLine> = result
+            .lines
+            .iter()
+            .map(|line| {
+                // Format PV as array of "x,y->x,y" strings
+                let pv_strings: Vec<String> = line
+                    .pv
+                    .iter()
+                    .map(|m| format!("{},{}->{},{}", m.from.x, m.from.y, m.to.x, m.to.y))
+                    .collect();
+
+                JsPVLine {
+                    from: format!("{},{}", line.mv.from.x, line.mv.from.y),
+                    to: format!("{},{}", line.mv.to.x, line.mv.to.y),
+                    promotion: line.mv.promotion.map(|p| p.to_str().to_string()),
+                    eval: line.score,
+                    depth: line.depth,
+                    pv: pv_strings,
+                }
+            })
+            .collect();
+
+        serde_wasm_bindgen::to_value(&js_lines).unwrap_or(JsValue::NULL)
     }
 
     pub fn perft(&mut self, depth: usize) -> u64 {
