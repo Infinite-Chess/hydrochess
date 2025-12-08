@@ -77,12 +77,7 @@ impl PlayerColor {
     /// Convert from u8
     #[inline]
     pub fn from_u8(v: u8) -> Self {
-        match v {
-            0 => PlayerColor::Neutral,
-            1 => PlayerColor::White,
-            2 => PlayerColor::Black,
-            _ => PlayerColor::Neutral,
-        }
+        unsafe { std::mem::transmute(v) }
     }
 }
 
@@ -215,11 +210,7 @@ impl PieceType {
     /// Convert from u8
     #[inline]
     pub fn from_u8(v: u8) -> Self {
-        if v < NUM_PIECE_TYPES {
-            unsafe { std::mem::transmute(v) }
-        } else {
-            PieceType::Void
-        }
+        unsafe { std::mem::transmute(v) }
     }
 }
 

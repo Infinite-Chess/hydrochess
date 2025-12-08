@@ -265,7 +265,7 @@ impl Searcher {
             time_limit_ms,
             stopped: false,
             seldepth: 0,
-            tt: TranspositionTable::new(64),
+            tt: TranspositionTable::new(32),
             pv_table,
             pv_length: vec![0; MAX_PLY],
             killers,

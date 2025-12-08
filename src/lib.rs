@@ -404,20 +404,20 @@ impl Engine {
 
     pub fn get_best_move(&mut self) -> JsValue {
         // console log all legal moves in the position
-        let moves = self.game.get_legal_moves();
-        for m in &moves {
-            let piece_code = m.piece.piece_type().to_str();
-            let color_code = m.piece.color().to_str();
-            let promo_part = match m.promotion {
-                Some(p) => format!(" promo={}", p.to_str()),
-                None => String::new(),
-            };
-            let line = format!(
-                "{}{}: ({},{}) -> ({},{}){}",
-                color_code, piece_code, m.from.x, m.from.y, m.to.x, m.to.y, promo_part,
-            );
-            web_sys::console::debug_1(&JsValue::from(line));
-        }
+        // let moves = self.game.get_legal_moves();
+        // for m in &moves {
+        //     let piece_code = m.piece.piece_type().to_str();
+        //     let color_code = m.piece.color().to_str();
+        //     let promo_part = match m.promotion {
+        //         Some(p) => format!(" promo={}", p.to_str()),
+        //         None => String::new(),
+        //     };
+        //     let line = format!(
+        //         "{}{}: ({},{}) -> ({},{}){}",
+        //         color_code, piece_code, m.from.x, m.from.y, m.to.x, m.to.y, promo_part,
+        //     );
+        //     web_sys::console::debug_1(&JsValue::from(line));
+        // }
         if let Some((best_move, _eval, _stats)) =
             search::get_best_move(&mut self.game, 50, u128::MAX, false)
         {
@@ -563,6 +563,22 @@ impl Engine {
     pub fn get_best_move_with_time(&mut self, time_limit_ms: u32, silent: Option<bool>) -> JsValue {
         let effective_limit = self.effective_time_limit_ms(time_limit_ms);
         let silent = silent.unwrap_or(false);
+
+        // console log all legal moves in the position
+        // let moves = self.game.get_legal_moves();
+        // for m in &moves {
+        //     let piece_code = m.piece.piece_type().to_str();
+        //     let color_code = m.piece.color().to_str();
+        //     let promo_part = match m.promotion {
+        //         Some(p) => format!(" promo={}", p.to_str()),
+        //         None => String::new(),
+        //     };
+        //     let line = format!(
+        //         "{}{}: ({},{}) -> ({},{}){}",
+        //         color_code, piece_code, m.from.x, m.from.y, m.to.x, m.to.y, promo_part,
+        //     );
+        //     web_sys::console::debug_1(&JsValue::from(line));
+        // }
 
         // Snapshot TT stats *before* starting the timed search so logs reflect the
         // state at the beginning of the move.
