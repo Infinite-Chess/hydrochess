@@ -1,0 +1,51 @@
+name: Build & Release WASM Engine
+
+# Run this when code is pushed to the main branch
+on:
+  push:
+    branches: [ "main" ]
+  # Also allow clicking a button to run manually
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Build WASM (Web Target)
+        # Use identical flags in the hydrochess code
+        run: wasm-pack build --target web
+
+      # Force the 'nightly' tag to point to this commit, otherwise the release might be attached to an old version of the code.
+      - name: Update Nightly Tag
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git tag -f nightly
+          git push origin nightly --force
+
+      - name: Update Nightly Release
+        uses: softprops/action-gh-release@v1
+        with:
+          # Update the same "nightly" tag every time so the URL stays constant
+          tag_name: nightly
+          name: Nightly Build (Latest)
+          draft: false
+          prerelease: false
+          files: |
+            pkg/hydrochess_wasm_bg.wasm
+            pkg/hydrochess_wasm.js
