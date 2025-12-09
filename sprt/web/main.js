@@ -9,6 +9,7 @@ const sprtBoundsPreset = document.getElementById('sprtBoundsPreset');
 const sprtBoundsMode = document.getElementById('sprtBoundsMode');
 const sprtAlphaEl = document.getElementById('sprtAlpha');
 const sprtBetaEl = document.getElementById('sprtBeta');
+const sprtTcMode = document.getElementById('sprtTcMode');
 const sprtTimeControlEl = document.getElementById('sprtTimeControl');
 const sprtConcurrencyEl = document.getElementById('sprtConcurrency');
 const sprtMinGames = document.getElementById('sprtMinGames');
@@ -319,7 +320,7 @@ function generateICNFromWorkerLog(workerLog, gameIndex, result, newPlaysWhite, e
     const whiteEngine = newPlaysWhite ? 'HydroChess New' : 'HydroChess Old';
     const blackEngine = newPlaysWhite ? 'HydroChess Old' : 'HydroChess New';
 
-    const displayVariantName = (variantName || 'Classical').replace(/_/g, ' ');
+    const displayVariantName = variantName || 'Classical';
 
     const headerList = [
         `[Event "SPRT Test Game ${gameIndex}"]`,
@@ -404,9 +405,19 @@ function generateICNFromWorkerLog(workerLog, gameIndex, result, newPlaysWhite, e
     const moves = lines.map((line) => {
         const idx = line.indexOf(':');
         if (idx === -1) return '';
-        const rest = line.slice(idx + 1).trim(); // "x,y>u,v" or with promotion
-        // Strip any leading piece info if ever added; currently we only have coords
-        return rest.replace(/\s+/g, '');
+        const raw = line.slice(idx + 1).trim();
+
+        // Handle comments like {[%clk ...]}; extract them so we don't strip spaces inside
+        const commentIdx = raw.indexOf('{');
+        let movePart = raw;
+        let commentPart = '';
+        if (commentIdx !== -1) {
+            movePart = raw.slice(0, commentIdx);
+            commentPart = raw.slice(commentIdx); // Keep spaces inside comment
+        }
+
+        // Strip any leading piece info/spaces from move part
+        return movePart.replace(/\s+/g, '') + commentPart;
     }).filter(Boolean);
 
     const movesStr = moves.join('|');
@@ -478,6 +489,60 @@ function parseTimeControl(str) {
     const baseMs = Math.round(baseSec * 1000);
     const incMs = Math.round(incSec * 1000);
     return { baseSec, incSec, baseMs, incMs, tcString: raw };
+}
+
+function getTcParams(mode, valStr, pairIndex) {
+    if (mode === 'smart_mix') {
+        // Deterministic pseudo-random based on pairIndex so pairs match
+        const r = (pairIndex * 137 + 13) % 100;
+        if (r < 40) { // 40% Standard
+            const opts = ['10+0.1', '5+0.05', '1+0.02', '3+0.03', '60+0.5'];
+            const pick = opts[pairIndex % opts.length];
+            return getTcParams('standard', pick, pairIndex);
+        } else if (r < 70) { // 30% Fixed Time
+            const opts = ['0.1', '0.25', '0.5', '1.0', '2.0'];
+            const pick = opts[pairIndex % opts.length];
+            return getTcParams('fixed_time', pick, pairIndex);
+        } else { // 30% Fixed Depth
+            const opts = ['4', '5', '6', '7', '8'];
+            const pick = opts[pairIndex % opts.length];
+            return getTcParams('fixed_depth', pick, pairIndex);
+        }
+    }
+
+    if (mode === 'fixed_depth') {
+        const depth = parseInt(valStr, 10) || 6;
+        return {
+            timePerMove: 0,
+            baseTimeMs: 0,
+            incrementMs: 0,
+            maxDepth: depth,
+            tcString: `depth ${depth}`
+        };
+    }
+
+    if (mode === 'fixed_time') {
+        const sec = parseFloat(valStr) || 1.0;
+        const ms = Math.round(sec * 1000);
+        return {
+            timePerMove: ms,
+            baseTimeMs: 0,
+            incrementMs: 0,
+            maxDepth: null,
+            tcString: `fixed ${sec}s`
+        };
+    }
+
+    // Standard
+    const parsed = parseTimeControl(valStr) || { baseMs: 10000, incMs: 100, tcString: '10+0.1' };
+    const perMoveEstimate = Math.max(10, Math.round(((parsed.baseSec / 20) + (parsed.incSec / 2)) * 1000));
+    return {
+        timePerMove: perMoveEstimate, // Used for estimation/fallback
+        baseTimeMs: parsed.baseMs,
+        incrementMs: parsed.incMs,
+        maxDepth: null,
+        tcString: parsed.tcString
+    };
 }
 
 function calculateLLR(wins, losses, draws, elo0, elo1) {
@@ -667,6 +732,7 @@ async function runSprt() {
     CONFIG.boundsMode = sprtBoundsMode.value || 'gainer';
     CONFIG.alpha = parseFloat(sprtAlphaEl.value) || 0.05;
     CONFIG.beta = parseFloat(sprtBetaEl.value) || 0.05;
+    CONFIG.tcMode = document.getElementById('sprtTcMode').value;
     CONFIG.timeControl = (sprtTimeControlEl.value || '').trim() || '10+0.1';
 
     const rawConcurrency = (sprtConcurrencyEl.value || '').toString().trim();
@@ -690,15 +756,32 @@ async function runSprt() {
     if (CONFIG.maxGames % 2 !== 0) CONFIG.maxGames++;
 
     applyBoundsPreset();
-    const tc = parseTimeControl(CONFIG.timeControl);
-    if (!tc) {
-        log('Invalid time control: ' + CONFIG.timeControl + ' (expected base+inc in seconds)', 'error');
-        sprtRunning = false;
-        runSprtBtn.disabled = false;
-        stopSprtBtn.disabled = true;
-        return;
+    // Validate for Standard mode only, or basic check.
+    // If smart_mix, we ignore inputs essentially.
+    let displayTcString = CONFIG.timeControl;
+    let displayPerMoveMs = 0;
+
+    if (CONFIG.tcMode === 'standard') {
+        const tc = parseTimeControl(CONFIG.timeControl);
+        if (!tc) {
+            log('Invalid time control: ' + CONFIG.timeControl + ' (expected base+inc in seconds)', 'error');
+            sprtRunning = false;
+            runSprtBtn.disabled = false;
+            stopSprtBtn.disabled = true;
+            return;
+        }
+        displayTcString = tc.tcString;
+        displayPerMoveMs = Math.max(10, Math.round(((tc.baseSec / 20) + (tc.incSec / 2)) * 1000));
+    } else if (CONFIG.tcMode === 'smart_mix') {
+        displayTcString = 'Smart Mix';
+        displayPerMoveMs = 'Var';
+    } else {
+        // fixed time/depth
+        const p = getTcParams(CONFIG.tcMode, CONFIG.timeControl, 0);
+        displayTcString = p.tcString;
+        displayPerMoveMs = p.timePerMove || 0;
     }
-    const perMoveMs = Math.max(10, Math.round(((tc.baseSec / 20) + (tc.incSec / 2)) * 1000));
+    const timePerMove = displayPerMoveMs; // For info log only
     const bounds = calculateBounds(CONFIG.alpha, CONFIG.beta);
     // reset last stats snapshot for this run
     lastBounds = bounds;
@@ -708,7 +791,7 @@ async function runSprt() {
     lastElo = 0;
     lastEloError = 0;
     lastLLR = 0;
-    const timePerMove = perMoveMs;
+
     const maxGames = CONFIG.maxGames;
     const maxMovesPerGame = CONFIG.maxMoves;
 
@@ -723,7 +806,7 @@ async function runSprt() {
     clearLog();
     sprtStatusEl.textContent = 'Status: running...';
     sprtStatusEl.className = 'sprt-status';
-    log('Starting SPRT: ' + maxGames + ' games (' + (maxGames / 2) + ' pairs), TC=' + tc.tcString + ' (≈ ' + timePerMove + 'ms/move)', 'info');
+    log('Starting SPRT: ' + maxGames + ' games (' + (maxGames / 2) + ' pairs), Mode=' + CONFIG.tcMode + ', TC=' + displayTcString, 'info');
     sprtLog('SPRT Test Started (random openings, paired games)');
 
     const maxConcurrent = Math.max(1, CONFIG.concurrency | 0);
@@ -753,17 +836,20 @@ async function runSprt() {
         // Only use opening moves for Classical variant to avoid errors with custom positions
         const openingMove = variantName === 'Classical' ? getOpeningForPair(pairIndex) : null;
 
+        const tcParams = getTcParams(CONFIG.tcMode, CONFIG.timeControl, pairIndex);
+
         worker.postMessage({
             type: 'runGame',
             gameIndex,
-            timePerMove,
+            timePerMove: tcParams.timePerMove,
             maxMoves: maxMovesPerGame,
             newPlaysWhite,
             openingMove,
             materialThreshold: CONFIG.materialThreshold,
-            baseTimeMs: tc.baseMs,
-            incrementMs: tc.incMs,
-            timeControl: tc.tcString,
+            baseTimeMs: tcParams.baseTimeMs,
+            incrementMs: tcParams.incrementMs,
+            maxDepth: tcParams.maxDepth,
+            timeControl: tcParams.tcString,
             variantName, // Add variant to the message
         });
         return true;
@@ -893,7 +979,14 @@ async function runSprt() {
                     }
                 };
 
-                startWorker(worker, i);
+                worker.onerror = (e) => {
+                    activeWorkers--;
+                    resolve(undefined);
+                };
+
+                if (!startWorker(worker, i)) {
+                    resolve(undefined);
+                }
             });
         })
     );
@@ -1125,3 +1218,29 @@ initWasm();
 // Initially hide & disable games download until we have results
 downloadGamesBtn.disabled = true;
 downloadGamesBtn.style.display = 'none';
+
+/* UI Logic for TC Mode */
+if (typeof sprtTcMode !== 'undefined' && sprtTcMode) {
+    const sprtTcLabel = document.getElementById('sprtTcLabel');
+    // sprtTimeControlEl is already defined globally at top
+
+    sprtTcMode.addEventListener('change', () => {
+        const mode = sprtTcMode.value;
+        if (mode === 'standard') {
+            sprtTcLabel.textContent = 'Time Control (base+inc)';
+            if (!sprtTimeControlEl.value.includes('+')) sprtTimeControlEl.value = '10+0.1';
+            sprtTimeControlEl.disabled = false;
+        } else if (mode === 'fixed_time') {
+            sprtTcLabel.textContent = 'Fixed Time per Move (s)';
+            if (sprtTimeControlEl.value.includes('+') || !sprtTimeControlEl.value) sprtTimeControlEl.value = '0.15';
+            sprtTimeControlEl.disabled = false;
+        } else if (mode === 'fixed_depth') {
+            sprtTcLabel.textContent = 'Fixed Depth (ply)';
+            if (sprtTimeControlEl.value.includes('.') || sprtTimeControlEl.value.includes('+')) sprtTimeControlEl.value = '4';
+            sprtTimeControlEl.disabled = false;
+        } else if (mode === 'smart_mix') {
+            sprtTcLabel.textContent = 'Smart Mix (Config ignored)';
+            sprtTimeControlEl.disabled = true;
+        }
+    });
+}

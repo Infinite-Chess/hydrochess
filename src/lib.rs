@@ -86,7 +86,19 @@ pub struct JsMoveWithEval {
     pub from: String, // "x,y"
     pub to: String,   // "x,y"
     pub promotion: Option<String>,
-    pub eval: i32, // centipawn score from side-to-move's perspective
+    pub eval: i32,    // centipawn score from side-to-move's perspective
+    pub depth: usize, // depth reached
+}
+
+/// A single PV line for MultiPV output
+#[derive(Serialize, Deserialize)]
+pub struct JsPVLine {
+    pub from: String, // "x,y"
+    pub to: String,   // "x,y"
+    pub promotion: Option<String>,
+    pub eval: i32,       // centipawn score from side-to-move's perspective
+    pub depth: usize,    // depth searched
+    pub pv: Vec<String>, // full PV as array of "x,y->x,y" strings
 }
 
 #[derive(Deserialize)]
@@ -109,6 +121,9 @@ struct JsFullGame {
     clock: Option<JsClock>,
     #[serde(default)]
     variant: Option<String>,
+    /// Optional strength hint from the UI/JS side (1=Relaxed, 2=Standard, 3=Maximum).
+    #[serde(default)]
+    strength_level: Option<u32>,
 }
 
 #[derive(Deserialize, Default)]
@@ -183,6 +198,7 @@ struct JsEvalWithFeatures {
 pub struct Engine {
     game: GameState,
     clock: Option<JsClock>,
+    strength_level: Option<u32>,
 }
 
 #[wasm_bindgen]
@@ -387,26 +403,16 @@ impl Engine {
 
         // Optional clock information (similar to UCI wtime/btime/winc/binc).
         let clock = js_game.clock;
+        let strength_level = js_game.strength_level;
 
-        Ok(Engine { game, clock })
+        Ok(Engine {
+            game,
+            clock,
+            strength_level,
+        })
     }
 
     pub fn get_best_move(&mut self) -> JsValue {
-        // console log all legal moves in the position
-        let moves = self.game.get_legal_moves();
-        for m in &moves {
-            let piece_code = m.piece.piece_type().to_str();
-            let color_code = m.piece.color().to_str();
-            let promo_part = match m.promotion {
-                Some(p) => format!(" promo={}", p.to_str()),
-                None => String::new(),
-            };
-            let line = format!(
-                "{}{}: ({},{}) -> ({},{}){}",
-                color_code, piece_code, m.from.x, m.from.y, m.to.x, m.to.y, promo_part,
-            );
-            web_sys::console::debug_1(&JsValue::from(line));
-        }
         if let Some((best_move, _eval, _stats)) =
             search::get_best_move(&mut self.game, 50, u128::MAX, false)
         {
@@ -549,12 +555,22 @@ impl Engine {
     /// Timed search. This also exposes the search evaluation as an `eval` field alongside the move,
     /// so callers can reuse the same search for adjudication.
     #[wasm_bindgen]
-    pub fn get_best_move_with_time(&mut self, time_limit_ms: u32, silent: Option<bool>) -> JsValue {
-        let effective_limit = self.effective_time_limit_ms(time_limit_ms);
+    pub fn get_best_move_with_time(
+        &mut self,
+        time_limit_ms: u32,
+        silent: Option<bool>,
+        max_depth: Option<usize>,
+    ) -> JsValue {
+        let effective_limit = if time_limit_ms == 0 && max_depth.is_some() {
+            // If explicit depth is requested with 0 time, treat as infinite time (fixed depth search)
+            u128::MAX
+        } else {
+            self.effective_time_limit_ms(time_limit_ms)
+        };
         let silent = silent.unwrap_or(false);
+        let depth = max_depth.unwrap_or(50).max(1).min(50);
+        let strength = self.strength_level.unwrap_or(3).max(1).min(3);
 
-        // Snapshot TT stats *before* starting the timed search so logs reflect the
-        // state at the beginning of the move.
         #[allow(unused_variables)]
         let pre_stats = crate::search::get_current_tt_stats();
 
@@ -592,9 +608,10 @@ impl Engine {
                     ));
                 } else {
                     log(&format!(
-                        "info timealloc no_clock requested_limit {} effective_limit {} variant {} tt_cap {} tt_used {} tt_fill {}",
+                        "info timealloc no_clock requested_limit {} effective_limit {} max_depth {:?} variant {} tt_cap {} tt_used {} tt_fill {}",
                         time_limit_ms,
                         effective_limit,
+                        max_depth,
                         variant,
                         tt_cap,
                         tt_used,
@@ -604,19 +621,90 @@ impl Engine {
             }
         }
 
-        if let Some((best_move, eval, _stats)) =
-            search::get_best_move(&mut self.game, 50, effective_limit, silent)
-        {
-            let js_move = JsMoveWithEval {
-                from: format!("{},{}", best_move.from.x, best_move.from.y),
-                to: format!("{},{}", best_move.to.x, best_move.to.y),
-                promotion: best_move.promotion.map(|p| p.to_str().to_string()),
-                eval,
-            };
-            serde_wasm_bindgen::to_value(&js_move).unwrap()
+        // Choose search path based on strength level.
+        let (best_move, eval) = if strength == 3 {
+            if let Some((bm, ev, _stats)) =
+                search::get_best_move(&mut self.game, depth, effective_limit, silent)
+            {
+                (bm, ev)
+            } else {
+                return JsValue::NULL;
+            }
         } else {
-            JsValue::NULL
-        }
+            // Strength 1/2: run full search with deterministic noisy eval.
+            let noise_amp: i32 = if strength == 2 { 25 } else { 50 };
+            if let Some((bm, ev, _stats)) = search::get_best_move_with_noise(
+                &mut self.game,
+                depth,
+                effective_limit,
+                noise_amp,
+                silent,
+            ) {
+                (bm, ev)
+            } else {
+                return JsValue::NULL;
+            }
+        };
+
+        let js_move = JsMoveWithEval {
+            from: format!("{},{}", best_move.from.x, best_move.from.y),
+            to: format!("{},{}", best_move.to.x, best_move.to.y),
+            promotion: best_move.promotion.map(|p| p.to_str().to_string()),
+            eval,
+            depth,
+        };
+        serde_wasm_bindgen::to_value(&js_move).unwrap()
+    }
+
+    /// MultiPV-enabled timed search. Returns an array of PV lines (best moves with their
+    /// evaluations and full PVs).
+    ///
+    /// Parameters:
+    /// - `time_limit_ms`: Maximum time to think in milliseconds
+    /// - `multi_pv`: Number of best moves to return (default 1). Must be >= 1.
+    /// - `silent`: If true, suppress info output during search
+    ///
+    /// When `multi_pv` is 1, this has zero overhead compared to `get_best_move_with_time`.
+    /// For `multi_pv` > 1, subsequent PV lines are found by re-searching the position
+    /// with previously found best moves excluded.
+    #[wasm_bindgen]
+    pub fn get_best_moves_multipv(
+        &mut self,
+        time_limit_ms: u32,
+        multi_pv: Option<usize>,
+        silent: Option<bool>,
+    ) -> JsValue {
+        let effective_limit = self.effective_time_limit_ms(time_limit_ms);
+        let silent = silent.unwrap_or(false);
+        let multi_pv = multi_pv.unwrap_or(1).max(1);
+
+        let result =
+            search::get_best_moves_multipv(&mut self.game, 50, effective_limit, multi_pv, silent);
+
+        // Convert to JS-friendly format
+        let js_lines: Vec<JsPVLine> = result
+            .lines
+            .iter()
+            .map(|line| {
+                // Format PV as array of "x,y->x,y" strings
+                let pv_strings: Vec<String> = line
+                    .pv
+                    .iter()
+                    .map(|m| format!("{},{}->{},{}", m.from.x, m.from.y, m.to.x, m.to.y))
+                    .collect();
+
+                JsPVLine {
+                    from: format!("{},{}", line.mv.from.x, line.mv.from.y),
+                    to: format!("{},{}", line.mv.to.x, line.mv.to.y),
+                    promotion: line.mv.promotion.map(|p| p.to_str().to_string()),
+                    eval: line.score,
+                    depth: line.depth,
+                    pv: pv_strings,
+                }
+            })
+            .collect();
+
+        serde_wasm_bindgen::to_value(&js_lines).unwrap_or(JsValue::NULL)
     }
 
     pub fn perft(&mut self, depth: usize) -> u64 {

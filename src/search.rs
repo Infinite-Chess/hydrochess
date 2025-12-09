@@ -49,6 +49,9 @@ pub(crate) use see::static_exchange_eval_impl as static_exchange_eval;
 pub mod zobrist;
 pub use zobrist::{en_passant_key, piece_key, special_right_key, SIDE_KEY};
 
+mod noisy;
+pub use noisy::get_best_move_with_noise;
+
 /// Timer abstraction to handle platform differences
 #[derive(Clone)]
 pub struct Timer {
@@ -96,10 +99,27 @@ impl Timer {
 }
 
 /// Lightweight statistics about the transposition table after a search.
+#[derive(Clone, Debug)]
 pub struct SearchStats {
     pub tt_capacity: usize,
     pub tt_used: usize,
     pub tt_fill_permille: u32,
+}
+
+/// A single PV line with its score and depth.
+#[derive(Clone, Debug)]
+pub struct PVLine {
+    pub mv: Move,
+    pub score: i32,
+    pub depth: usize,
+    pub pv: Vec<Move>,
+}
+
+/// Result of a MultiPV search.
+#[derive(Clone, Debug)]
+pub struct MultiPVResult {
+    pub lines: Vec<PVLine>,
+    pub stats: SearchStats,
 }
 
 thread_local! {
@@ -214,6 +234,10 @@ pub struct Searcher {
     // Continuation history: [prev_piece_type][prev_to_hash][cur_from_hash][cur_to_hash]
     // Using smaller dimensions (16*32*32*32*4 = 2MB) to fit in WASM memory
     pub cont_history: Vec<[[[i32; 32]; 32]; 32]>,
+
+    // MultiPV: moves to exclude from root search (for finding 2nd, 3rd, etc. best moves)
+    // Stored as (from_x, from_y, to_x, to_y) tuples for fast comparison without cloning
+    pub excluded_moves: Vec<(i64, i64, i64, i64)>,
 }
 
 impl Searcher {
@@ -244,7 +268,7 @@ impl Searcher {
             time_limit_ms,
             stopped: false,
             seldepth: 0,
-            tt: TranspositionTable::new(64),
+            tt: TranspositionTable::new(32),
             pv_table,
             pv_length: vec![0; MAX_PLY],
             killers,
@@ -260,6 +284,7 @@ impl Searcher {
             move_history: vec![None; MAX_PLY],
             moved_piece_history: vec![0; MAX_PLY],
             cont_history: vec![[[[0i32; 32]; 32]; 32]; 16],
+            excluded_moves: Vec::new(),
         }
     }
 
@@ -340,8 +365,13 @@ impl Searcher {
         pv_str
     }
 
-    /// Print UCI-style info string
+    /// Print UCI-style info string with optional MultiPV index
     pub fn print_info(&self, depth: usize, score: i32) {
+        self.print_info_multipv(depth, score, 1);
+    }
+
+    /// Print UCI-style info string with MultiPV index
+    pub fn print_info_multipv(&self, depth: usize, score: i32, multipv: usize) {
         let time_ms = self.timer.elapsed_ms();
         let nps = if time_ms > 0 {
             (self.nodes as u128 * 1000) / time_ms
@@ -368,33 +398,65 @@ impl Searcher {
         #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
         {
             use crate::log;
-            log(&format!(
-                "info depth {} seldepth {} score {} nodes {} qnodes {} nps {} time {} hashfull {} pv {}",
-                depth,
-                self.seldepth,
-                score_str,
-                self.nodes,
-                self.qnodes,
-                nps,
-                time_ms,
-                tt_fill,
-                pv
-            ));
+            if multipv > 1 {
+                log(&format!(
+                    "info depth {} seldepth {} multipv {} score {} nodes {} qnodes {} nps {} time {} hashfull {} pv {}",
+                    depth,
+                    self.seldepth,
+                    multipv,
+                    score_str,
+                    self.nodes,
+                    self.qnodes,
+                    nps,
+                    time_ms,
+                    tt_fill,
+                    pv
+                ));
+            } else {
+                log(&format!(
+                    "info depth {} seldepth {} score {} nodes {} qnodes {} nps {} time {} hashfull {} pv {}",
+                    depth,
+                    self.seldepth,
+                    score_str,
+                    self.nodes,
+                    self.qnodes,
+                    nps,
+                    time_ms,
+                    tt_fill,
+                    pv
+                ));
+            }
         }
         #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
         {
-            eprintln!(
-                "info depth {} seldepth {} score {} nodes {} qnodes {} nps {} time {} hashfull {} pv {}",
-                depth,
-                self.seldepth,
-                score_str,
-                self.nodes,
-                self.qnodes,
-                nps,
-                time_ms,
-                tt_fill,
-                pv
-            );
+            if multipv > 1 {
+                eprintln!(
+                    "info depth {} seldepth {} multipv {} score {} nodes {} qnodes {} nps {} time {} hashfull {} pv {}",
+                    depth,
+                    self.seldepth,
+                    multipv,
+                    score_str,
+                    self.nodes,
+                    self.qnodes,
+                    nps,
+                    time_ms,
+                    tt_fill,
+                    pv
+                );
+            } else {
+                eprintln!(
+                    "info depth {} seldepth {} score {} nodes {} qnodes {} nps {} time {} hashfull {} pv {}",
+                    depth,
+                    self.seldepth,
+                    score_str,
+                    self.nodes,
+                    self.qnodes,
+                    nps,
+                    time_ms,
+                    tt_fill,
+                    pv
+                );
+            }
         }
     }
 }
@@ -595,6 +657,284 @@ pub fn get_best_move(
     result.map(|(m, eval)| (m, eval, stats))
 }
 
+/// MultiPV-enabled search that returns up to `multi_pv` best moves with their evaluations.
+///
+/// When `multi_pv` is 1, this has zero overhead - it's equivalent to `get_best_move`.
+/// For `multi_pv` > 1, at each depth all root moves are searched and the top N are returned.
+pub fn get_best_moves_multipv(
+    game: &mut GameState,
+    max_depth: usize,
+    time_limit_ms: u128,
+    multi_pv: usize,
+    silent: bool,
+) -> MultiPVResult {
+    // Ensure fast per-color piece counts are in sync with the board
+    game.recompute_piece_counts();
+
+    let multi_pv = multi_pv.max(1);
+
+    // MultiPV = 1: Zero overhead path - just do normal search
+    if multi_pv == 1 {
+        let mut searcher = Searcher::new(time_limit_ms);
+        searcher.time_limit_ms = time_limit_ms;
+        searcher.silent = silent;
+
+        let mut lines: Vec<PVLine> = Vec::with_capacity(1);
+        if let Some((best_move, score)) = search_with_searcher(&mut searcher, game, max_depth) {
+            let pv = extract_pv(&searcher);
+            let depth = max_depth.min(searcher.seldepth.max(1));
+            lines.push(PVLine {
+                mv: best_move,
+                score,
+                depth,
+                pv,
+            });
+        }
+        let stats = build_search_stats(&searcher);
+        return MultiPVResult { lines, stats };
+    }
+
+    // MultiPV > 1: Search with special root handling to collect multiple best moves
+    let mut searcher = Searcher::new(time_limit_ms);
+    searcher.time_limit_ms = time_limit_ms;
+    searcher.silent = silent;
+
+    // Get all legal moves upfront
+    let moves = game.get_legal_moves();
+    if moves.is_empty() {
+        let stats = build_search_stats(&searcher);
+        return MultiPVResult {
+            lines: Vec::new(),
+            stats,
+        };
+    }
+
+    // If only one move, return it immediately
+    if moves.len() == 1 {
+        let single = moves[0].clone();
+        let score = crate::evaluation::evaluate(game);
+        let stats = build_search_stats(&searcher);
+        return MultiPVResult {
+            lines: vec![PVLine {
+                mv: single,
+                score,
+                depth: 0,
+                pv: Vec::new(),
+            }],
+            stats,
+        };
+    }
+
+    // Find legal moves only (filter pseudo-legal)
+    let mut legal_root_moves: Vec<Move> = Vec::with_capacity(moves.len());
+    for m in &moves {
+        let undo = game.make_move(m);
+        let legal = !game.is_move_illegal();
+        game.undo_move(m, undo);
+        if legal {
+            legal_root_moves.push(m.clone());
+        }
+    }
+
+    if legal_root_moves.is_empty() {
+        let stats = build_search_stats(&searcher);
+        return MultiPVResult {
+            lines: Vec::new(),
+            stats,
+        };
+    }
+
+    // Cap multi_pv at number of legal moves
+    let multi_pv = multi_pv.min(legal_root_moves.len());
+
+    // Store (move, score, pv) for each root move at current depth
+    let mut root_scores: Vec<(Move, i32, Vec<Move>)> = Vec::with_capacity(legal_root_moves.len());
+    let mut best_lines: Vec<PVLine> = Vec::with_capacity(multi_pv);
+
+    // Iterative deepening
+    for depth in 1..=max_depth {
+        searcher.reset_for_iteration();
+        searcher.decay_history();
+
+        // Time check at start of each iteration
+        if searcher.timer.elapsed_ms() >= searcher.time_limit_ms {
+            searcher.stopped = true;
+            break;
+        }
+
+        root_scores.clear();
+
+        // Search each root move
+        for (move_idx, m) in legal_root_moves.iter().enumerate() {
+            if searcher.stopped {
+                break;
+            }
+
+            let undo = game.make_move(m);
+
+            // Set up prev move info for child search
+            let prev_from_hash = hash_move_from(m);
+            let prev_to_hash = hash_move_dest(m);
+            searcher.prev_move_stack[0] = (prev_from_hash, prev_to_hash);
+
+            // For MultiPV, we need to search all moves to get their scores.
+            // First move gets full window, subsequent moves use PVS.
+            let score = if move_idx == 0 {
+                -negamax(&mut searcher, game, depth - 1, 1, -INFINITY, INFINITY, true)
+            } else {
+                // Use PVS for efficiency, but we need to re-search with full window
+                // if the move might be in the top-N
+                let alpha = if root_scores.len() >= multi_pv {
+                    // We already have enough candidates; use the worst score as lower bound
+                    root_scores
+                        .iter()
+                        .map(|(_, s, _)| *s)
+                        .min()
+                        .unwrap_or(-INFINITY)
+                } else {
+                    -INFINITY
+                };
+
+                let mut s = -negamax(&mut searcher, game, depth - 1, 1, -alpha - 1, -alpha, true);
+                if s > alpha && !searcher.stopped {
+                    // Re-search with full window to get accurate score
+                    s = -negamax(&mut searcher, game, depth - 1, 1, -INFINITY, INFINITY, true);
+                }
+                s
+            };
+
+            game.undo_move(m, undo);
+
+            if !searcher.stopped {
+                // Extract PV for this move
+                let mut pv = Vec::with_capacity(searcher.pv_length[1] + 1);
+                pv.push(m.clone());
+                for i in 0..searcher.pv_length[1] {
+                    if let Some(ref pv_move) = searcher.pv_table[1][i] {
+                        pv.push(pv_move.clone());
+                    }
+                }
+                root_scores.push((m.clone(), score, pv));
+            }
+        }
+
+        if searcher.stopped && root_scores.is_empty() {
+            break;
+        }
+
+        // Sort by score descending
+        root_scores.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // Update best_lines with results from this depth
+        best_lines.clear();
+        for (idx, (mv, score, pv)) in root_scores.iter().take(multi_pv).enumerate() {
+            best_lines.push(PVLine {
+                mv: mv.clone(),
+                score: *score,
+                depth,
+                pv: pv.clone(),
+            });
+
+            // Print info for each PV line
+            if !silent && !searcher.stopped {
+                // Format PV string
+                let pv_str: String = pv
+                    .iter()
+                    .map(|m| format!("{},{}->{},{}", m.from.x, m.from.y, m.to.x, m.to.y))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+
+                let time_ms = searcher.timer.elapsed_ms();
+                let nps = if time_ms > 0 {
+                    (searcher.nodes as u128 * 1000) / time_ms
+                } else {
+                    0
+                };
+
+                let score_str = if *score > MATE_SCORE {
+                    let mate_in = (MATE_VALUE - score + 1) / 2;
+                    format!("mate {}", mate_in)
+                } else if *score < -MATE_SCORE {
+                    let mate_in = (MATE_VALUE + score + 1) / 2;
+                    format!("mate -{}", mate_in)
+                } else {
+                    format!("cp {}", score)
+                };
+
+                #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+                {
+                    use crate::log;
+                    log(&format!(
+                        "info depth {} seldepth {} multipv {} score {} nodes {} nps {} time {} pv {}",
+                        depth,
+                        searcher.seldepth,
+                        idx + 1,
+                        score_str,
+                        searcher.nodes,
+                        nps,
+                        time_ms,
+                        pv_str
+                    ));
+                }
+                #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
+                {
+                    eprintln!(
+                        "info depth {} seldepth {} multipv {} score {} nodes {} nps {} time {} pv {}",
+                        depth,
+                        searcher.seldepth,
+                        idx + 1,
+                        score_str,
+                        searcher.nodes,
+                        nps,
+                        time_ms,
+                        pv_str
+                    );
+                }
+            }
+        }
+
+        // Check for mate or time up
+        if searcher.stopped {
+            break;
+        }
+        if !best_lines.is_empty() && best_lines[0].score.abs() > MATE_SCORE {
+            break;
+        }
+
+        // Soft time limit check - don't start next iteration if past 50%
+        if searcher.time_limit_ms != u128::MAX {
+            let elapsed = searcher.timer.elapsed_ms();
+            if elapsed >= searcher.time_limit_ms / 2 {
+                break;
+            }
+        }
+    }
+
+    // Update PV table with best move for stats
+    if !best_lines.is_empty() {
+        searcher.pv_table[0][0] = Some(best_lines[0].mv.clone());
+        searcher.pv_length[0] = 1;
+    }
+
+    searcher.tt.increment_age();
+    let stats = build_search_stats(&searcher);
+    MultiPVResult {
+        lines: best_lines,
+        stats,
+    }
+}
+
+/// Extract the PV line from the searcher's PV table as a Vec<Move>.
+fn extract_pv(searcher: &Searcher) -> Vec<Move> {
+    let mut pv = Vec::with_capacity(searcher.pv_length[0]);
+    for i in 0..searcher.pv_length[0] {
+        if let Some(m) = &searcher.pv_table[0][i] {
+            pv.push(m.clone());
+        }
+    }
+    pv
+}
+
 pub fn negamax_node_count_for_depth(game: &mut GameState, depth: usize) -> u64 {
     // Ensure fast per-color piece counts are in sync with the board
     game.recompute_piece_counts();
@@ -644,6 +984,14 @@ fn negamax_root(
     let mut legal_moves = 0;
 
     for m in &moves {
+        // Skip excluded moves (for MultiPV subsequent passes)
+        if !searcher.excluded_moves.is_empty() {
+            let coords = (m.from.x, m.from.y, m.to.x, m.to.y);
+            if searcher.excluded_moves.contains(&coords) {
+                continue;
+            }
+        }
+
         let undo = game.make_move(m);
 
         // Check if move is illegal (leaves our king in check)

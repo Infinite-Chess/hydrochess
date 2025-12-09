@@ -32,12 +32,7 @@ pub enum TTFlag {
 impl TTFlag {
     #[inline]
     fn from_u8(v: u8) -> Self {
-        match v & 0b11 {
-            1 => TTFlag::Exact,
-            2 => TTFlag::LowerBound,
-            3 => TTFlag::UpperBound,
-            _ => TTFlag::None,
-        }
+        unsafe { std::mem::transmute(v & 0b11) }
     }
 }
 

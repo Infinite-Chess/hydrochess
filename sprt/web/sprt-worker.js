@@ -306,6 +306,18 @@ function nowMs() {
     return Date.now();
 }
 
+function formatClock(ms) {
+    const totalSeconds = Math.floor(Math.max(0, ms) / 1000);
+    const h = Math.floor(totalSeconds / 3600);
+    const m = Math.floor((totalSeconds % 3600) / 60);
+    const s = Math.floor(totalSeconds % 60);
+    const dec = Math.floor((Math.max(0, ms) % 1000) / 100);
+    const hStr = h.toString();
+    const mStr = m.toString().padStart(2, '0');
+    const sStr = s.toString().padStart(2, '0');
+    return `${hStr}:${mStr}:${sStr}.${dec}`;
+}
+
 async function ensureInit() {
     if (!wasmReady) {
         await initOld();
@@ -314,7 +326,7 @@ async function ensureInit() {
     }
 }
 
-async function playSingleGame(timePerMove, maxMoves, newPlaysWhite, openingMove, materialThreshold, baseTimeMs, incrementMs, timeControl, variantName = 'Classical') {
+async function playSingleGame(timePerMove, maxMoves, newPlaysWhite, openingMove, materialThreshold, baseTimeMs, incrementMs, timeControl, variantName = 'Classical', maxDepth) {
     const startPosition = getVariantPosition(variantName);
     let position = clonePosition(startPosition);
     const newColor = newPlaysWhite ? 'w' : 'b';
@@ -448,7 +460,7 @@ async function playSingleGame(timePerMove, maxMoves, newPlaysWhite, openingMove,
         let searchTimeMs = timePerMove;
         let flaggedOnTime = false;
         const engine = new EngineClass(gameInput);
-        const startMs = haveClocks ? nowMs() : 0;
+        const startMs = nowMs();
 
         // Safety check: if clock time is already zero or negative, flag timeout immediately
         if (haveClocks) {
@@ -468,10 +480,12 @@ async function playSingleGame(timePerMove, maxMoves, newPlaysWhite, openingMove,
             }
         }
 
-        const move = engine.get_best_move_with_time(haveClocks ? 0 : searchTimeMs, true);
+        const move = engine.get_best_move_with_time(haveClocks ? 0 : searchTimeMs, true, maxDepth);
         engine.free();
+
+        const elapsed = Math.max(0, Math.round(nowMs() - startMs));
+
         if (haveClocks) {
-            const elapsed = Math.max(0, Math.round(nowMs() - startMs));
             if (isWhiteTurn) {
                 let next = whiteClock - elapsed;
                 if (next < 0) {
@@ -618,8 +632,38 @@ async function playSingleGame(timePerMove, maxMoves, newPlaysWhite, openingMove,
             promotionSuffix = '=' + (sideToMove === 'w' ? siteCode.toUpperCase() : siteCode.toLowerCase());
         }
 
+        // Build move comment: [%clk] only if game clocks, [%eval], and depth text comment
+        let commands = '';
+        if (haveClocks) {
+            const clkMs = isWhiteTurn ? whiteClock : blackClock;
+            commands += `[%clk ${formatClock(clkMs)}]`;
+        }
+        // Add eval if available
+        if (typeof move.eval === 'number') {
+            if (commands) commands += ' ';
+            // If sideToMove is Black, negate the score so it's always from White's perspective.
+            let evalVal = move.eval;
+            if (sideToMove === 'b') {
+                evalVal = -evalVal;
+            }
+            const evalCp = (evalVal / 100).toFixed(2);
+            const evalStr = evalVal >= 0 ? `+${evalCp}` : evalCp;
+            commands += `[%eval ${evalStr}]`;
+        }
+        // Add depth as a text comment (not a command)
+        let textComment = '';
+        if (maxDepth) {
+            textComment = `depth ${maxDepth}`;
+        }
+        // Combine: commands first, then text comment
+        let comment = commands;
+        if (textComment) {
+            if (comment) comment += ' ';
+            comment += textComment;
+        }
+
         moveLines.push(
-            (sideToMove === 'w' ? 'W' : 'B') + ': ' + move.from + '>' + move.to + promotionSuffix
+            (sideToMove === 'w' ? 'W' : 'B') + ': ' + move.from + '>' + move.to + promotionSuffix + (comment ? '{' + comment + '}' : '')
         );
 
         // Track move history from the initial position for subsequent engine calls
@@ -675,7 +719,6 @@ async function playSingleGame(timePerMove, maxMoves, newPlaysWhite, openingMove,
 
 // Per-game timeout to prevent hangs
 const GAME_TIMEOUT_MS = 90000; // 90 seconds max per game
-
 function withTimeout(promise, ms, fallbackValue) {
     return Promise.race([
         promise,
@@ -699,6 +742,7 @@ self.onmessage = async (e) => {
                 msg.incrementMs,
                 msg.timeControl,
                 msg.variantName || 'Classical',
+                msg.maxDepth
             );
 
             // Timeout wrapper - treat timeout as draw

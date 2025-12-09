@@ -79,25 +79,68 @@ pub(crate) fn static_exchange_eval_impl(game: &GameState, m: &Move) -> i32 {
 
         // Helper for sliding moves (rook/bishop/queen-like) over the local
         // snapshot, checking that the ray to (tx, ty) is not blocked.
+        // IMPORTANT: We don't iterate step-by-step (would be O(distance)),
+        // instead we check if any piece lies strictly between p and the target.
         fn is_clear_ray(p: &PieceInfo, dx: i64, dy: i64, pieces: &[PieceInfo]) -> bool {
             let adx = dx.abs();
             let ady = dy.abs();
 
-            let (step_x, step_y, steps) = if dx == 0 {
-                (0, dy.signum(), ady)
-            } else if dy == 0 {
-                (dx.signum(), 0, adx)
-            } else if adx == ady {
-                (dx.signum(), dy.signum(), adx)
-            } else {
-                return false;
-            };
+            // Determine if this is a valid sliding direction
+            let is_ortho = (dx == 0 && dy != 0) || (dy == 0 && dx != 0);
+            let is_diag = adx == ady && adx != 0;
 
-            for s in 1..steps {
-                let ix = p.x + step_x * s;
-                let iy = p.y + step_y * s;
-                if find_piece_index(pieces, ix, iy).is_some() {
-                    return false;
+            if !is_ortho && !is_diag {
+                return false;
+            }
+
+            let target_x = p.x + dx;
+            let target_y = p.y + dy;
+
+            // Check if any piece lies strictly between p and target
+            for other in pieces.iter() {
+                if !other.alive {
+                    continue;
+                }
+                // Skip the target square itself
+                if other.x == target_x && other.y == target_y {
+                    continue;
+                }
+                // Skip the piece itself
+                if other.x == p.x && other.y == p.y {
+                    continue;
+                }
+
+                let odx = other.x - p.x;
+                let ody = other.y - p.y;
+
+                // Check if 'other' is on the same ray and strictly between p and target
+                if is_ortho {
+                    if dx == 0 {
+                        // Vertical ray
+                        if odx == 0 {
+                            let ody_abs = ody.abs();
+                            if ody.signum() == dy.signum() && ody_abs < ady {
+                                return false; // Blocker found
+                            }
+                        }
+                    } else {
+                        // Horizontal ray
+                        if ody == 0 {
+                            let odx_abs = odx.abs();
+                            if odx.signum() == dx.signum() && odx_abs < adx {
+                                return false; // Blocker found
+                            }
+                        }
+                    }
+                } else {
+                    // Diagonal ray
+                    if odx.abs() == ody.abs() && odx.abs() > 0 {
+                        if odx.signum() == dx.signum() && ody.signum() == dy.signum() {
+                            if odx.abs() < adx {
+                                return false; // Blocker found
+                            }
+                        }
+                    }
                 }
             }
             true
@@ -113,12 +156,8 @@ pub(crate) fn static_exchange_eval_impl(game: &GameState, m: &Move) -> i32 {
                 };
                 dy == dir && (dx == 1 || dx == -1)
             }
-            Knight => {
-                (adx == 1 && ady == 2) || (adx == 2 && ady == 1)
-            }
-            Bishop => {
-                adx == ady && adx != 0 && is_clear_ray(p, dx, dy, pieces)
-            }
+            Knight => (adx == 1 && ady == 2) || (adx == 2 && ady == 1),
+            Bishop => adx == ady && adx != 0 && is_clear_ray(p, dx, dy, pieces),
             Rook => {
                 ((dx == 0 && dy != 0) || (dy == 0 && dx != 0)) && is_clear_ray(p, dx, dy, pieces)
             }
@@ -135,53 +174,66 @@ pub(crate) fn static_exchange_eval_impl(game: &GameState, m: &Move) -> i32 {
             }
 
             // Leaper fairies
-            Giraffe => {
-                (adx == 1 && ady == 4) || (adx == 4 && ady == 1)
-            }
-            Camel => {
-                (adx == 1 && ady == 3) || (adx == 3 && ady == 1)
-            }
-            Zebra => {
-                (adx == 2 && ady == 3) || (adx == 3 && ady == 2)
-            }
+            Giraffe => (adx == 1 && ady == 4) || (adx == 4 && ady == 1),
+            Camel => (adx == 1 && ady == 3) || (adx == 3 && ady == 1),
+            Zebra => (adx == 2 && ady == 3) || (adx == 3 && ady == 2),
 
             // Compound pieces
             Amazon => {
                 // Queen + knight
-                ((dx == 0 || dy == 0 || adx == ady) && is_clear_ray(p, dx, dy, pieces)) ||
-                    ((adx == 1 && ady == 2) || (adx == 2 && ady == 1))
+                ((dx == 0 || dy == 0 || adx == ady) && is_clear_ray(p, dx, dy, pieces))
+                    || ((adx == 1 && ady == 2) || (adx == 2 && ady == 1))
             }
             Chancellor => {
                 // Rook + knight
-                (((dx == 0 && dy != 0) || (dy == 0 && dx != 0)) && is_clear_ray(p, dx, dy, pieces)) ||
-                    ((adx == 1 && ady == 2) || (adx == 2 && ady == 1))
+                (((dx == 0 && dy != 0) || (dy == 0 && dx != 0)) && is_clear_ray(p, dx, dy, pieces))
+                    || ((adx == 1 && ady == 2) || (adx == 2 && ady == 1))
             }
             Archbishop => {
                 // Bishop + knight
-                (adx == ady && adx != 0 && is_clear_ray(p, dx, dy, pieces)) ||
-                    ((adx == 1 && ady == 2) || (adx == 2 && ady == 1))
+                (adx == ady && adx != 0 && is_clear_ray(p, dx, dy, pieces))
+                    || ((adx == 1 && ady == 2) || (adx == 2 && ady == 1))
             }
             Centaur | RoyalCentaur => {
                 // King + knight
-                ((adx <= 1 && ady <= 1) && (dx != 0 || dy != 0)) ||
-                    ((adx == 1 && ady == 2) || (adx == 2 && ady == 1))
+                ((adx <= 1 && ady <= 1) && (dx != 0 || dy != 0))
+                    || ((adx == 1 && ady == 2) || (adx == 2 && ady == 1))
             }
 
             // Hawk: fixed leaper offsets (see is_square_attacked)
             Hawk => {
-                matches!((dx, dy),
-                    (2, 0) | (-2, 0) | (0, 2) | (0, -2) |
-                    (3, 0) | (-3, 0) | (0, 3) | (0, -3) |
-                    (2, 2) | (2, -2) | (-2, 2) | (-2, -2) |
-                    (3, 3) | (3, -3) | (-3, 3) | (-3, -3)
+                matches!(
+                    (dx, dy),
+                    (2, 0)
+                        | (-2, 0)
+                        | (0, 2)
+                        | (0, -2)
+                        | (3, 0)
+                        | (-3, 0)
+                        | (0, 3)
+                        | (0, -3)
+                        | (2, 2)
+                        | (2, -2)
+                        | (-2, 2)
+                        | (-2, -2)
+                        | (3, 3)
+                        | (3, -3)
+                        | (-3, 3)
+                        | (-3, -3)
                 )
             }
 
             // Knightrider: repeat knight vector in same direction; ignore blockers
             Knightrider => {
                 const DIRS: &[(i64, i64)] = &[
-                    (1, 2), (2, 1), (-1, 2), (-2, 1),
-                    (1, -2), (2, -1), (-1, -2), (-2, -1),
+                    (1, 2),
+                    (2, 1),
+                    (-1, 2),
+                    (-2, 1),
+                    (1, -2),
+                    (2, -1),
+                    (-1, -2),
+                    (-2, -1),
                 ];
                 for (bx, by) in DIRS {
                     if dx == *bx && dy == *by {
@@ -210,9 +262,7 @@ pub(crate) fn static_exchange_eval_impl(game: &GameState, m: &Move) -> i32 {
             }
 
             // Rose: approximate as a knight-like leaper for SEE purposes.
-            Rose => {
-                (adx == 1 && ady == 2) || (adx == 2 && ady == 1)
-            }
+            Rose => (adx == 1 && ady == 2) || (adx == 2 && ady == 1),
 
             // Neutral/blocking pieces do not attack in SEE
             Void | Obstacle => false,

@@ -452,7 +452,21 @@ impl GameState {
             &self.game_rules,
             &self.spatial_indices,
             out,
+            false,
         );
+
+        if out.is_empty() {
+            get_legal_moves_into(
+                &self.board,
+                self.turn,
+                &self.special_rights,
+                &self.en_passant,
+                &self.game_rules,
+                &self.spatial_indices,
+                out,
+                true,
+            );
+        }
     }
 
     pub fn get_evasion_moves_into(&self, out: &mut Vec<Move>) {
@@ -656,8 +670,9 @@ impl GameState {
             &king_sq,
             &self.special_rights,
             &self.en_passant,
-            Some(&self.spatial_indices),
+            &self.spatial_indices,
             &self.game_rules,
+            false,
         );
         out.extend(king_moves);
 
@@ -770,8 +785,9 @@ impl GameState {
                     &from,
                     &self.special_rights,
                     &self.en_passant,
-                    Some(&self.spatial_indices),
+                    &self.spatial_indices,
                     &self.game_rules,
+                    true,
                 );
                 for m in pseudo {
                     for target in &targets {
@@ -857,8 +873,9 @@ impl GameState {
                     &from,
                     &self.special_rights,
                     &self.en_passant,
-                    Some(&self.spatial_indices),
+                    &self.spatial_indices,
                     &self.game_rules,
+                    true,
                 );
                 for m in pseudo {
                     for target in &targets {
@@ -891,7 +908,7 @@ impl GameState {
                 };
                 if piece.color() == moved_color && piece.piece_type().is_royal() {
                     let pos = Coordinate::new(*x, *y);
-                    if is_square_attacked(&self.board, &pos, self.turn, Some(indices)) {
+                    if is_square_attacked(&self.board, &pos, self.turn, indices) {
                         return true;
                     }
                 }
@@ -900,7 +917,7 @@ impl GameState {
             for ((x, y), piece) in &self.board.pieces {
                 if piece.color() == moved_color && piece.piece_type().is_royal() {
                     let pos = Coordinate::new(*x, *y);
-                    if is_square_attacked(&self.board, &pos, self.turn, Some(indices)) {
+                    if is_square_attacked(&self.board, &pos, self.turn, indices) {
                         return true;
                     }
                 }
@@ -923,7 +940,7 @@ impl GameState {
                 };
                 if piece.color() == self.turn && piece.piece_type().is_royal() {
                     let pos = Coordinate::new(*x, *y);
-                    if is_square_attacked(&self.board, &pos, attacker_color, Some(indices)) {
+                    if is_square_attacked(&self.board, &pos, attacker_color, indices) {
                         return true;
                     }
                 }
@@ -932,7 +949,7 @@ impl GameState {
             for ((x, y), piece) in &self.board.pieces {
                 if piece.color() == self.turn && piece.piece_type().is_royal() {
                     let pos = Coordinate::new(*x, *y);
-                    if is_square_attacked(&self.board, &pos, attacker_color, Some(indices)) {
+                    if is_square_attacked(&self.board, &pos, attacker_color, indices) {
                         return true;
                     }
                 }
