@@ -49,6 +49,9 @@ pub(crate) use see::static_exchange_eval_impl as static_exchange_eval;
 pub mod zobrist;
 pub use zobrist::{en_passant_key, piece_key, special_right_key, SIDE_KEY};
 
+mod noisy;
+pub use noisy::get_best_move_with_noise;
+
 /// Timer abstraction to handle platform differences
 #[derive(Clone)]
 pub struct Timer {

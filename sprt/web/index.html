@@ -380,7 +380,17 @@
           </div>
 
           <div class="form-group">
-            <label>Time Control (base+inc in seconds)</label>
+            <label>TC Mode</label>
+            <select id="sprtTcMode">
+              <option value="standard">Standard (Base+Inc)</option>
+              <option value="fixed_time">Fixed Time/Move</option>
+              <option value="fixed_depth">Fixed Depth</option>
+              <option value="smart_mix">Smart Mix (Randomized)</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label id="sprtTcLabel">Time Control (s)</label>
             <input type="text" id="sprtTimeControl" value="10+0.1" />
           </div>
 
