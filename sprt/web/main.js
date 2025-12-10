@@ -15,7 +15,8 @@ const sprtConcurrencyEl = document.getElementById('sprtConcurrency');
 const sprtMinGames = document.getElementById('sprtMinGames');
 const sprtMaxGames = document.getElementById('sprtMaxGames');
 const sprtMaxMoves = document.getElementById('sprtMaxMoves');
-const sprtMaterialThresholdEl = document.getElementById('sprtMaterialThreshold');
+const sprtMaterialThresholdEl = document.getElementById('sprtMaterialAdjudication');
+const sprtSearchNoiseEl = document.getElementById('sprtSearchNoise');
 const sprtVariantsEl = document.getElementById('sprtVariants');
 const runSprtBtn = document.getElementById('runSprt');
 const stopSprtBtn = document.getElementById('stopSprt');
@@ -70,6 +71,7 @@ const CONFIG = {
     maxMoves: 200,
     concurrency: 1,
     materialThreshold: 1500,
+    searchNoise: 7,
 };
 
 const MAX_CONCURRENCY_STORAGE_KEY = 'sprtMaxSafeConcurrency';
@@ -749,6 +751,8 @@ async function runSprt() {
     {
         const mt = parseInt(sprtMaterialThresholdEl.value, 10);
         CONFIG.materialThreshold = Number.isFinite(mt) && mt >= 0 ? mt : 1500;
+        const noise = parseInt(sprtSearchNoiseEl.value, 10);
+        CONFIG.searchNoise = Number.isFinite(noise) && noise >= 0 ? noise : 7;
     }
 
     // Ensure min/max games are even (for game pairing)
@@ -834,6 +838,7 @@ async function runSprt() {
             maxMoves: maxMovesPerGame,
             newPlaysWhite,
             materialThreshold: CONFIG.materialThreshold,
+            searchNoise: CONFIG.searchNoise,
             baseTimeMs: tcParams.baseTimeMs,
             incrementMs: tcParams.incrementMs,
             maxDepth: tcParams.maxDepth,

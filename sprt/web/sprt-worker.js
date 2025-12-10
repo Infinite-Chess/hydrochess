@@ -326,7 +326,7 @@ async function ensureInit() {
     }
 }
 
-async function playSingleGame(timePerMove, maxMoves, newPlaysWhite, materialThreshold, baseTimeMs, incrementMs, timeControl, variantName = 'Classical', maxDepth) {
+async function playSingleGame(timePerMove, maxMoves, newPlaysWhite, materialThreshold, baseTimeMs, incrementMs, timeControl, variantName = 'Classical', maxDepth, searchNoise) {
     const startPosition = getVariantPosition(variantName);
     let position = clonePosition(startPosition);
     const newColor = newPlaysWhite ? 'w' : 'b';
@@ -340,7 +340,9 @@ async function playSingleGame(timePerMove, maxMoves, newPlaysWhite, materialThre
     let blackClock = initialBase;
     const haveClocks = initialBase > 0;
     const repetitionCounts = new Map();
-    let halfmoveClock = 0;
+    // Track 50-move rule and fullmove counter in JS, as the engine expects authoritative values
+    let halfmoveClock = startPosition.halfmove_clock || 0;
+    let fullmoveNumber = startPosition.fullmove_number || 1;
 
     // Track last known search evaluation (in cp from White's perspective)
     // for each engine, based on the eval returned alongside its normal
@@ -436,6 +438,10 @@ async function playSingleGame(timePerMove, maxMoves, newPlaysWhite, materialThre
             };
         }
 
+        // Pass authoritative game counters to the engine
+        gameInput.halfmove_clock = halfmoveClock;
+        gameInput.fullmove_number = fullmoveNumber;
+
         // Let the appropriate engine choose a move on this gameInput
         const EngineClass = isWhiteTurn
             ? (newPlaysWhite ? EngineNew : EngineOld)
@@ -467,10 +473,10 @@ async function playSingleGame(timePerMove, maxMoves, newPlaysWhite, materialThre
             }
         }
 
-        // For the first 4 ply (2 moves each side), use a slight noise (+/-5cp)
+        // For the first 4 ply (2 moves each side), use a slight noise
         // to create opening variety. After ply 4, use normal search.
         const currentPly = moveHistory.length;
-        const noiseAmp = currentPly < 4 ? 5 : null;
+        const noiseAmp = currentPly < 4 ? (typeof searchNoise === 'number' ? searchNoise : 5) : null;
 
         const move = engine.get_best_move_with_time(haveClocks ? 0 : searchTimeMs, true, maxDepth, noiseAmp);
         engine.free();
@@ -654,6 +660,29 @@ async function playSingleGame(timePerMove, maxMoves, newPlaysWhite, materialThre
             comment += textComment;
         }
 
+        // Calculate counters *before* applying the move, because applyMove updates the board
+        {
+            const pieces = position.board.pieces;
+            const [fromX, fromY] = move.from.split(',');
+            const [toX, toY] = move.to.split(',');
+            const movingPiece = pieces.find(p => p.x === fromX && p.y === fromY);
+            // Check for capture: is there a piece at dest?
+            const targetPiece = pieces.find(p => p.x === toX && p.y === toY);
+            const isCapture = !!targetPiece;
+            const isPawn = movingPiece && movingPiece.piece_type === 'p';
+
+            if (isPawn || isCapture) {
+                halfmoveClock = 0;
+            } else {
+                halfmoveClock++;
+            }
+
+            // If it was Black's turn, increment fullmove number
+            if (position.turn === 'b') {
+                fullmoveNumber++;
+            }
+        }
+
         moveLines.push(
             (sideToMove === 'w' ? 'W' : 'B') + ': ' + move.from + '>' + move.to + promotionSuffix + (comment ? '{' + comment + '}' : '')
         );
@@ -733,7 +762,8 @@ self.onmessage = async (e) => {
                 msg.incrementMs,
                 msg.timeControl,
                 msg.variantName || 'Classical',
-                msg.maxDepth
+                msg.maxDepth,
+                msg.searchNoise
             );
 
             // Timeout wrapper - treat timeout as draw
