@@ -15,7 +15,8 @@ const sprtConcurrencyEl = document.getElementById('sprtConcurrency');
 const sprtMinGames = document.getElementById('sprtMinGames');
 const sprtMaxGames = document.getElementById('sprtMaxGames');
 const sprtMaxMoves = document.getElementById('sprtMaxMoves');
-const sprtMaterialThresholdEl = document.getElementById('sprtMaterialThreshold');
+const sprtMaterialThresholdEl = document.getElementById('sprtMaterialAdjudication');
+const sprtSearchNoiseEl = document.getElementById('sprtSearchNoise');
 const sprtVariantsEl = document.getElementById('sprtVariants');
 const runSprtBtn = document.getElementById('runSprt');
 const stopSprtBtn = document.getElementById('stopSprt');
@@ -70,6 +71,7 @@ const CONFIG = {
     maxMoves: 200,
     concurrency: 1,
     materialThreshold: 1500,
+    searchNoise: 7,
 };
 
 const MAX_CONCURRENCY_STORAGE_KEY = 'sprtMaxSafeConcurrency';
@@ -749,6 +751,8 @@ async function runSprt() {
     {
         const mt = parseInt(sprtMaterialThresholdEl.value, 10);
         CONFIG.materialThreshold = Number.isFinite(mt) && mt >= 0 ? mt : 1500;
+        const noise = parseInt(sprtSearchNoiseEl.value, 10);
+        CONFIG.searchNoise = Number.isFinite(noise) && noise >= 0 ? noise : 7;
     }
 
     // Ensure min/max games are even (for game pairing)
@@ -807,21 +811,12 @@ async function runSprt() {
     sprtStatusEl.textContent = 'Status: running...';
     sprtStatusEl.className = 'sprt-status';
     log('Starting SPRT: ' + maxGames + ' games (' + (maxGames / 2) + ' pairs), Mode=' + CONFIG.tcMode + ', TC=' + displayTcString, 'info');
-    sprtLog('SPRT Test Started (random openings, paired games)');
+    sprtLog('SPRT Test Started (noisy opening moves for first 4 ply, paired games)');
 
     const maxConcurrent = Math.max(1, CONFIG.concurrency | 0);
     const workers = [];
     let activeWorkers = 0;
     let nextGameIndex = 0;
-    // Store opening moves for each pair (pairIndex -> opening move)
-    const pairOpenings = new Map();
-
-    function getOpeningForPair(pairIndex) {
-        if (!pairOpenings.has(pairIndex)) {
-            pairOpenings.set(pairIndex, getRandomOpening());
-        }
-        return pairOpenings.get(pairIndex);
-    }
 
     function startWorker(worker, id) {
         const gameIndex = nextGameIndex++;
@@ -833,8 +828,6 @@ async function runSprt() {
 
         // Games run in pairs: each variant appears twice (both colors)
         const pairIndex = Math.floor(gameIndex / 2);
-        // Only use opening moves for Classical variant to avoid errors with custom positions
-        const openingMove = variantName === 'Classical' ? getOpeningForPair(pairIndex) : null;
 
         const tcParams = getTcParams(CONFIG.tcMode, CONFIG.timeControl, pairIndex);
 
@@ -844,8 +837,8 @@ async function runSprt() {
             timePerMove: tcParams.timePerMove,
             maxMoves: maxMovesPerGame,
             newPlaysWhite,
-            openingMove,
             materialThreshold: CONFIG.materialThreshold,
+            searchNoise: CONFIG.searchNoise,
             baseTimeMs: tcParams.baseTimeMs,
             incrementMs: tcParams.incrementMs,
             maxDepth: tcParams.maxDepth,
@@ -918,14 +911,10 @@ async function runSprt() {
                         sprtDrawsEl.textContent = String(draws);
                         sprtEloEl.textContent = String(Math.round(elo));
 
-                        // Extract opening move from log (first line)
-                        const firstLine = (msg.log || '').split('\n')[0] || '';
-                        const openingInfo = firstLine.includes('>') ? ' [' + firstLine.replace('W: ', '') + ']' : '';
-
                         sprtLog('Game ' + total + ': ' + result +
                             ' (W:' + wins + ' L:' + losses + ' D:' + draws + ')' +
                             ' Elo≈' + elo.toFixed(1) + '±' + error.toFixed(1) +
-                            ' LLR=' + llr.toFixed(2) + openingInfo);
+                            ' LLR=' + llr.toFixed(2));
 
                         log(
                             'Games: ' + total + '/' + maxGames +

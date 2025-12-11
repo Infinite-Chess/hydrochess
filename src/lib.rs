@@ -132,6 +132,8 @@ struct JsGameRules {
     promotion_ranks: Option<JsPromotionRanks>,
     #[serde(default)]
     promotions_allowed: Option<Vec<String>>,
+    #[serde(default)]
+    move_rule: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -207,8 +209,7 @@ impl Engine {
     pub fn new(json_state: JsValue) -> Result<Engine, JsValue> {
         let js_game: JsFullGame = serde_wasm_bindgen::from_value(json_state)?;
 
-        // If this looks like a fresh game (no move history and starting fullmove number),
-        // clear any persistent search/TT state so we don't carry information across games.
+        // If this looks like a fresh game, clear any persistent search/TT state.
         if js_game.move_history.is_empty() && js_game.fullmove_number <= 1 {
             crate::search::reset_search_state();
         }
@@ -301,6 +302,7 @@ impl Engine {
                 promotion_ranks,
                 promotion_types: None,
                 promotions_allowed: js_rules.promotions_allowed,
+                move_rule_limit: js_rules.move_rule,
             };
             rules.init_promotion_types();
             rules
@@ -348,6 +350,8 @@ impl Engine {
             null_moves: 0,
             white_piece_count: 0,
             black_piece_count: 0,
+            starting_white_pieces: 0,
+            starting_black_pieces: 0,
             white_pieces: Vec::new(),
             black_pieces: Vec::new(),
             spatial_indices: SpatialIndices::default(),
@@ -360,8 +364,9 @@ impl Engine {
 
         game.material_score = calculate_initial_material(&game.board);
         game.recompute_piece_counts(); // Rebuild piece lists and counts
-                                       // Initialize development starting squares from the initial board
-                                       // before replaying move history.
+        game.init_starting_piece_counts(); // Cache starting non-pawn piece counts for phase detection
+                                           // Initialize development starting squares from the initial board
+                                           // before replaying move history.
         game.init_starting_squares();
         game.recompute_hash(); // Compute initial hash from position
 
@@ -377,15 +382,9 @@ impl Engine {
         }
 
         if js_game.move_history.is_empty() {
-            // No history: trust JS clocks/turn/en-passant for this position
+            // No history: trust JS turn/en-passant for this position
             game.en_passant = parsed_en_passant;
             game.turn = js_turn;
-            game.halfmove_clock = js_game.halfmove_clock;
-            game.fullmove_number = if js_game.fullmove_number == 0 {
-                1
-            } else {
-                js_game.fullmove_number
-            };
         } else {
             // Replay the full move history from the start position.
             // Like UCI: just apply moves directly by coordinates, no legal move generation needed.
@@ -400,6 +399,15 @@ impl Engine {
             // After replay, GameState.turn, clocks, and en_passant have been
             // updated naturally by make_move_coords.
         }
+
+        // Always use the clocks passed from JS, as they reflect the authoritative state
+        // (e.g. edited counters in board editor, or simple synchronization).
+        game.halfmove_clock = js_game.halfmove_clock;
+        game.fullmove_number = if js_game.fullmove_number == 0 {
+            1
+        } else {
+            js_game.fullmove_number
+        };
 
         // Optional clock information (similar to UCI wtime/btime/winc/binc).
         let clock = js_game.clock;
@@ -560,6 +568,7 @@ impl Engine {
         time_limit_ms: u32,
         silent: Option<bool>,
         max_depth: Option<usize>,
+        noise_amp: Option<i32>,
     ) -> JsValue {
         let effective_limit = if time_limit_ms == 0 && max_depth.is_some() {
             // If explicit depth is requested with 0 time, treat as infinite time (fixed depth search)
@@ -570,6 +579,19 @@ impl Engine {
         let silent = silent.unwrap_or(false);
         let depth = max_depth.unwrap_or(50).max(1).min(50);
         let strength = self.strength_level.unwrap_or(3).max(1).min(3);
+
+        // Determine effective noise amplitude:
+        // 1. If explicit noise_amp is provided, use it
+        // 2. Otherwise, derive from strength level
+        let effective_noise: i32 = if let Some(amp) = noise_amp {
+            amp.max(0)
+        } else {
+            match strength {
+                1 => 50,
+                2 => 25,
+                _ => 0, // strength 3 = no noise
+            }
+        };
 
         #[allow(unused_variables)]
         let pre_stats = crate::search::get_current_tt_stats();
@@ -621,25 +643,25 @@ impl Engine {
             }
         }
 
-        // Choose search path based on strength level.
-        let (best_move, eval) = if strength == 3 {
-            if let Some((bm, ev, _stats)) =
-                search::get_best_move(&mut self.game, depth, effective_limit, silent)
-            {
+        // Choose search path based on effective noise.
+        let (best_move, eval) = if effective_noise > 0 {
+            // Use noisy search
+            if let Some((bm, ev, _stats)) = search::get_best_move_with_noise(
+                &mut self.game,
+                depth,
+                effective_limit,
+                effective_noise,
+                silent,
+            ) {
                 (bm, ev)
             } else {
                 return JsValue::NULL;
             }
         } else {
-            // Strength 1/2: run full search with deterministic noisy eval.
-            let noise_amp: i32 = if strength == 2 { 25 } else { 50 };
-            if let Some((bm, ev, _stats)) = search::get_best_move_with_noise(
-                &mut self.game,
-                depth,
-                effective_limit,
-                noise_amp,
-                silent,
-            ) {
+            // Normal search (no noise)
+            if let Some((bm, ev, _stats)) =
+                search::get_best_move(&mut self.game, depth, effective_limit, silent)
+            {
                 (bm, ev)
             } else {
                 return JsValue::NULL;

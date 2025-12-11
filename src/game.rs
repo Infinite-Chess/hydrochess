@@ -27,6 +27,7 @@ pub struct GameRules {
     #[serde(skip)]
     pub promotion_types: Option<Vec<PieceType>>, // Pre-converted promotion piece types (fast)
     pub promotions_allowed: Option<Vec<String>>, // Piece type codes (only for serialization)
+    pub move_rule_limit: Option<u32>,            // 50-move rule limit in halfmoves (default 100)
 }
 
 impl GameRules {
@@ -82,6 +83,12 @@ pub struct GameState {
     pub white_piece_count: u16,
     #[serde(skip)]
     pub black_piece_count: u16,
+    /// Starting piece counts (non-pawn) for game phase calculation
+    /// Set once when game is initialized, never changes
+    #[serde(skip)]
+    pub starting_white_pieces: u16,
+    #[serde(skip)]
+    pub starting_black_pieces: u16,
     /// Piece coordinates per color for fast iteration (avoid scanning full HashMap)
     #[serde(skip)]
     pub white_pieces: Vec<(i64, i64)>,
@@ -152,6 +159,8 @@ impl GameState {
             null_moves: 0,
             white_piece_count: 0,
             black_piece_count: 0,
+            starting_white_pieces: 0,
+            starting_black_pieces: 0,
             white_pieces: Vec::new(),
             black_pieces: Vec::new(),
             spatial_indices: SpatialIndices::default(),
@@ -179,6 +188,8 @@ impl GameState {
             null_moves: 0,
             white_piece_count: 0,
             black_piece_count: 0,
+            starting_white_pieces: 0,
+            starting_black_pieces: 0,
             white_pieces: Vec::new(),
             black_pieces: Vec::new(),
             spatial_indices: SpatialIndices::default(),
@@ -247,6 +258,25 @@ impl GameState {
                 self.starting_squares.insert(Coordinate::new(*x, *y));
             }
         }
+    }
+
+    /// Initialize starting piece counts for game phase calculation.
+    /// Should be called once when the game is created before move history replay.
+    /// Counts non-pawn pieces (since pawns don't contribute to game phase).
+    pub fn init_starting_piece_counts(&mut self) {
+        let mut white: u16 = 0;
+        let mut black: u16 = 0;
+        for piece in self.board.pieces.values() {
+            if piece.piece_type() != PieceType::Pawn && piece.color() != PlayerColor::Neutral {
+                match piece.color() {
+                    PlayerColor::White => white += 1,
+                    PlayerColor::Black => black += 1,
+                    PlayerColor::Neutral => {}
+                }
+            }
+        }
+        self.starting_white_pieces = white;
+        self.starting_black_pieces = black;
     }
 
     #[inline]
@@ -334,13 +364,13 @@ impl GameState {
         !white_has_non_king || !black_has_non_king
     }
 
-    /// Check if position is a draw by 50-move rule
+    /// Check if position is a draw by 50-move rule (or variant specific limit)
     pub fn is_fifty(&self) -> bool {
         // Don't check during null move search
         if self.null_moves > 0 {
             return false;
         }
-        self.halfmove_clock >= 100
+        self.halfmove_clock >= self.game_rules.move_rule_limit.unwrap_or(100)
     }
 
     /// Make a null move (just flip turn, for null move pruning)
