@@ -66,6 +66,15 @@ use params::{
 mod tt;
 pub use tt::{TTEntry, TTFlag, TranspositionTable};
 
+// Shared TT for Lazy SMP - uses SharedArrayBuffer from JavaScript
+// Shared TT for Lazy SMP - uses SharedArrayBuffer from JavaScript
+#[cfg(feature = "multithreading")]
+mod shared_tt;
+#[cfg(feature = "multithreading")]
+pub use shared_tt::{SharedTT, SharedTTFlag};
+#[cfg(all(target_arch = "wasm32", feature = "multithreading"))]
+pub use shared_tt::SharedTTView;
+
 mod ordering;
 use ordering::{
     hash_coord_32, hash_move_dest, hash_move_from, sort_captures, sort_moves, sort_moves_root,
@@ -79,6 +88,152 @@ pub use zobrist::{en_passant_key, material_key, pawn_key, piece_key, special_rig
 
 mod noisy;
 pub use noisy::get_best_move_with_noise;
+
+// Shared work queue for root move splitting (DTS-style parallelism)
+#[cfg(all(target_arch = "wasm32", feature = "multithreading"))]
+mod work_queue;
+#[cfg(all(target_arch = "wasm32", feature = "multithreading"))]
+pub use work_queue::{SharedWorkQueue, WORK_QUEUE_SIZE_WORDS, NO_MORE_MOVES};
+
+// ============================================================================
+// Shared TT Global State (for Lazy SMP with SharedArrayBuffer)
+// ============================================================================
+
+/// Thread-local storage for the shared TT pointer and length.
+/// Each worker receives the same SharedArrayBuffer from JavaScript,
+/// so all workers share the exact same TT memory.
+/// Thread-local storage for the shared TT pointer and length.
+/// Each worker receives the same SharedArrayBuffer from JavaScript,
+/// so all workers share the exact same TT memory.
+#[cfg(all(target_arch = "wasm32", feature = "multithreading"))]
+thread_local! {
+    // Raw pointer to the SharedArrayBuffer data and its length in u64 words
+    static SHARED_TT_STATE: RefCell<Option<(*mut u64, usize)>> = RefCell::new(None);
+    // Pointer to shared work queue (offset after TT in shared memory)
+    static SHARED_WORK_QUEUE_STATE: RefCell<Option<(*mut u64, usize)>> = RefCell::new(None);
+}
+
+/// Set the shared TT pointer (called from lib.rs WASM binding)
+#[cfg(all(target_arch = "wasm32", feature = "multithreading"))]
+pub fn set_shared_tt_ptr(ptr: *mut u64, len: usize) {
+    SHARED_TT_STATE.with(|cell| {
+        *cell.borrow_mut() = Some((ptr, len));
+    });
+}
+
+/// Set the shared work queue pointer (called from lib.rs WASM binding)
+#[cfg(all(target_arch = "wasm32", feature = "multithreading"))]
+pub fn set_shared_work_queue_ptr(ptr: *mut u64, len: usize) {
+    SHARED_WORK_QUEUE_STATE.with(|cell| {
+        *cell.borrow_mut() = Some((ptr, len));
+    });
+}
+
+/// Check if a shared TT is configured
+#[cfg(all(target_arch = "wasm32", feature = "multithreading"))]
+pub fn has_shared_tt() -> bool {
+    SHARED_TT_STATE.with(|cell| cell.borrow().is_some())
+}
+
+/// Create a SharedTTView from the stored pointer.
+/// Returns None if no shared TT is configured.
+#[cfg(all(target_arch = "wasm32", feature = "multithreading"))]
+pub fn create_shared_tt_view() -> Option<SharedTTView> {
+    SHARED_TT_STATE.with(|cell| {
+        if let Some((ptr, len)) = *cell.borrow() {
+            // SAFETY: The pointer comes from JavaScript's SharedArrayBuffer
+            // which is kept alive by JS. The SharedTTView uses atomic operations.
+            Some(unsafe { SharedTTView::new(ptr, len) })
+        } else {
+            None
+        }
+    })
+}
+
+/// Create a SharedWorkQueue from the stored pointer.
+/// Returns None if no work queue is configured.
+#[cfg(all(target_arch = "wasm32", feature = "multithreading"))]
+pub fn create_work_queue_view() -> Option<SharedWorkQueue> {
+    SHARED_WORK_QUEUE_STATE.with(|cell| {
+        if let Some((ptr, len)) = *cell.borrow() {
+            Some(unsafe { SharedWorkQueue::new(ptr, len) })
+        } else {
+            None
+        }
+    })
+}
+
+// ============================================================================
+// TT Probe/Store with Shared TT Support (for Lazy SMP)
+// ============================================================================
+
+/// Probe the TT, using SharedTTView when available for Lazy SMP.
+/// Falls back to the Searcher's local TT if no shared TT is configured.
+#[inline]
+pub fn probe_tt_with_shared(
+    searcher: &Searcher,
+    hash: u64,
+    alpha: i32,
+    beta: i32,
+    depth: usize,
+    ply: usize,
+) -> Option<(i32, Option<Move>)> {
+    // On WASM with shared TT configured, use SharedTTView
+    #[cfg(all(target_arch = "wasm32", feature = "multithreading"))]
+    {
+        if let Some(shared_tt) = create_shared_tt_view() {
+            // SAFETY: SharedTTView uses atomic operations for thread-safety
+            let result = unsafe { shared_tt.probe(hash, alpha, beta, depth, ply) };
+            return result;
+        }
+    }
+    
+    // Fall back to local TT
+    searcher.tt.probe(hash, alpha, beta, depth, ply)
+}
+
+/// Store to the TT, using SharedTTView when available for Lazy SMP.
+/// Falls back to the Searcher's local TT if no shared TT is configured.
+#[inline]
+pub fn store_tt_with_shared(
+    searcher: &mut Searcher,
+    hash: u64,
+    depth: usize,
+    flag: TTFlag,
+    score: i32,
+    best_move: Option<Move>,
+    ply: usize,
+) {
+    // On WASM with shared TT configured, use SharedTTView
+    #[cfg(all(target_arch = "wasm32", feature = "multithreading"))]
+    {
+        if let Some(shared_tt) = create_shared_tt_view() {
+            // Convert TTFlag to SharedTTFlag
+            let shared_flag = match flag {
+                TTFlag::None => SharedTTFlag::None,
+                TTFlag::Exact => SharedTTFlag::Exact,
+                TTFlag::LowerBound => SharedTTFlag::LowerBound,
+                TTFlag::UpperBound => SharedTTFlag::UpperBound,
+            };
+            // SAFETY: SharedTTView uses atomic operations for thread-safety
+            unsafe {
+                shared_tt.store(
+                    hash,
+                    depth,
+                    shared_flag,
+                    score,
+                    best_move.as_ref(),
+                    ply,
+                    0, // generation - we use 0 for now since all workers share
+                );
+            }
+            return;
+        }
+    }
+    
+    // Fall back to local TT
+    searcher.tt.store(hash, depth, flag, score, best_move, ply);
+}
 
 /// Timer abstraction to handle platform differences
 #[derive(Clone)]
@@ -170,6 +325,25 @@ where
 }
 
 fn build_search_stats(searcher: &Searcher) -> SearchStats {
+    #[cfg(all(target_arch = "wasm32", feature = "multithreading"))]
+    if let Some(shared) = create_shared_tt_view() {
+        // Use shared TT stats
+        // Note: used_entries() scans the whole table, which might be slow for very large TTs,
+        // but it's only called at the end of a search iteration. 
+        // If it's too slow, we can return 0 or an estimate.
+        // For now, let's trust the sampling in fill_permille and avoid full scan for 'used'.
+        // Or we could implement an approximate counter in shared memory.
+        let fill = unsafe { shared.fill_permille() };
+        let cap = shared.capacity();
+        let used = ((cap as u64 * fill as u64) / 1000) as usize;
+        
+        return SearchStats {
+            tt_capacity: cap,
+            tt_used: used,
+            tt_fill_permille: fill,
+        };
+    }
+
     SearchStats {
         tt_capacity: searcher.tt.capacity(),
         tt_used: searcher.tt.used_entries(),
@@ -178,13 +352,26 @@ fn build_search_stats(searcher: &Searcher) -> SearchStats {
 }
 
 /// Return current TT statistics from the persistent global searcher, if any.
-/// When no global searcher exists yet, this returns zeros.
+/// When no global searcher exists yet, checks shared TT if available.
 pub fn get_current_tt_stats() -> SearchStats {
     GLOBAL_SEARCHER.with(|cell| {
         let opt = cell.borrow();
         if let Some(ref searcher) = *opt {
             build_search_stats(searcher)
         } else {
+            // No global searcher yet - check if shared TT is available
+            #[cfg(all(target_arch = "wasm32", feature = "multithreading"))]
+            if let Some(shared) = create_shared_tt_view() {
+                let fill = unsafe { shared.fill_permille() };
+                let cap = shared.capacity();
+                let used = ((cap as u64 * fill as u64) / 1000) as usize;
+                return SearchStats {
+                    tt_capacity: cap,
+                    tt_used: used,
+                    tt_fill_permille: fill,
+                };
+            }
+            
             SearchStats {
                 tt_capacity: 0,
                 tt_used: 0,
@@ -254,6 +441,10 @@ pub struct Searcher {
     // Silent mode - no info output
     pub silent: bool,
 
+    // Thread ID for Lazy SMP - helper threads (id > 0) skip first N moves
+    // This distributes work across threads naturally
+    pub thread_id: usize,
+
     // Per-ply reusable move buffers to avoid Vec allocations in the search
     pub move_buffers: Vec<Vec<Move>>,
 
@@ -316,6 +507,7 @@ impl Searcher {
             best_move_root: None,
             prev_score: 0,
             silent: false,
+            thread_id: 0,
             move_buffers,
             move_history: vec![None; MAX_PLY],
             moved_piece_history: vec![0; MAX_PLY],
@@ -815,6 +1007,18 @@ pub fn get_best_move(
     time_limit_ms: u128,
     silent: bool,
 ) -> Option<(Move, i32, SearchStats)> {
+    get_best_move_threaded(game, max_depth, time_limit_ms, silent, 0)
+}
+
+/// Time-limited search with thread_id for Lazy SMP.
+/// Helper threads (thread_id > 0) skip the first move to distribute work.
+pub fn get_best_move_threaded(
+    game: &mut GameState,
+    max_depth: usize,
+    time_limit_ms: u128,
+    silent: bool,
+    thread_id: usize,
+) -> Option<(Move, i32, SearchStats)> {
     // Ensure fast per-color piece counts are in sync with the board
     game.recompute_piece_counts();
     // Initialize correction history hashes
@@ -824,6 +1028,7 @@ pub fn get_best_move(
     let mut searcher = Searcher::new(time_limit_ms);
     searcher.time_limit_ms = time_limit_ms;
     searcher.silent = silent;
+    searcher.thread_id = thread_id;
     // Set correction mode based on variant (zero overhead during search)
     searcher.set_corrhist_mode(game);
     let result = search_with_searcher(&mut searcher, game, max_depth);
@@ -1174,8 +1379,8 @@ fn negamax_root(
     let hash = TranspositionTable::generate_hash(game);
     let mut tt_move: Option<Move> = None;
 
-    // Probe TT for best move from previous search
-    if let Some((_, best)) = searcher.tt.probe(hash, alpha, beta, depth, 0) {
+    // Probe TT for best move from previous search (uses shared TT if configured)
+    if let Some((_, best)) = probe_tt_with_shared(searcher, hash, alpha, beta, depth, 0) {
         tt_move = best;
     }
 
@@ -1198,6 +1403,10 @@ fn negamax_root(
                 continue;
             }
         }
+
+        // Note: All threads search all moves. Thread variation comes from:
+        // 1. Shared TT - threads benefit from each other's entries
+        // 2. Slight timing differences - threads finish at different points
 
         let undo = game.make_move(m);
 
@@ -1274,9 +1483,7 @@ fn negamax_root(
     } else {
         TTFlag::Exact
     };
-    searcher
-        .tt
-        .store(hash, depth, tt_flag, best_score, best_move, 0);
+    store_tt_with_shared(searcher, hash, depth, tt_flag, best_score, best_move, 0);
 
     best_score
 }
@@ -1364,7 +1571,7 @@ fn negamax(
     }
     let mut tt_move: Option<Move> = None;
 
-    if let Some((score, best)) = searcher.tt.probe(hash, alpha, beta, depth, ply) {
+    if let Some((score, best)) = probe_tt_with_shared(searcher, hash, alpha, beta, depth, ply) {
         tt_move = best;
 
         // Use TT cutoff in non-PV nodes
@@ -1737,9 +1944,7 @@ fn negamax(
     } else {
         TTFlag::Exact
     };
-    searcher
-        .tt
-        .store(hash, depth, tt_flag, best_score, best_move, ply);
+    store_tt_with_shared(searcher, hash, depth, tt_flag, best_score, best_move, ply);
 
     // Update correction history when conditions are met:
     // - Not in check

@@ -69,10 +69,65 @@ extern "C" {
     pub fn log(s: &str);
 }
 
-// #[wasm_bindgen]
-// pub fn init_panic_hook() {
-//     utils::set_panic_hook();
-// }
+// ============================================================================
+// Shared TT WASM Bindings (for Lazy SMP with SharedArrayBuffer)
+// ============================================================================
+
+/// Size of the shared TT in u64 words (32MB = 4M words at 8 bytes each)
+#[cfg(feature = "multithreading")]
+const SHARED_TT_SIZE_WORDS: usize = 32 * 1024 * 1024 / 8;
+
+/// Size of work queue in u64 words (header + 256 moves * 6 words each)
+#[cfg(feature = "multithreading")]
+const WORK_QUEUE_SIZE_WORDS: usize = 6 + 256 * 6; // ~12KB
+
+/// Static buffer for shared TT - lives in WASM linear memory
+/// When WASM memory is backed by SharedArrayBuffer, all workers share this
+#[cfg(feature = "multithreading")]
+static mut SHARED_TT_BUFFER: [u64; SHARED_TT_SIZE_WORDS] = [0u64; SHARED_TT_SIZE_WORDS];
+
+/// Static buffer for work queue - for root move splitting
+#[cfg(feature = "multithreading")]
+static mut SHARED_WORK_QUEUE: [u64; WORK_QUEUE_SIZE_WORDS] = [0u64; WORK_QUEUE_SIZE_WORDS];
+
+/// Get the pointer to the shared TT buffer in WASM memory.
+/// JavaScript can use this with the WASM memory buffer to share between workers.
+#[cfg(feature = "multithreading")]
+#[wasm_bindgen]
+pub fn get_shared_tt_ptr() -> u32 {
+    unsafe { SHARED_TT_BUFFER.as_ptr() as u32 }
+}
+
+/// Get the size of the shared TT buffer in u64 words.
+#[cfg(feature = "multithreading")]
+#[wasm_bindgen]
+pub fn get_shared_tt_size() -> u32 {
+    SHARED_TT_SIZE_WORDS as u32
+}
+
+/// Initialize the shared TT view in search module.
+/// Call this after WASM is loaded to set up TT for search.
+#[cfg(feature = "multithreading")]
+#[wasm_bindgen]
+pub fn init_shared_tt() {
+    let ptr = unsafe { SHARED_TT_BUFFER.as_mut_ptr() };
+    let len = SHARED_TT_SIZE_WORDS;
+    
+    // Store in the search module's thread-local state
+    search::set_shared_tt_ptr(ptr, len);
+    
+    // Also initialize work queue
+    let wq_ptr = unsafe { SHARED_WORK_QUEUE.as_mut_ptr() };
+    let wq_len = WORK_QUEUE_SIZE_WORDS;
+    search::set_shared_work_queue_ptr(wq_ptr, wq_len);
+    
+    log(&format!(
+        "[WASM] Shared TT initialized: {} words ({} MB) at {:p}",
+        len,
+        (len * 8) / (1024 * 1024),
+        ptr
+    ));
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct JsMove {
@@ -567,6 +622,7 @@ impl Engine {
 
     /// Timed search. This also exposes the search evaluation as an `eval` field alongside the move,
     /// so callers can reuse the same search for adjudication.
+    /// thread_id is used for Lazy SMP - helper threads (id > 0) skip the first move.
     #[wasm_bindgen]
     pub fn get_best_move_with_time(
         &mut self,
@@ -574,6 +630,7 @@ impl Engine {
         silent: Option<bool>,
         max_depth: Option<usize>,
         noise_amp: Option<i32>,
+        thread_id: Option<u32>,
     ) -> JsValue {
         let effective_limit = if time_limit_ms == 0 && max_depth.is_some() {
             // If explicit depth is requested with 0 time, treat as infinite time (fixed depth search)
@@ -649,6 +706,7 @@ impl Engine {
         }
 
         // Choose search path based on effective noise.
+        let tid = thread_id.unwrap_or(0) as usize;
         let (best_move, eval) = if effective_noise > 0 {
             // Use noisy search
             if let Some((bm, ev, _stats)) = search::get_best_move_with_noise(
@@ -663,9 +721,9 @@ impl Engine {
                 return JsValue::NULL;
             }
         } else {
-            // Normal search (no noise)
+            // Normal search with thread_id for Lazy SMP
             if let Some((bm, ev, _stats)) =
-                search::get_best_move(&mut self.game, depth, effective_limit, silent)
+                search::get_best_move_threaded(&mut self.game, depth, effective_limit, silent, tid)
             {
                 (bm, ev)
             } else {

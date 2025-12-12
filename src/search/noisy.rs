@@ -232,7 +232,7 @@ fn negamax_root_noisy(
     let hash = TranspositionTable::generate_hash(game);
     let mut tt_move: Option<Move> = None;
 
-    if let Some((_, best)) = searcher.tt.probe(hash, alpha, beta, depth, 0) {
+    if let Some((_, best)) = super::probe_tt_with_shared(searcher, hash, alpha, beta, depth, 0) {
         tt_move = best;
     }
 
@@ -343,9 +343,7 @@ fn negamax_root_noisy(
     } else {
         TTFlag::Exact
     };
-    searcher
-        .tt
-        .store(hash, depth, tt_flag, best_score, best_move, 0);
+    super::store_tt_with_shared(searcher, hash, depth, tt_flag, best_score, best_move, 0);
 
     best_score
 }
@@ -416,7 +414,7 @@ fn negamax_noisy(
     }
     let mut tt_move: Option<Move> = None;
 
-    if let Some((score, best)) = searcher.tt.probe(hash, alpha, beta, depth, ply) {
+    if let Some((score, best)) = super::probe_tt_with_shared(searcher, hash, alpha, beta, depth, ply) {
         tt_move = best;
 
         if !is_pv && score != INFINITY + 1 {
@@ -739,9 +737,7 @@ fn negamax_noisy(
         TTFlag::Exact
     };
 
-    searcher
-        .tt
-        .store(hash, depth, flag, best_score, best_move.clone(), ply);
+    super::store_tt_with_shared(searcher, hash, depth, flag, best_score, best_move.clone(), ply);
 
     best_score
 }
