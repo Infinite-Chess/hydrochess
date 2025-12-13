@@ -1664,6 +1664,22 @@ fn negamax(
                 }
             }
         }
+
+        // Razoring
+        // If static evaluation is very low, drop directly into quiescence search
+        // to see if we can prune this node early.
+        if depth <= 3 && static_eval + 300 + depth as i32 * 150 <= alpha {
+            let razor_score = quiescence(
+                searcher,
+                game,
+                ply,
+                alpha - 300 - depth as i32 * 150,
+                beta - 300 - depth as i32 * 150,
+            );
+            if razor_score + 300 + depth as i32 * 150 <= alpha {
+                return razor_score;
+            }
+        }
     }
 
     // Reuse per-ply move buffer for this node
