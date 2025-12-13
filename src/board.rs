@@ -1,5 +1,5 @@
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
 
 // ============================================================================
 // Number of piece types (for packed piece encoding)
@@ -312,13 +312,13 @@ pub struct Board {
     // We keep 'pieces_vec' private to enforce sorted invariant
     pieces: Vec<((i64, i64), Piece)>,
     #[serde(skip)]
-    pub active_coords: Option<HashSet<(i64, i64)>>,
+    pub active_coords: Option<FxHashSet<(i64, i64)>>,
 }
 
 /// Raw representation for serialization
 #[derive(Serialize, Deserialize)]
 struct BoardRaw {
-    pieces: HashMap<(i64, i64), Piece>,
+    pieces: FxHashMap<(i64, i64), Piece>,
 }
 
 impl From<BoardRaw> for Board {
@@ -329,7 +329,7 @@ impl From<BoardRaw> for Board {
             .any(|p| p.piece_type().is_neutral_type());
 
         let active_coords = if has_neutral {
-            let mut set = HashSet::new();
+            let mut set = FxHashSet::default();
             for (pos, piece) in &raw.pieces {
                 if !piece.piece_type().is_neutral_type() {
                     set.insert(*pos);
@@ -408,7 +408,7 @@ impl Board {
         // Active coords tracking
         if piece.piece_type().is_neutral_type() && self.active_coords.is_none() {
             // Need to initialize active_coords by scanning current pieces
-            let mut set = HashSet::new();
+            let mut set = FxHashSet::default();
             for (p_pos, p) in self.iter() {
                 if !p.piece_type().is_neutral_type() {
                     set.insert(*p_pos);

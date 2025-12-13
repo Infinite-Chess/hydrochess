@@ -70,10 +70,10 @@ pub use tt::{TTEntry, TTFlag, TranspositionTable};
 // Shared TT for Lazy SMP - uses SharedArrayBuffer from JavaScript
 #[cfg(feature = "multithreading")]
 mod shared_tt;
-#[cfg(feature = "multithreading")]
-pub use shared_tt::{SharedTT, SharedTTFlag};
 #[cfg(all(target_arch = "wasm32", feature = "multithreading"))]
 pub use shared_tt::SharedTTView;
+#[cfg(feature = "multithreading")]
+pub use shared_tt::{SharedTT, SharedTTFlag};
 
 mod ordering;
 use ordering::{
@@ -93,7 +93,7 @@ pub use noisy::get_best_move_with_noise;
 #[cfg(all(target_arch = "wasm32", feature = "multithreading"))]
 mod work_queue;
 #[cfg(all(target_arch = "wasm32", feature = "multithreading"))]
-pub use work_queue::{SharedWorkQueue, WORK_QUEUE_SIZE_WORDS, NO_MORE_MOVES};
+pub use work_queue::{SharedWorkQueue, NO_MORE_MOVES, WORK_QUEUE_SIZE_WORDS};
 
 // ============================================================================
 // Shared TT Global State (for Lazy SMP with SharedArrayBuffer)
@@ -187,7 +187,7 @@ pub fn probe_tt_with_shared(
             return result;
         }
     }
-    
+
     // Fall back to local TT
     searcher.tt.probe(hash, alpha, beta, depth, ply)
 }
@@ -230,7 +230,7 @@ pub fn store_tt_with_shared(
             return;
         }
     }
-    
+
     // Fall back to local TT
     searcher.tt.store(hash, depth, flag, score, best_move, ply);
 }
@@ -329,14 +329,14 @@ fn build_search_stats(searcher: &Searcher) -> SearchStats {
     if let Some(shared) = create_shared_tt_view() {
         // Use shared TT stats
         // Note: used_entries() scans the whole table, which might be slow for very large TTs,
-        // but it's only called at the end of a search iteration. 
+        // but it's only called at the end of a search iteration.
         // If it's too slow, we can return 0 or an estimate.
         // For now, let's trust the sampling in fill_permille and avoid full scan for 'used'.
         // Or we could implement an approximate counter in shared memory.
         let fill = unsafe { shared.fill_permille() };
         let cap = shared.capacity();
         let used = ((cap as u64 * fill as u64) / 1000) as usize;
-        
+
         return SearchStats {
             tt_capacity: cap,
             tt_used: used,
@@ -371,7 +371,7 @@ pub fn get_current_tt_stats() -> SearchStats {
                     tt_fill_permille: fill,
                 };
             }
-            
+
             SearchStats {
                 tt_capacity: 0,
                 tt_used: 0,
@@ -1710,6 +1710,18 @@ fn negamax(
             }
         }
 
+        // SEE-based move pruning for captures
+        // Skip clearly losing captures at non-PV nodes when we have at least one legal move
+        if !in_check && !is_pv && is_capture && legal_moves > 0 && best_score > -MATE_SCORE {
+            let see_value = static_exchange_eval(game, m);
+            // Threshold scales with depth: prune more aggressively at shallow depths
+            // At depth 1: threshold = -80, depth 4: threshold = -320
+            let see_threshold = -(depth as i32) * 80;
+            if see_value < see_threshold {
+                continue;
+            }
+        }
+
         let undo = game.make_move(m);
 
         // Check if move is illegal (leaves our king in check)
@@ -1758,6 +1770,19 @@ fn negamax(
                 if !improving {
                     reduction += 1;
                 }
+
+                // History-based LMR adjustments
+                // let hist_idx = hash_move_dest(m);
+                // let hist_score = searcher.history[m.piece.piece_type() as usize][hist_idx];
+
+                // // Reduce more for moves with bad history
+                // if hist_score < -1000 {
+                //     reduction += 1;
+                // }
+                // Reduce less for moves with good history
+                // else if hist_score > 1000 {
+                //     reduction = reduction.saturating_sub(1);
+                // }
 
                 reduction = reduction.min(depth - 2);
             }

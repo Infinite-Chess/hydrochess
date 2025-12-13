@@ -414,7 +414,9 @@ fn negamax_noisy(
     }
     let mut tt_move: Option<Move> = None;
 
-    if let Some((score, best)) = super::probe_tt_with_shared(searcher, hash, alpha, beta, depth, ply) {
+    if let Some((score, best)) =
+        super::probe_tt_with_shared(searcher, hash, alpha, beta, depth, ply)
+    {
         tt_move = best;
 
         if !is_pv && score != INFINITY + 1 {
@@ -737,7 +739,15 @@ fn negamax_noisy(
         TTFlag::Exact
     };
 
-    super::store_tt_with_shared(searcher, hash, depth, flag, best_score, best_move.clone(), ply);
+    super::store_tt_with_shared(
+        searcher,
+        hash,
+        depth,
+        flag,
+        best_score,
+        best_move.clone(),
+        ply,
+    );
 
     best_score
 }

@@ -1,8 +1,8 @@
 use crate::board::{Board, Coordinate, Piece, PieceType, PlayerColor};
 use crate::game::{EnPassantState, GameRules};
 use crate::utils::is_prime_i64;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
 
 // World border for infinite chess. These are initialized to a very large box,
 // but can be overridden from JS via the playableRegion values.
@@ -19,6 +19,18 @@ pub fn set_world_bounds(left: i64, right: i64, bottom: i64, top: i64) {
         COORD_MAX_X = left.max(right);
         COORD_MIN_Y = bottom.min(top);
         COORD_MAX_Y = bottom.max(top);
+    }
+}
+
+/// Get the maximum dimension of the current world border.
+/// Returns the larger of (max_x - min_x, max_y - min_y).
+/// Used for determining if standard chess mating patterns apply (bounded board).
+#[inline]
+pub fn get_world_size() -> i64 {
+    unsafe {
+        let width = COORD_MAX_X - COORD_MIN_X;
+        let height = COORD_MAX_Y - COORD_MIN_Y;
+        width.max(height)
     }
 }
 
@@ -132,18 +144,18 @@ pub fn in_bounds(x: i64, y: i64) -> bool {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SpatialIndices {
-    pub rows: HashMap<i64, Vec<i64>>,
-    pub cols: HashMap<i64, Vec<i64>>,
-    pub diag1: HashMap<i64, Vec<i64>>, // x - y
-    pub diag2: HashMap<i64, Vec<i64>>, // x + y
+    pub rows: FxHashMap<i64, Vec<i64>>,
+    pub cols: FxHashMap<i64, Vec<i64>>,
+    pub diag1: FxHashMap<i64, Vec<i64>>, // x - y
+    pub diag2: FxHashMap<i64, Vec<i64>>, // x + y
 }
 
 impl SpatialIndices {
     pub fn new(board: &Board) -> Self {
-        let mut rows: HashMap<i64, Vec<i64>> = HashMap::new();
-        let mut cols: HashMap<i64, Vec<i64>> = HashMap::new();
-        let mut diag1: HashMap<i64, Vec<i64>> = HashMap::new();
-        let mut diag2: HashMap<i64, Vec<i64>> = HashMap::new();
+        let mut rows: FxHashMap<i64, Vec<i64>> = FxHashMap::default();
+        let mut cols: FxHashMap<i64, Vec<i64>> = FxHashMap::default();
+        let mut diag1: FxHashMap<i64, Vec<i64>> = FxHashMap::default();
+        let mut diag2: FxHashMap<i64, Vec<i64>> = FxHashMap::default();
 
         for ((x, y), _) in board.iter() {
             rows.entry(*y).or_default().push(*x);
@@ -235,10 +247,10 @@ impl SpatialIndices {
 impl Default for SpatialIndices {
     fn default() -> Self {
         SpatialIndices {
-            rows: HashMap::new(),
-            cols: HashMap::new(),
-            diag1: HashMap::new(),
-            diag2: HashMap::new(),
+            rows: FxHashMap::default(),
+            cols: FxHashMap::default(),
+            diag1: FxHashMap::default(),
+            diag2: FxHashMap::default(),
         }
     }
 }
@@ -274,7 +286,7 @@ fn is_enemy_piece(piece: &Piece, our_color: PlayerColor) -> bool {
 pub fn get_legal_moves_into(
     board: &Board,
     turn: PlayerColor,
-    special_rights: &HashSet<Coordinate>,
+    special_rights: &FxHashSet<Coordinate>,
     en_passant: &Option<EnPassantState>,
     game_rules: &GameRules,
     indices: &SpatialIndices,
@@ -332,7 +344,7 @@ pub fn get_legal_moves_into(
 pub fn get_legal_moves(
     board: &Board,
     turn: PlayerColor,
-    special_rights: &HashSet<Coordinate>,
+    special_rights: &FxHashSet<Coordinate>,
     en_passant: &Option<EnPassantState>,
     game_rules: &GameRules,
     indices: &SpatialIndices,
@@ -373,7 +385,7 @@ pub fn get_legal_moves(
 pub fn get_quiescence_captures(
     board: &Board,
     turn: PlayerColor,
-    special_rights: &HashSet<Coordinate>,
+    special_rights: &FxHashSet<Coordinate>,
     en_passant: &Option<EnPassantState>,
     game_rules: &GameRules,
     indices: &SpatialIndices,
@@ -429,7 +441,7 @@ fn generate_captures_for_piece(
     board: &Board,
     piece: &Piece,
     from: &Coordinate,
-    special_rights: &HashSet<Coordinate>,
+    special_rights: &FxHashSet<Coordinate>,
     en_passant: &Option<EnPassantState>,
     game_rules: &GameRules,
     indices: &SpatialIndices,
@@ -539,7 +551,7 @@ pub fn get_pseudo_legal_moves_for_piece(
     board: &Board,
     piece: &Piece,
     from: &Coordinate,
-    special_rights: &HashSet<Coordinate>,
+    special_rights: &FxHashSet<Coordinate>,
     en_passant: &Option<EnPassantState>,
     indices: &SpatialIndices,
     game_rules: &GameRules,
@@ -1022,7 +1034,7 @@ fn generate_pawn_moves(
     board: &Board,
     from: &Coordinate,
     piece: &Piece,
-    special_rights: &HashSet<Coordinate>,
+    special_rights: &FxHashSet<Coordinate>,
     en_passant: &Option<EnPassantState>,
     game_rules: &GameRules,
 ) -> Vec<Move> {
@@ -1155,7 +1167,7 @@ fn generate_pawn_capture_moves(
     board: &Board,
     from: &Coordinate,
     piece: &Piece,
-    _special_rights: &HashSet<Coordinate>,
+    _special_rights: &FxHashSet<Coordinate>,
     en_passant: &Option<EnPassantState>,
     game_rules: &GameRules,
     out: &mut Vec<Move>,
@@ -1256,7 +1268,7 @@ fn generate_castling_moves(
     board: &Board,
     from: &Coordinate,
     piece: &Piece,
-    special_rights: &HashSet<Coordinate>,
+    special_rights: &FxHashSet<Coordinate>,
     indices: &SpatialIndices,
 ) -> Vec<Move> {
     let mut moves = Vec::new();

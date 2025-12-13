@@ -14,7 +14,7 @@ use crate::game::GameState;
 use crate::Variant;
 
 // Re-export commonly used items
-pub use base::{calculate_initial_material, get_piece_value};
+pub use base::{calculate_initial_material, get_piece_value, is_insufficient_material};
 
 #[cfg(feature = "eval_tuning")]
 pub use base::{reset_eval_features, snapshot_eval_features, EvalFeatures};

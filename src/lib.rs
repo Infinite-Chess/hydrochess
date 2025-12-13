@@ -1,5 +1,5 @@
+use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use wasm_bindgen::prelude::*;
 
 pub mod board;
@@ -112,15 +112,15 @@ pub fn get_shared_tt_size() -> u32 {
 pub fn init_shared_tt() {
     let ptr = unsafe { SHARED_TT_BUFFER.as_mut_ptr() };
     let len = SHARED_TT_SIZE_WORDS;
-    
+
     // Store in the search module's thread-local state
     search::set_shared_tt_ptr(ptr, len);
-    
+
     // Also initialize work queue
     let wq_ptr = unsafe { SHARED_WORK_QUEUE.as_mut_ptr() };
     let wq_len = WORK_QUEUE_SIZE_WORDS;
     search::set_shared_work_queue_ptr(wq_ptr, wq_len);
-    
+
     log(&format!(
         "[WASM] Shared TT initialized: {} words ({} MB) at {:p}",
         len,
@@ -300,7 +300,7 @@ impl Engine {
         let js_turn = PlayerColor::from_str(&js_game.turn).unwrap_or(PlayerColor::White);
 
         // Parse initial special rights (castling + pawn double-move)
-        let mut special_rights = HashSet::new();
+        let mut special_rights = FxHashSet::default();
         for sr in js_game.special_rights {
             let parts: Vec<&str> = sr.split(',').collect();
             if parts.len() == 2 {
@@ -410,7 +410,7 @@ impl Engine {
             white_pieces: Vec::new(),
             black_pieces: Vec::new(),
             spatial_indices: SpatialIndices::default(),
-            starting_squares: std::collections::HashSet::new(),
+            starting_squares: FxHashSet::default(),
             white_back_rank,
             black_back_rank,
             white_promo_rank,

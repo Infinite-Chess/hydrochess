@@ -4,8 +4,9 @@ use crate::moves::{
     get_legal_moves, get_legal_moves_into, get_pseudo_legal_moves_for_piece, is_square_attacked,
     Move, SpatialIndices,
 };
+use arrayvec::ArrayVec;
+use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 
 #[derive(Copy, Clone, Serialize, Deserialize)]
 pub struct EnPassantState {
@@ -49,8 +50,8 @@ pub struct UndoMove {
     pub captured_piece: Option<Piece>,
     pub old_en_passant: Option<EnPassantState>,
     pub old_halfmove_clock: u32,
-    pub old_hash: u64,                           // Hash before the move was made
-    pub special_rights_removed: Vec<Coordinate>, // Track which special rights were removed (re-insert on undo)
+    pub old_hash: u64, // Hash before the move was made
+    pub special_rights_removed: ArrayVec<Coordinate, 4>, // Track which special rights were removed (re-insert on undo)sert on undo)
     /// If this move caused a piece to leave its original starting square,
     /// we remove that coordinate from starting_squares. Store it here so
     /// undo_move can restore starting_squares exactly.
@@ -66,7 +67,7 @@ pub struct GameState {
     pub turn: PlayerColor,
     /// Special rights for pieces - includes both castling rights (kings/rooks) AND
     /// pawn double-move rights. A piece with its coordinate in this set has its special rights.
-    pub special_rights: HashSet<Coordinate>,
+    pub special_rights: FxHashSet<Coordinate>,
     pub en_passant: Option<EnPassantState>,
     pub halfmove_clock: u32,
     pub fullmove_number: u32,
@@ -92,7 +93,7 @@ pub struct GameState {
     pub starting_white_pieces: u16,
     #[serde(skip)]
     pub starting_black_pieces: u16,
-    /// Piece coordinates per color for fast iteration (avoid scanning full HashMap)
+    /// Piece coordinates per color for fast iteration
     #[serde(skip)]
     pub white_pieces: Vec<(i64, i64)>,
     #[serde(skip)]
@@ -104,7 +105,7 @@ pub struct GameState {
     /// non-royal pieces began the game. Used to apply a one-time
     /// development penalty while a piece remains on its original square.
     #[serde(skip)]
-    pub starting_squares: HashSet<Coordinate>,
+    pub starting_squares: FxHashSet<Coordinate>,
     /// Cached dynamic back ranks derived from promotion_ranks. These are
     /// computed once when the game is created.
     #[serde(skip)]
@@ -137,8 +138,8 @@ pub struct GameState {
 // For backwards compatibility, keep castling_rights as an alias
 impl GameState {
     /// Returns pieces that can castle (kings and rooks with special rights)
-    pub fn castling_rights(&self) -> HashSet<Coordinate> {
-        let mut rights = HashSet::new();
+    pub fn castling_rights(&self) -> FxHashSet<Coordinate> {
+        let mut rights = FxHashSet::default();
         for coord in &self.special_rights {
             if let Some(piece) = self.board.get_piece(&coord.x, &coord.y) {
                 // Only include kings and rooks (not pawns) in castling rights
@@ -164,7 +165,7 @@ impl GameState {
         GameState {
             board: Board::new(),
             turn: PlayerColor::White,
-            special_rights: HashSet::new(),
+            special_rights: FxHashSet::default(),
             en_passant: None,
             halfmove_clock: 0,
             fullmove_number: 1,
@@ -181,7 +182,7 @@ impl GameState {
             white_pieces: Vec::new(),
             black_pieces: Vec::new(),
             spatial_indices: SpatialIndices::default(),
-            starting_squares: HashSet::new(),
+            starting_squares: FxHashSet::default(),
             white_back_rank: 1,
             black_back_rank: 8,
             white_promo_rank: 8,
@@ -198,7 +199,7 @@ impl GameState {
         GameState {
             board: Board::new(),
             turn: PlayerColor::White,
-            special_rights: HashSet::new(),
+            special_rights: FxHashSet::default(),
             en_passant: None,
             halfmove_clock: 0,
             fullmove_number: 1,
@@ -215,7 +216,7 @@ impl GameState {
             white_pieces: Vec::new(),
             black_pieces: Vec::new(),
             spatial_indices: SpatialIndices::default(),
-            starting_squares: HashSet::new(),
+            starting_squares: FxHashSet::default(),
             white_back_rank: 1,
             black_back_rank: 8,
             white_promo_rank: 8,
@@ -1313,7 +1314,7 @@ impl GameState {
             old_en_passant: self.en_passant.clone(),
             old_halfmove_clock: self.halfmove_clock,
             old_hash: self.hash_stack.last().copied().unwrap_or(0), // Save original hash
-            special_rights_removed: Vec::new(),
+            special_rights_removed: ArrayVec::new(),
             starting_square_restored: None,
             old_white_king_pos: None,
             old_black_king_pos: None,
@@ -1621,16 +1622,27 @@ impl GameState {
         if depth == 0 {
             return 1;
         }
+        // One move buffer per ply so recursion doesn't overwrite
+        let mut bufs: Vec<Vec<Move>> = (0..=depth).map(|_| Vec::with_capacity(128)).collect();
+        self.perft_buf(depth, 0, &mut bufs)
+    }
 
-        let moves = self.get_legal_moves();
-        let mut nodes = 0;
-
-        for m in moves {
-            let undo = self.make_move(&m);
-            nodes += self.perft(depth - 1);
-            self.undo_move(&m, undo);
+    fn perft_buf(&mut self, depth: usize, ply: usize, bufs: &mut [Vec<Move>]) -> u64 {
+        if depth == 0 {
+            return 1;
         }
 
+        bufs[ply].clear();
+        self.get_legal_moves_into(&mut bufs[ply]);
+
+        let move_count = bufs[ply].len();
+        let mut nodes = 0u64;
+        for i in 0..move_count {
+            let m = bufs[ply][i];
+            let undo = self.make_move(&m);
+            nodes += self.perft_buf(depth - 1, ply + 1, bufs);
+            self.undo_move(&m, undo);
+        }
         nodes
     }
 
