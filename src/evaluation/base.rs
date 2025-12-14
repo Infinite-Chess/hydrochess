@@ -2131,7 +2131,7 @@ pub fn has_sufficient_mating_material(
     // Helper: check if we have "only" certain pieces (nothing else)
     // Using a macro for zero overhead - gets inlined at compile time
     macro_rules! has_only {
-        ($q:expr, $r:expr, $b:expr, $n:expr, $c:expr, $a:expr, $h:expr, $g:expr, $p:expr, $s:expr, $hu:expr, $am:expr) => {
+        ($q:expr_2021, $r:expr_2021, $b:expr_2021, $n:expr_2021, $c:expr_2021, $a:expr_2021, $h:expr_2021, $g:expr_2021, $p:expr_2021, $s:expr_2021, $hu:expr_2021, $am:expr_2021) => {
             queens <= $q
                 && rooks <= $r
                 && bishops <= $b

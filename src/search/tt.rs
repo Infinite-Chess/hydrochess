@@ -584,14 +584,14 @@ mod tests {
     #[test]
     fn test_tt_gen_bound_packing() {
         // Test that generation and bound are packed correctly
-        for gen in [0u8, 1, 31, 63] {
+        for r#gen in [0u8, 1, 31, 63] {
             for flag in [
                 TTFlag::None,
                 TTFlag::Exact,
                 TTFlag::LowerBound,
                 TTFlag::UpperBound,
             ] {
-                let packed = TTEntry::pack_gen_bound(gen, flag);
+                let packed = TTEntry::pack_gen_bound(r#gen, flag);
                 let entry = TTEntry {
                     key16: 0,
                     depth: 0,
@@ -599,7 +599,7 @@ mod tests {
                     score: 0,
                     tt_move: TTMove::none(),
                 };
-                assert_eq!(entry.generation(), gen & 0x3F);
+                assert_eq!(entry.generation(), r#gen & 0x3F);
                 assert_eq!(entry.flag(), flag);
             }
         }

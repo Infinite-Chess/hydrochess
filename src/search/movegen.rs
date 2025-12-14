@@ -123,9 +123,9 @@ impl StagedMoveGen {
         game: &GameState,
         excluded: Move,
     ) -> Self {
-        let mut gen = Self::new(tt_move, ply, searcher, game);
-        gen.excluded_move = Some(excluded);
-        gen
+        let mut r#gen = Self::new(tt_move, ply, searcher, game);
+        r#gen.excluded_move = Some(excluded);
+        r#gen
     }
 
     /// Check if a move is the excluded move
@@ -184,7 +184,7 @@ impl StagedMoveGen {
             score += cap_hist / 10;
 
             // Check bonus for captures that give check
-            if let Some(ref ek) = enemy_king {
+            if let Some(ek) = enemy_king {
                 if Self::move_gives_check_simple(game, m, ek) {
                     score += sort_gives_check();
                 }
@@ -217,7 +217,7 @@ impl StagedMoveGen {
         }
 
         // Check bonus
-        if let Some(ref ek) = enemy_king {
+        if let Some(ek) = enemy_king {
             if Self::move_gives_check_simple(game, m, ek) {
                 score += sort_gives_check();
             }
