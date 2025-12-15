@@ -362,374 +362,381 @@ async function playSingleGame(timePerMove, maxMoves, newPlaysWhite, materialThre
     // Initial position before any moves
     recordRepetition();
 
-    for (let i = 0; i < maxMoves; i++) {
-        const sideToMove = position.turn;
-        const isWhiteTurn = sideToMove === 'w';
+    try {
+        for (let i = 0; i < maxMoves; i++) {
+            const sideToMove = position.turn;
+            const isWhiteTurn = sideToMove === 'w';
 
-        // Sample positions for Texel-style tuning. We record a subset of
-        // midgame positions (by ply index) together with the current
-        // move_history and side to move. Final game result is attached
-        // when the game finishes.
-        const ply = moveHistory.length; // number of moves already played
-        const pieceCount = position.board.pieces.length;
-        if (ply >= 12 && ply <= 120 && ply % 4 === 0 && pieceCount > 4 && texelSamples.length < 32) {
-            texelSamples.push({
-                move_history: moveHistory.slice(),
-                side_to_move: sideToMove,
-                ply_index: ply,
-                piece_count: pieceCount,
-                // Capture the full board state at this ply so that downstream
-                // tooling can reconstruct the exact position for inspection.
-                position: clonePosition(position),
-            });
-        }
+            // Sample positions for Texel-style tuning. We record a subset of
+            // midgame positions (by ply index) together with the current
+            // move_history and side to move. Final game result is attached
+            // when the game finishes.
+            const ply = moveHistory.length; // number of moves already played
+            const pieceCount = position.board.pieces.length;
+            if (ply >= 12 && ply <= 120 && ply % 4 === 0 && pieceCount > 4 && texelSamples.length < 32) {
+                texelSamples.push({
+                    move_history: moveHistory.slice(),
+                    side_to_move: sideToMove,
+                    ply_index: ply,
+                    piece_count: pieceCount,
+                    // Capture the full board state at this ply so that downstream
+                    // tooling can reconstruct the exact position for inspection.
+                    position: clonePosition(position),
+                });
+            }
 
-        // winner, stop early and award the game. Only start checking after at
-        // least 20 plies, and only if both engines have provided evals.
-        if (moveHistory.length >= 20 && lastEvalNew !== null && lastEvalOld !== null) {
-            const uiThresh = typeof materialThreshold === 'number' ? materialThreshold : 0;
-            const threshold = Math.max(1500, uiThresh);
-            if (threshold > 0) {
-                function winnerFromWhiteEval(score) {
-                    if (score >= threshold) return 'w';
-                    if (score <= -threshold) return 'b';
-                    return null;
-                }
-
-                const newWinner = winnerFromWhiteEval(lastEvalNew);
-                const oldWinner = winnerFromWhiteEval(lastEvalOld);
-
-                let winningColor = null;
-                if (newWinner && oldWinner && newWinner === oldWinner) {
-                    winningColor = newWinner;
-                }
-
-                if (winningColor) {
-                    const evalCp = winningColor === 'w'
-                        ? Math.min(lastEvalNew, lastEvalOld)
-                        : Math.max(lastEvalNew, lastEvalOld);
-                    const result = winningColor === newColor ? 'win' : 'loss';
-                    const winnerStr = winningColor === 'w' ? 'White' : 'Black';
-                    moveLines.push('# Game adjudicated by material: ~' + (evalCp > 0 ? '+' : '') + evalCp + ' cp for ' + winnerStr + ' (threshold ' + threshold + ' cp, both engines agree; search eval from main search)');
-                    moveLines.push('# Engines: new=' + (newColor === 'w' ? 'White' : 'Black') + ', old=' + (newColor === 'w' ? 'Black' : 'White'));
-                    const result_token = winningColor === 'w' ? '1-0' : '0-1';
-                    for (const s of texelSamples) {
-                        s.result_token = result_token;
+            // winner, stop early and award the game. Only start checking after at
+            // least 20 plies, and only if both engines have provided evals.
+            if (moveHistory.length >= 20 && lastEvalNew !== null && lastEvalOld !== null) {
+                const uiThresh = typeof materialThreshold === 'number' ? materialThreshold : 0;
+                const threshold = Math.max(1500, uiThresh);
+                if (threshold > 0) {
+                    function winnerFromWhiteEval(score) {
+                        if (score >= threshold) return 'w';
+                        if (score <= -threshold) return 'b';
+                        return null;
                     }
-                    return { result, log: moveLines.join('\n'), reason: 'material_adjudication', materialThreshold: threshold, samples: texelSamples };
+
+                    const newWinner = winnerFromWhiteEval(lastEvalNew);
+                    const oldWinner = winnerFromWhiteEval(lastEvalOld);
+
+                    let winningColor = null;
+                    if (newWinner && oldWinner && newWinner === oldWinner) {
+                        winningColor = newWinner;
+                    }
+
+                    if (winningColor) {
+                        const evalCp = winningColor === 'w'
+                            ? Math.min(lastEvalNew, lastEvalOld)
+                            : Math.max(lastEvalNew, lastEvalOld);
+                        const result = winningColor === newColor ? 'win' : 'loss';
+                        const winnerStr = winningColor === 'w' ? 'White' : 'Black';
+                        moveLines.push('# Game adjudicated by material: ~' + (evalCp > 0 ? '+' : '') + evalCp + ' cp for ' + winnerStr + ' (threshold ' + threshold + ' cp, both engines agree; search eval from main search)');
+                        moveLines.push('# Engines: new=' + (newColor === 'w' ? 'White' : 'Black') + ', old=' + (newColor === 'w' ? 'Black' : 'White'));
+                        const result_token = winningColor === 'w' ? '1-0' : '0-1';
+                        for (const s of texelSamples) {
+                            s.result_token = result_token;
+                        }
+                        return { result, log: moveLines.join('\n'), reason: 'material_adjudication', materialThreshold: threshold, samples: texelSamples };
+                    }
                 }
             }
-        }
 
-        // Otherwise, let the appropriate engine choose a move from the full
-        // game history starting from the standard position. We rebuild
-        // gameInput each ply so the WASM side can reconstruct all dynamic
-        // state (clocks, en passant, special rights) by replaying moves.
-        const gameInput = clonePosition(startPosition);
-        gameInput.move_history = moveHistory.slice();
+            // Otherwise, let the appropriate engine choose a move from the full
+            // game history starting from the standard position. We rebuild
+            // gameInput each ply so the WASM side can reconstruct all dynamic
+            // state (clocks, en passant, special rights) by replaying moves.
+            const gameInput = clonePosition(startPosition);
+            gameInput.move_history = moveHistory.slice();
 
-        // Include clock info in the game state so the engine can manage its own time
-        if (haveClocks) {
-            gameInput.clock = {
-                wtime: Math.floor(whiteClock),
-                btime: Math.floor(blackClock),
-                winc: Math.floor(increment),
-                binc: Math.floor(increment),
-            };
-        }
-
-        // Pass authoritative game counters to the engine
-        gameInput.halfmove_clock = halfmoveClock;
-        gameInput.fullmove_number = fullmoveNumber;
-
-        // Let the appropriate engine choose a move on this gameInput
-        const EngineClass = isWhiteTurn
-            ? (newPlaysWhite ? EngineNew : EngineOld)
-            : (newPlaysWhite ? EngineOld : EngineNew);
-        const engineName = isWhiteTurn
-            ? (newPlaysWhite ? 'new' : 'old')
-            : (newPlaysWhite ? 'old' : 'new');
-
-        let searchTimeMs = timePerMove;
-        let flaggedOnTime = false;
-        const engine = new EngineClass(gameInput);
-        const startMs = nowMs();
-
-        // Safety check: if clock time is already zero or negative, flag timeout immediately
-        if (haveClocks) {
-            const currentClock = isWhiteTurn ? whiteClock : blackClock;
-            if (currentClock <= 0) {
-                flaggedOnTime = true;
-                engine.free();
-                return {
-                    result: isWhiteTurn ? 'black' : 'white',
-                    reason: 'timeout',
-                    moveHistory,
-                    moveLines,
-                    texelSamples,
-                    adjudicated: false,
-                    engineStats: { ...engineStats }
+            // Include clock info in the game state so the engine can manage its own time
+            if (haveClocks) {
+                gameInput.clock = {
+                    wtime: Math.floor(whiteClock),
+                    btime: Math.floor(blackClock),
+                    winc: Math.floor(increment),
+                    binc: Math.floor(increment),
                 };
             }
-        }
 
-        // For the first 4 ply (2 moves each side), use a slight noise
-        // to create opening variety. After ply 4, use normal search.
-        const currentPly = moveHistory.length;
-        const noiseAmp = currentPly < 4 ? (typeof searchNoise === 'number' ? searchNoise : 5) : null;
+            // Pass authoritative game counters to the engine
+            gameInput.halfmove_clock = halfmoveClock;
+            gameInput.fullmove_number = fullmoveNumber;
 
-        const move = engine.get_best_move_with_time(haveClocks ? 0 : searchTimeMs, true, maxDepth, noiseAmp);
-        engine.free();
+            // Let the appropriate engine choose a move on this gameInput
+            const EngineClass = isWhiteTurn
+                ? (newPlaysWhite ? EngineNew : EngineOld)
+                : (newPlaysWhite ? EngineOld : EngineNew);
+            const engineName = isWhiteTurn
+                ? (newPlaysWhite ? 'new' : 'old')
+                : (newPlaysWhite ? 'old' : 'new');
 
-        const elapsed = Math.max(0, Math.round(nowMs() - startMs));
+            let searchTimeMs = timePerMove;
+            let flaggedOnTime = false;
+            const engine = new EngineClass(gameInput);
+            const startMs = nowMs();
 
-        if (haveClocks) {
-            if (isWhiteTurn) {
-                let next = whiteClock - elapsed;
-                if (next < 0) {
+            // Safety check: if clock time is already zero or negative, flag timeout immediately
+            if (haveClocks) {
+                const currentClock = isWhiteTurn ? whiteClock : blackClock;
+                if (currentClock <= 0) {
                     flaggedOnTime = true;
-                    next = 0;
+                    engine.free();
+                    return {
+                        result: isWhiteTurn ? 'black' : 'white',
+                        reason: 'timeout',
+                        moveHistory,
+                        moveLines,
+                        texelSamples,
+                        adjudicated: false,
+                        engineStats: { ...engineStats }
+                    };
                 }
-                whiteClock = next + increment;
-            } else {
-                let next = blackClock - elapsed;
-                if (next < 0) {
-                    flaggedOnTime = true;
-                    next = 0;
+            }
+
+            // For the first 4 ply (2 moves each side), use a slight noise
+            // to create opening variety. After ply 4, use normal search.
+            const currentPly = moveHistory.length;
+            const noiseAmp = currentPly < 4 ? (typeof searchNoise === 'number' ? searchNoise : 5) : null;
+
+            const move = engine.get_best_move_with_time(haveClocks ? 0 : searchTimeMs, true, maxDepth, noiseAmp);
+            engine.free();
+
+            const elapsed = Math.max(0, Math.round(nowMs() - startMs));
+
+            if (haveClocks) {
+                if (isWhiteTurn) {
+                    let next = whiteClock - elapsed;
+                    if (next < 0) {
+                        flaggedOnTime = true;
+                        next = 0;
+                    }
+                    whiteClock = next + increment;
+                } else {
+                    let next = blackClock - elapsed;
+                    if (next < 0) {
+                        flaggedOnTime = true;
+                        next = 0;
+                    }
+                    blackClock = next + increment;
                 }
-                blackClock = next + increment;
             }
-        }
 
-        if (haveClocks && flaggedOnTime) {
-            moveLines.push('# Time forfeit: ' + (isWhiteTurn ? 'White' : 'Black') + ' flagged on time.');
-            const result = engineName === 'new' ? 'loss' : 'win';
-            const result_token = result === 'win' ? '1-0' : '0-1';
-            for (const s of texelSamples) {
-                s.result_token = result_token;
+            if (haveClocks && flaggedOnTime) {
+                moveLines.push('# Time forfeit: ' + (isWhiteTurn ? 'White' : 'Black') + ' flagged on time.');
+                const result = engineName === 'new' ? 'loss' : 'win';
+                const result_token = result === 'win' ? '1-0' : '0-1';
+                for (const s of texelSamples) {
+                    s.result_token = result_token;
+                }
+                return { result, log: moveLines.join('\n'), reason: 'time_forfeit', samples: texelSamples };
             }
-            return { result, log: moveLines.join('\n'), reason: 'time_forfeit', samples: texelSamples };
-        }
 
-        if (!move || !move.from || !move.to) {
-            // Engine returned no move. Before treating this as a rules-based
-            // terminal state, ask the WASM side whether any legal moves exist
-            // from the same gameInput. If legal moves remain, classify this
-            // as an engine failure instead of checkmate.
+            if (!move || !move.from || !move.to) {
+                // Engine returned no move. Before treating this as a rules-based
+                // terminal state, ask the WASM side whether any legal moves exist
+                // from the same gameInput. If legal moves remain, classify this
+                // as an engine failure instead of checkmate.
 
-            let hasLegalMoves = false;
+                let hasLegalMoves = false;
+                try {
+                    const checker = new EngineClass(gameInput);
+                    if (typeof checker.get_legal_moves_js === 'function') {
+                        const legal = checker.get_legal_moves_js();
+                        if (Array.isArray(legal) && legal.length > 0) {
+                            hasLegalMoves = true;
+                        }
+                    }
+                    checker.free();
+                } catch (e) {
+                    // If the probe itself fails, fall back to conservative
+                    // classification below.
+                }
+
+                let winningColor = sideToMove === 'w' ? 'b' : 'w';
+                let reason = null;
+
+                if (!hasLegalMoves) {
+                    // True terminal: no legal moves for sideToMove. From SPRT's
+                    // perspective this is a loss for that side (checkmate or
+                    // stalemate-as-loss), with one special-case variant below.
+                    reason = 'checkmate';
+
+                    // Special handling for Pawn_Horde: Black also wins by
+                    // eliminating all White pieces (the pawn horde). If that
+                    // condition holds, record a distinct reason.
+                    if (variantName === 'Pawn_Horde') {
+                        const whitePieces = position.board.pieces.filter((p) =>
+                            p.player === 'w' && p.piece_type !== 'x' && p.piece_type !== 'v'
+                        );
+                        if (whitePieces.length === 0) {
+                            winningColor = 'b';
+                            reason = 'horde_elimination';
+                        }
+                    }
+                } else {
+                    // Engine produced no move even though legal moves exist.
+                    // Treat this as an engine failure, not a rules-based result.
+                    reason = 'engine_failure';
+                }
+
+                const result = winningColor === newColor ? 'win' : 'loss';
+                const result_token = winningColor === 'w' ? '1-0' : '0-1';
+                for (const s of texelSamples) {
+                    s.result_token = result_token;
+                }
+
+                if (reason === 'horde_elimination') {
+                    moveLines.push('# No move returned; treated as win by capturing all White pieces in Pawn Horde.');
+                } else if (reason === 'checkmate') {
+                    moveLines.push('# No move returned; treated as checkmate / no legal moves for ' + (sideToMove === 'w' ? 'White' : 'Black') + '.');
+                } else {
+                    moveLines.push('# No move returned; treated as engine failure (legal moves still exist).');
+                }
+
+                return { result, log: moveLines.join('\n'), reason, samples: texelSamples };
+            }
+
+            // Record this engine's last search evaluation (from White's POV) if
+            // the engine returned an eval field. The Rust side reports eval from
+            // the side-to-move's perspective.
+            if (typeof move.eval === 'number') {
+                const evalSide = move.eval;
+                const evalWhite = sideToMove === 'w' ? evalSide : -evalSide;
+                if (engineName === 'new') {
+                    lastEvalNew = evalWhite;
+                } else {
+                    lastEvalOld = evalWhite;
+                }
+            }
+
+            let isPawnMove = false;
+            let isCapture = false;
+            {
+                const [fromX, fromY] = move.from.split(',');
+                const [toX, toY] = move.to.split(',');
+                const piecesBefore = position.board.pieces;
+                const movingPiece = piecesBefore.find(p => p.x === fromX && p.y === fromY);
+                if (movingPiece && typeof movingPiece.piece_type === 'string') {
+                    isPawnMove = movingPiece.piece_type.toLowerCase() === 'p';
+                }
+                isCapture = piecesBefore.some(p => p.x === toX && p.y === toY);
+            }
+
+            // First try to apply the move to our local position. If this fails,
+            // we treat it as an illegal move from the engine: the side to move
+            // loses immediately, and we DO NOT record this move in the log or
+            // move_history so that the resulting ICN is always playable.
             try {
-                const checker = new EngineClass(gameInput);
-                if (typeof checker.get_legal_moves_js === 'function') {
-                    const legal = checker.get_legal_moves_js();
-                    if (Array.isArray(legal) && legal.length > 0) {
-                        hasLegalMoves = true;
-                    }
-                }
-                checker.free();
+                position = applyMove(position, move);
             } catch (e) {
-                // If the probe itself fails, fall back to conservative
-                // classification below.
-            }
-
-            let winningColor = sideToMove === 'w' ? 'b' : 'w';
-            let reason = null;
-
-            if (!hasLegalMoves) {
-                // True terminal: no legal moves for sideToMove. From SPRT's
-                // perspective this is a loss for that side (checkmate or
-                // stalemate-as-loss), with one special-case variant below.
-                reason = 'checkmate';
-
-                // Special handling for Pawn_Horde: Black also wins by
-                // eliminating all White pieces (the pawn horde). If that
-                // condition holds, record a distinct reason.
-                if (variantName === 'Pawn_Horde') {
-                    const whitePieces = position.board.pieces.filter((p) =>
-                        p.player === 'w' && p.piece_type !== 'x' && p.piece_type !== 'v'
-                    );
-                    if (whitePieces.length === 0) {
-                        winningColor = 'b';
-                        reason = 'horde_elimination';
-                    }
+                // Illegal move from the engine: side that moved loses. Do NOT
+                // record the move itself in history so ICN remains playable.
+                moveLines.push('# Illegal move from ' + (engineName === 'new' ? 'HydroChess New' : 'HydroChess Old') +
+                    ': ' + (move && move.from && move.to ? (move.from + '>' + move.to) : 'null') +
+                    ' (' + (e && e.message ? e.message : String(e)) + ')');
+                const result = engineName === 'new' ? 'loss' : 'win';
+                const result_token = result === 'win' ? '1-0' : '0-1';
+                for (const s of texelSamples) {
+                    s.result_token = result_token;
                 }
-            } else {
-                // Engine produced no move even though legal moves exist.
-                // Treat this as an engine failure, not a rules-based result.
-                reason = 'engine_failure';
+                return { result, log: moveLines.join('\n'), reason: 'illegal_move', samples: texelSamples };
             }
 
-            const result = winningColor === newColor ? 'win' : 'loss';
-            const result_token = winningColor === 'w' ? '1-0' : '0-1';
-            for (const s of texelSamples) {
-                s.result_token = result_token;
+            // Only after a successful apply do we log and record the move.
+            let promotionSuffix = '';
+            if (move.promotion) {
+                // Convert engine promotion letter to site code, then apply case for side
+                const siteCode = engineLetterToSiteCode(move.promotion);
+                promotionSuffix = '=' + (sideToMove === 'w' ? siteCode.toUpperCase() : siteCode.toLowerCase());
             }
 
-            if (reason === 'horde_elimination') {
-                moveLines.push('# No move returned; treated as win by capturing all White pieces in Pawn Horde.');
-            } else if (reason === 'checkmate') {
-                moveLines.push('# No move returned; treated as checkmate / no legal moves for ' + (sideToMove === 'w' ? 'White' : 'Black') + '.');
-            } else {
-                moveLines.push('# No move returned; treated as engine failure (legal moves still exist).');
+            // Build move comment: [%clk] only if game clocks, [%eval], and depth text comment
+            let commands = '';
+            if (haveClocks) {
+                const clkMs = isWhiteTurn ? whiteClock : blackClock;
+                commands += `[%clk ${formatClock(clkMs)}]`;
+            }
+            // Add eval if available
+            if (typeof move.eval === 'number') {
+                if (commands) commands += ' ';
+                // If sideToMove is Black, negate the score so it's always from White's perspective.
+                let evalVal = move.eval;
+                if (sideToMove === 'b') {
+                    evalVal = -evalVal;
+                }
+                const evalCp = (evalVal / 100).toFixed(2);
+                const evalStr = evalVal >= 0 ? `+${evalCp}` : evalCp;
+                commands += `[%eval ${evalStr}]`;
+            }
+            // Add depth as a text comment (not a command)
+            let textComment = '';
+            if (maxDepth) {
+                textComment = `depth ${maxDepth}`;
+            }
+            // Combine: commands first, then text comment
+            let comment = commands;
+            if (textComment) {
+                if (comment) comment += ' ';
+                comment += textComment;
             }
 
-            return { result, log: moveLines.join('\n'), reason, samples: texelSamples };
-        }
+            // Calculate counters *before* applying the move, because applyMove updates the board
+            {
+                const pieces = position.board.pieces;
+                const [fromX, fromY] = move.from.split(',');
+                const [toX, toY] = move.to.split(',');
+                const movingPiece = pieces.find(p => p.x === fromX && p.y === fromY);
+                // Check for capture: is there a piece at dest?
+                const targetPiece = pieces.find(p => p.x === toX && p.y === toY);
+                const isCapture = !!targetPiece;
+                const isPawn = movingPiece && movingPiece.piece_type === 'p';
 
-        // Record this engine's last search evaluation (from White's POV) if
-        // the engine returned an eval field. The Rust side reports eval from
-        // the side-to-move's perspective.
-        if (typeof move.eval === 'number') {
-            const evalSide = move.eval;
-            const evalWhite = sideToMove === 'w' ? evalSide : -evalSide;
-            if (engineName === 'new') {
-                lastEvalNew = evalWhite;
-            } else {
-                lastEvalOld = evalWhite;
+                if (isPawn || isCapture) {
+                    halfmoveClock = 0;
+                } else {
+                    halfmoveClock++;
+                }
+
+                // If it was Black's turn, increment fullmove number
+                if (position.turn === 'b') {
+                    fullmoveNumber++;
+                }
             }
-        }
 
-        let isPawnMove = false;
-        let isCapture = false;
-        {
-            const [fromX, fromY] = move.from.split(',');
-            const [toX, toY] = move.to.split(',');
-            const piecesBefore = position.board.pieces;
-            const movingPiece = piecesBefore.find(p => p.x === fromX && p.y === fromY);
-            if (movingPiece && typeof movingPiece.piece_type === 'string') {
-                isPawnMove = movingPiece.piece_type.toLowerCase() === 'p';
-            }
-            isCapture = piecesBefore.some(p => p.x === toX && p.y === toY);
-        }
+            moveLines.push(
+                (sideToMove === 'w' ? 'W' : 'B') + ': ' + move.from + '>' + move.to + promotionSuffix + (comment ? '{' + comment + '}' : '')
+            );
 
-        // First try to apply the move to our local position. If this fails,
-        // we treat it as an illegal move from the engine: the side to move
-        // loses immediately, and we DO NOT record this move in the log or
-        // move_history so that the resulting ICN is always playable.
-        try {
-            position = applyMove(position, move);
-        } catch (e) {
-            // Illegal move from the engine: side that moved loses. Do NOT
-            // record the move itself in history so ICN remains playable.
-            moveLines.push('# Illegal move from ' + (engineName === 'new' ? 'HydroChess New' : 'HydroChess Old') +
-                ': ' + (move && move.from && move.to ? (move.from + '>' + move.to) : 'null') +
-                ' (' + (e && e.message ? e.message : String(e)) + ')');
-            const result = engineName === 'new' ? 'loss' : 'win';
-            const result_token = result === 'win' ? '1-0' : '0-1';
-            for (const s of texelSamples) {
-                s.result_token = result_token;
-            }
-            return { result, log: moveLines.join('\n'), reason: 'illegal_move', samples: texelSamples };
-        }
+            // Track move history from the initial position for subsequent engine calls
+            moveHistory.push({
+                from: move.from,
+                to: move.to,
+                promotion: move.promotion || null
+            });
 
-        // Only after a successful apply do we log and record the move.
-        let promotionSuffix = '';
-        if (move.promotion) {
-            // Convert engine promotion letter to site code, then apply case for side
-            const siteCode = engineLetterToSiteCode(move.promotion);
-            promotionSuffix = '=' + (sideToMove === 'w' ? siteCode.toUpperCase() : siteCode.toLowerCase());
-        }
-
-        // Build move comment: [%clk] only if game clocks, [%eval], and depth text comment
-        let commands = '';
-        if (haveClocks) {
-            const clkMs = isWhiteTurn ? whiteClock : blackClock;
-            commands += `[%clk ${formatClock(clkMs)}]`;
-        }
-        // Add eval if available
-        if (typeof move.eval === 'number') {
-            if (commands) commands += ' ';
-            // If sideToMove is Black, negate the score so it's always from White's perspective.
-            let evalVal = move.eval;
-            if (sideToMove === 'b') {
-                evalVal = -evalVal;
-            }
-            const evalCp = (evalVal / 100).toFixed(2);
-            const evalStr = evalVal >= 0 ? `+${evalCp}` : evalCp;
-            commands += `[%eval ${evalStr}]`;
-        }
-        // Add depth as a text comment (not a command)
-        let textComment = '';
-        if (maxDepth) {
-            textComment = `depth ${maxDepth}`;
-        }
-        // Combine: commands first, then text comment
-        let comment = commands;
-        if (textComment) {
-            if (comment) comment += ' ';
-            comment += textComment;
-        }
-
-        // Calculate counters *before* applying the move, because applyMove updates the board
-        {
-            const pieces = position.board.pieces;
-            const [fromX, fromY] = move.from.split(',');
-            const [toX, toY] = move.to.split(',');
-            const movingPiece = pieces.find(p => p.x === fromX && p.y === fromY);
-            // Check for capture: is there a piece at dest?
-            const targetPiece = pieces.find(p => p.x === toX && p.y === toY);
-            const isCapture = !!targetPiece;
-            const isPawn = movingPiece && movingPiece.piece_type === 'p';
-
-            if (isPawn || isCapture) {
+            if (isPawnMove || isCapture) {
                 halfmoveClock = 0;
             } else {
-                halfmoveClock++;
+                halfmoveClock += 1;
             }
 
-            // If it was Black's turn, increment fullmove number
-            if (position.turn === 'b') {
-                fullmoveNumber++;
-            }
-        }
-
-        moveLines.push(
-            (sideToMove === 'w' ? 'W' : 'B') + ': ' + move.from + '>' + move.to + promotionSuffix + (comment ? '{' + comment + '}' : '')
-        );
-
-        // Track move history from the initial position for subsequent engine calls
-        moveHistory.push({
-            from: move.from,
-            to: move.to,
-            promotion: move.promotion || null
-        });
-
-        if (isPawnMove || isCapture) {
-            halfmoveClock = 0;
-        } else {
-            halfmoveClock += 1;
-        }
-
-        const repCount = recordRepetition();
-        if (repCount >= 3) {
-            for (const s of texelSamples) {
-                s.result_token = '1/2-1/2';
-            }
-            return { result: 'draw', log: moveLines.join('\n'), reason: 'threefold', samples: texelSamples };
-        }
-
-        if (halfmoveClock >= 100) {
-            for (const s of texelSamples) {
-                s.result_token = '1/2-1/2';
-            }
-            return { result: 'draw', log: moveLines.join('\n'), reason: 'fifty_move', samples: texelSamples };
-        }
-
-        const gameState = isGameOver(position);
-        if (gameState.over) {
-            if (gameState.reason === 'draw') {
+            const repCount = recordRepetition();
+            if (repCount >= 3) {
                 for (const s of texelSamples) {
                     s.result_token = '1/2-1/2';
                 }
-                return { result: 'draw', log: moveLines.join('\n'), reason: 'insufficient_material', samples: texelSamples };
+                return { result: 'draw', log: moveLines.join('\n'), reason: 'threefold', samples: texelSamples };
             }
-            const result = sideToMove === newColor ? 'win' : 'loss';
-            const result_token = result === 'win' ? '1-0' : '0-1';
-            for (const s of texelSamples) {
-                s.result_token = result_token;
+
+            if (halfmoveClock >= 100) {
+                for (const s of texelSamples) {
+                    s.result_token = '1/2-1/2';
+                }
+                return { result: 'draw', log: moveLines.join('\n'), reason: 'fifty_move', samples: texelSamples };
             }
-            return { result, log: moveLines.join('\n'), reason: gameState.reason || 'checkmate', samples: texelSamples };
+
+            const gameState = isGameOver(position);
+            if (gameState.over) {
+                if (gameState.reason === 'draw') {
+                    for (const s of texelSamples) {
+                        s.result_token = '1/2-1/2';
+                    }
+                    return { result: 'draw', log: moveLines.join('\n'), reason: 'insufficient_material', samples: texelSamples };
+                }
+                const result = sideToMove === newColor ? 'win' : 'loss';
+                const result_token = result === 'win' ? '1-0' : '0-1';
+                for (const s of texelSamples) {
+                    s.result_token = result_token;
+                }
+                return { result, log: moveLines.join('\n'), reason: gameState.reason || 'checkmate', samples: texelSamples };
+            }
         }
+    } catch (e) {
+        // Attach history to error object so we can report it
+        e.moveLines = moveLines;
+        e.moveHistory = moveHistory;
+        throw e;
     }
 
     for (const s of texelSamples) {
@@ -793,6 +800,9 @@ self.onmessage = async (e) => {
                 type: 'error',
                 gameIndex: msg.gameIndex,
                 error: err.message || String(err),
+                log: err.moveLines ? err.moveLines.join('\n') : null,
+                moveHistory: err.moveHistory || null,
+                variantName: msg.variantName || 'Classical',
             });
         }
     } else if (msg.type === 'getVariants') {

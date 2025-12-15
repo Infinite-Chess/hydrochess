@@ -598,7 +598,7 @@ impl SharedTTView {
         // Sample 1000 entries
         let sample_size = 1000;
         let total_buckets = self.len / (WORDS_PER_ENTRY * ENTRIES_PER_BUCKET);
-        
+
         // If table is small, check everything
         if total_buckets < sample_size {
             let used = self.used_entries();
@@ -616,7 +616,7 @@ impl SharedTTView {
         for i in 0..sample_size {
             let bucket_idx = i * step;
             let base_offset = self.bucket_offset(bucket_idx);
-            
+
             // Check if any entry in the bucket is used
             let mut bucket_used = false;
             for entry_idx in 0..ENTRIES_PER_BUCKET {
@@ -630,7 +630,7 @@ impl SharedTTView {
                 used_samples += 1;
             }
         }
-        
+
         (used_samples * 1000) / sample_size as u32
     }
 
@@ -638,7 +638,7 @@ impl SharedTTView {
     pub unsafe fn used_entries(&self) -> usize {
         let mut used = 0;
         let total_entries = self.len / WORDS_PER_ENTRY;
-        
+
         for i in 0..total_entries {
             let offset = i * WORDS_PER_ENTRY;
             if self.load_word(offset) != 0 {

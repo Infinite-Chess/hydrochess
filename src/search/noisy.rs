@@ -361,6 +361,12 @@ fn negamax_noisy(
     let alpha_orig = alpha;
     let beta_orig = beta;
 
+    // CRITICAL: Check for max ply BEFORE any array accesses to prevent out-of-bounds
+    // This must be the very first check to avoid panics when ply >= MAX_PLY
+    if ply >= MAX_PLY - 1 {
+        return evaluate_with_noise(game, noise_amp);
+    }
+
     searcher.nodes += 1;
     // Initialize PV length to 0; will be updated if alpha is raised
     searcher.pv_length[ply] = 0;
@@ -371,10 +377,6 @@ fn negamax_noisy(
 
     if searcher.check_time() {
         return 0;
-    }
-
-    if ply >= MAX_PLY - 1 {
-        return evaluate_with_noise(game, noise_amp);
     }
 
     if game.is_fifty() {
@@ -760,6 +762,12 @@ fn quiescence_noisy(
     beta: i32,
     noise_amp: i32,
 ) -> i32 {
+    // CRITICAL: Check for max ply BEFORE any array accesses to prevent out-of-bounds
+    // This must be the very first check to avoid panics when ply >= MAX_PLY
+    if ply >= MAX_PLY - 1 {
+        return evaluate_with_noise(game, noise_amp);
+    }
+
     searcher.nodes += 1;
     searcher.qnodes += 1;
 
@@ -787,10 +795,6 @@ fn quiescence_noisy(
         if alpha < stand_pat {
             alpha = stand_pat;
         }
-    }
-
-    if ply >= MAX_PLY - 1 {
-        return stand_pat;
     }
 
     let mut tactical_moves = Vec::new();

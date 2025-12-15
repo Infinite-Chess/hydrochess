@@ -1,8 +1,8 @@
 use crate::board::{Board, Coordinate, Piece, PieceType, PlayerColor};
 use crate::evaluation::{calculate_initial_material, get_piece_value};
 use crate::moves::{
-    get_legal_moves, get_legal_moves_into, get_pseudo_legal_moves_for_piece, is_square_attacked,
-    Move, SpatialIndices,
+    Move, SpatialIndices, get_legal_moves, get_legal_moves_into, get_pseudo_legal_moves_for_piece,
+    is_square_attacked,
 };
 use arrayvec::ArrayVec;
 use rustc_hash::FxHashSet;
@@ -421,7 +421,7 @@ impl GameState {
 
     /// Make a null move (just flip turn, for null move pruning)
     pub fn make_null_move(&mut self) {
-        use crate::search::zobrist::{en_passant_key, SIDE_KEY};
+        use crate::search::zobrist::{SIDE_KEY, en_passant_key};
 
         // Push current hash
         self.hash_stack.push(self.hash);
@@ -464,7 +464,7 @@ impl GameState {
 
     /// Recompute the hash from scratch (slow, use sparingly)
     pub fn recompute_hash(&mut self) {
-        use crate::search::zobrist::{en_passant_key, piece_key, special_right_key, SIDE_KEY};
+        use crate::search::zobrist::{SIDE_KEY, en_passant_key, piece_key, special_right_key};
 
         let mut h: u64 = 0;
 
@@ -1295,7 +1295,7 @@ impl GameState {
     }
 
     pub fn make_move(&mut self, m: &Move) -> UndoMove {
-        use crate::search::zobrist::{en_passant_key, piece_key, special_right_key, SIDE_KEY};
+        use crate::search::zobrist::{SIDE_KEY, en_passant_key, piece_key, special_right_key};
 
         // Push current position hash BEFORE making the move (for repetition detection)
         self.hash_stack.push(self.hash);

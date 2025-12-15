@@ -1604,6 +1604,12 @@ fn negamax(
     let alpha_orig = alpha;
     let beta_orig = beta;
 
+    // CRITICAL: Check for max ply BEFORE any array accesses to prevent out-of-bounds
+    // This must be the very first check to avoid panics when ply >= MAX_PLY
+    if ply >= MAX_PLY - 1 {
+        return evaluate(game);
+    }
+
     searcher.nodes += 1;
     // Initialize PV length to 0; will be updated if alpha is raised
     searcher.pv_length[ply] = 0;
@@ -1616,11 +1622,6 @@ fn negamax(
     // Time check
     if searcher.check_time() {
         return 0;
-    }
-
-    // Check for max ply
-    if ply >= MAX_PLY - 1 {
-        return evaluate(game);
     }
 
     // Fifty-move rule: 100 half-moves without pawn move or capture is a draw
@@ -1845,6 +1846,18 @@ fn negamax(
             }
         }
 
+        // Skip Quiet Moves optimization (Stockfish-style FutilityMoveCount)
+        // When we've searched enough moves, stop generating quiets entirely.
+        // Formula: threshold = (3 + depth*depth) / (2 - improving)
+        // This is more efficient than individual LMP because it skips quiet generation.
+        if !in_check && !is_pv && depth > 0 && best_score > -MATE_SCORE {
+            let improving_divisor = if improving { 1 } else { 2 };
+            let futility_move_count = (3 + depth * depth) / improving_divisor;
+            if legal_moves >= futility_move_count {
+                movegen.skip_quiet_moves();
+            }
+        }
+
         // SEE-based move pruning for captures
         // Skip clearly losing captures at non-PV nodes when we have at least one legal move
         if !in_check && !is_pv && is_capture && legal_moves > 0 && best_score > -MATE_SCORE {
@@ -1857,7 +1870,7 @@ fn negamax(
             }
         }
 
-        let undo = game.make_move(&m);
+        let mut undo = game.make_move(&m);
 
         // Check if move is illegal (leaves our king in check)
         if game.is_move_illegal() {
@@ -1961,7 +1974,7 @@ fn negamax(
                 // Re-make the TT move since we undid it above
                 let new_undo = game.make_move(&m);
                 // Update undo for later
-                let undo = new_undo;
+                undo = new_undo;
 
                 if se_best < singular_beta {
                     // TT move is singular - extend it
@@ -2300,6 +2313,12 @@ fn quiescence(
     mut alpha: i32,
     beta: i32,
 ) -> i32 {
+    // CRITICAL: Check for max ply BEFORE any array accesses to prevent out-of-bounds
+    // This must be the very first check to avoid panics when ply >= MAX_PLY
+    if ply >= MAX_PLY - 1 {
+        return evaluate(game);
+    }
+
     searcher.nodes += 1;
     searcher.qnodes += 1;
 

@@ -978,17 +978,9 @@ pub fn is_square_attacked(
                     // Check direction
                     let sign = if dist > 0 { 1 } else { -1 };
                     let dir_check = if dx == 0 {
-                        if dy == sign {
-                            true
-                        } else {
-                            false
-                        }
+                        if dy == sign { true } else { false }
                     } else {
-                        if dx == sign {
-                            true
-                        } else {
-                            false
-                        }
+                        if dx == sign { true } else { false }
                     };
 
                     if dir_check {
@@ -1786,11 +1778,7 @@ fn ray_border_distance(from: &Coordinate, dir_x: i64, dir_y: i64) -> Option<i64>
                 from.y - min_y
             };
             let limit = raw.min(MAX_INF_DISTANCE);
-            if limit > 0 {
-                Some(limit)
-            } else {
-                None
-            }
+            if limit > 0 { Some(limit) } else { None }
         } else if dir_y == 0 {
             let raw = if dir_x > 0 {
                 max_x - from.x
@@ -1798,11 +1786,7 @@ fn ray_border_distance(from: &Coordinate, dir_x: i64, dir_y: i64) -> Option<i64>
                 from.x - min_x
             };
             let limit = raw.min(MAX_INF_DISTANCE);
-            if limit > 0 {
-                Some(limit)
-            } else {
-                None
-            }
+            if limit > 0 { Some(limit) } else { None }
         } else if dir_x.abs() == dir_y.abs() {
             let raw_x = if dir_x > 0 {
                 max_x - from.x
@@ -1816,11 +1800,7 @@ fn ray_border_distance(from: &Coordinate, dir_x: i64, dir_y: i64) -> Option<i64>
             };
             let raw = raw_x.min(raw_y);
             let limit = raw.min(MAX_INF_DISTANCE);
-            if limit > 0 {
-                Some(limit)
-            } else {
-                None
-            }
+            if limit > 0 { Some(limit) } else { None }
         } else {
             None
         }

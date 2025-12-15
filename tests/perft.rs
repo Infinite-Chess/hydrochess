@@ -383,7 +383,7 @@ fn perft_fairy_piece_mix() {
     // run a search-only speed test on the same fairy position,
     // similar to run_search_only_suite but limited to depth 4 and 3 runs.
     const NUM_RUNS: usize = 3;
-    const MAX_SEARCH_DEPTH: usize = 5;
+    const MAX_SEARCH_DEPTH: usize = 6;
 
     println!(
         "\nFairy mix search-only benchmark ({} runs, depth 1..{}):",

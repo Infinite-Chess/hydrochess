@@ -93,7 +93,8 @@ function buildNewWebPkg() {
         const extraFeatures = (process.env.EVAL_TUNING === '1' || process.env.EVAL_TUNING === 'true')
             ? ' --features eval_tuning'
             : '';
-        execSync('wasm-pack build --target web --out-dir sprt/web/pkg-new' + extraFeatures, {
+        // Always build with debug feature enabled to get proper stack traces for panics
+        execSync('wasm-pack build --target web --out-dir sprt/web/pkg-new --features debug' + extraFeatures, {
             cwd: PROJECT_ROOT,
             stdio: 'inherit',
         });

@@ -9,7 +9,15 @@ pub mod moves;
 pub mod search;
 mod utils;
 
-use crate::moves::{set_world_bounds, SpatialIndices};
+// Initialize panic hook for better error messages in WASM
+// This will show actual line numbers instead of just "unreachable"
+#[cfg(feature = "debug")]
+#[wasm_bindgen(start)]
+fn init_panic_hook() {
+    console_error_panic_hook::set_once();
+}
+
+use crate::moves::{SpatialIndices, set_world_bounds};
 use board::{Board, Coordinate, Piece, PieceType, PlayerColor};
 use evaluation::calculate_initial_material;
 use game::{EnPassantState, GameState};
@@ -425,8 +433,8 @@ impl Engine {
         game.material_score = calculate_initial_material(&game.board);
         game.recompute_piece_counts(); // Rebuild piece lists and counts
         game.init_starting_piece_counts(); // Cache starting non-pawn piece counts for phase detection
-                                           // Initialize development starting squares from the initial board
-                                           // before replaying move history.
+        // Initialize development starting squares from the initial board
+        // before replaying move history.
         game.init_starting_squares();
         game.recompute_hash(); // Compute initial hash from position
 

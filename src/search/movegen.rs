@@ -70,6 +70,10 @@ pub struct StagedMoveGen {
 
     // Excluded move (for singular extension verification)
     excluded_move: Option<Move>,
+
+    // Skip quiet moves flag (for FutilityMoveCount pruning)
+    // When set, the generator will skip generating/returning quiet moves
+    skip_quiets: bool,
 }
 
 impl StagedMoveGen {
@@ -111,6 +115,7 @@ impl StagedMoveGen {
             quiets: Vec::with_capacity(64),
             quiet_idx: 0,
             excluded_move: None,
+            skip_quiets: false,
         }
     }
 
@@ -128,6 +133,14 @@ impl StagedMoveGen {
         r#gen
     }
 
+    /// Skip generating and returning quiet moves.
+    /// Called from search when moveCount exceeds FutilityMoveCount threshold.
+    /// This prevents wasting time generating quiets that will be pruned anyway.
+    #[inline]
+    pub fn skip_quiet_moves(&mut self) {
+        self.skip_quiets = true;
+    }
+
     /// Check if a move is the excluded move
     #[inline]
     fn is_excluded(&self, m: &Move) -> bool {
@@ -138,11 +151,57 @@ impl StagedMoveGen {
         }
     }
 
-    /// Check if move is pseudo-legal (piece exists at from square)
+    /// Check if move is pseudo-legal (strict validation)
     #[inline]
     fn is_pseudo_legal(game: &GameState, m: &Move) -> bool {
         if let Some(piece) = game.board.get_piece(&m.from.x, &m.from.y) {
-            piece.color() == game.turn && piece.piece_type() == m.piece.piece_type()
+            if piece.color() != game.turn || piece.piece_type() != m.piece.piece_type() {
+                return false;
+            }
+
+            // O(1) castling integrity check:
+            // TT moves may be invalid if path is blocked or rook moved. Check:
+            // 1. Rook exists at rook_coord
+            // 2. King's landing squares are clear (m.to and one square between)
+            // 3. Rook's landing square is clear
+            if piece.piece_type().is_royal() && (m.to.x - m.from.x).abs() > 1 {
+                if let Some(rook_coord) = &m.rook_coord {
+                    if let Some(rook) = game.board.get_piece(&rook_coord.x, &rook_coord.y) {
+                        if rook.color() != game.turn {
+                            return false;
+                        }
+
+                        // Calculate direction and critical squares
+                        let dir = if m.to.x > m.from.x { 1 } else { -1 };
+
+                        // King passes through m.from+dir and lands on m.to (m.from + 2*dir)
+                        let king_path_1 = m.from.x + dir;
+                        let king_path_2 = m.to.x; // = m.from.x + 2*dir
+
+                        // Check king's path squares (these must be empty for castling)
+                        if game.board.get_piece(&king_path_1, &m.from.y).is_some() {
+                            return false;
+                        }
+                        if game.board.get_piece(&king_path_2, &m.from.y).is_some() {
+                            return false;
+                        }
+
+                        // For queenside, also check the square next to rook (b-file)
+                        // The rook passes through this square
+                        if dir < 0 {
+                            let extra_path = m.from.x - 3; // b1 for standard chess
+                            if game.board.get_piece(&extra_path, &m.from.y).is_some() {
+                                return false;
+                            }
+                        }
+                    } else {
+                        return false; // Rook missing
+                    }
+                } else {
+                    return false; // Rook coord missing
+                }
+            }
+            true
         } else {
             false
         }
@@ -158,7 +217,12 @@ impl StagedMoveGen {
     #[inline]
     fn moves_match(a: &Move, b: &Option<Move>) -> bool {
         match b {
-            Some(bm) => a.from == bm.from && a.to == bm.to && a.promotion == bm.promotion,
+            Some(bm) => {
+                a.from == bm.from
+                    && a.to == bm.to
+                    && a.promotion == bm.promotion
+                    && a.rook_coord == bm.rook_coord
+            }
             None => false,
         }
     }
@@ -399,6 +463,10 @@ impl StagedMoveGen {
 
                 MoveStage::Killer1 => {
                     self.stage = MoveStage::Killer2;
+                    // Skip killers if we're skipping quiets
+                    if self.skip_quiets {
+                        continue;
+                    }
                     if !self.killer1_yielded {
                         self.killer1_yielded = true;
                         if let Some(ref k) = self.killer1 {
@@ -416,6 +484,10 @@ impl StagedMoveGen {
 
                 MoveStage::Killer2 => {
                     self.stage = MoveStage::GenerateQuiets;
+                    // Skip killers if we're skipping quiets
+                    if self.skip_quiets {
+                        continue;
+                    }
                     if !self.killer2_yielded {
                         self.killer2_yielded = true;
                         if let Some(ref k) = self.killer2 {
@@ -432,6 +504,12 @@ impl StagedMoveGen {
                 }
 
                 MoveStage::GenerateQuiets => {
+                    // Skip quiet generation entirely if we're skipping quiets
+                    if self.skip_quiets {
+                        self.stage = MoveStage::BadCaptures;
+                        continue;
+                    }
+
                     let mut quiets_raw = Vec::with_capacity(64);
                     get_quiet_moves_into(
                         &game.board,

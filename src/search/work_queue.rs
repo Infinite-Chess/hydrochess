@@ -46,7 +46,7 @@ unsafe impl Sync for SharedWorkQueue {}
 #[cfg(target_arch = "wasm32")]
 impl SharedWorkQueue {
     /// Create a view into shared work queue memory
-    /// 
+    ///
     /// # Safety
     /// The caller must ensure the pointer is valid and properly aligned.
     pub unsafe fn new(ptr: *mut u64, len: usize) -> Self {
@@ -80,12 +80,8 @@ impl SharedWorkQueue {
     pub unsafe fn claim_next_move(&self) -> usize {
         let total = (*self.ptr.add(1)).load(Ordering::Acquire) as usize;
         let idx = (*self.ptr.add(0)).fetch_add(1, Ordering::AcqRel) as usize;
-        
-        if idx < total {
-            idx
-        } else {
-            NO_MORE_MOVES
-        }
+
+        if idx < total { idx } else { NO_MORE_MOVES }
     }
 
     /// Get the move at a given index
@@ -102,12 +98,12 @@ impl SharedWorkQueue {
         // Atomically update best if this is better
         let best_ptr = self.ptr.add(2) as *mut AtomicI64;
         let mut current_best = (*best_ptr).load(Ordering::Acquire);
-        
+
         loop {
             if score as i64 <= current_best {
                 break; // Not better
             }
-            
+
             match (*best_ptr).compare_exchange_weak(
                 current_best,
                 score as i64,
@@ -142,7 +138,7 @@ impl SharedWorkQueue {
         if best_idx == u64::MAX {
             return None;
         }
-        
+
         let score = (*(self.ptr.add(2) as *mut AtomicI64)).load(Ordering::Acquire) as i32;
         self.load_move(best_idx as usize).map(|m| (m, score))
     }
@@ -186,7 +182,7 @@ impl SharedWorkQueue {
         // Swap best move with first move
         let first_move = self.load_move(0);
         let best_move = self.load_move(best_idx);
-        
+
         if let (Some(fm), Some(bm)) = (first_move, best_move) {
             self.store_move(0, &bm);
             self.store_move(best_idx, &fm);
@@ -199,7 +195,7 @@ impl SharedWorkQueue {
 
     unsafe fn store_move(&self, index: usize, m: &Move) {
         let base = HEADER_SIZE + index * WORDS_PER_PACKED_MOVE;
-        
+
         // Word 0: from_x as i64
         (*self.ptr.add(base)).store(m.from.x as u64, Ordering::Release);
         // Word 1: from_y as i64
@@ -218,7 +214,7 @@ impl SharedWorkQueue {
 
     unsafe fn load_move(&self, index: usize) -> Option<Move> {
         let base = HEADER_SIZE + index * WORDS_PER_PACKED_MOVE;
-        
+
         if base + WORDS_PER_PACKED_MOVE > self.len {
             return None;
         }
@@ -232,7 +228,7 @@ impl SharedWorkQueue {
 
         let piece_type = PieceType::from_u8(((piece_info >> 8) & 0xFF) as u8);
         let color = PlayerColor::from_u8((piece_info & 0xFF) as u8);
-        
+
         let promotion = if promo > 0 {
             Some(PieceType::from_u8((promo - 1) as u8))
         } else {

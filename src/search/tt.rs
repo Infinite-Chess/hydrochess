@@ -44,8 +44,6 @@ impl TTFlag {
 /// but removes Option overhead by using sentinel values.
 ///
 /// Size: 40 bytes (from: 16 + to: 16 + piece_type: 1 + piece_color: 1 + promotion: 1 + padding: 5)
-/// This is still much better than Option<Move> which has additional tag overhead
-/// and includes rook_coord for castling.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 pub struct TTMove {
@@ -123,7 +121,7 @@ impl TTMove {
             },
             piece,
             promotion,
-            rook_coord: None, // Castling info not stored in TT (not needed for move ordering)
+            rook_coord: None, // TT doesn't store rook_coord; is_pseudo_legal validates
         })
     }
 
@@ -557,13 +555,13 @@ mod tests {
         );
         assert_eq!(
             std::mem::size_of::<TTEntry>(),
-            48,
-            "TTEntry should be 48 bytes"
+            64,
+            "TTEntry should be 64 bytes"
         );
         assert_eq!(
             std::mem::size_of::<TTBucket>(),
-            48 * ENTRIES_PER_BUCKET,
-            "TTBucket should be 192 bytes (4 x 48)"
+            64 * ENTRIES_PER_BUCKET,
+            "TTBucket should be 256 bytes (4 x 64)"
         );
     }
 
