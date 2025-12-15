@@ -386,21 +386,26 @@ impl GameState {
     }
 
     /// Stockfish-style repetition detection for search.
-    /// Returns true if position has repeated strictly WITHIN the current search tree.
-    /// This catches drawing lines that should be avoided during search.
+    /// Returns true if the current position should be treated as a draw due to repetition.
     ///
-    /// Key insight: if a position repeats within the current search tree (repetition < ply),
-    /// it's effectively a draw because opponent can force threefold.
-    /// If it only repeats from game history before root, we still need twofold at minimum.
+    /// Two cases:
+    /// 1. Threefold repetition (repetition < 0): Always a draw, regardless of ply.
+    ///    The position has occurred twice before (in game history or search), making this the third time.
+    /// 2. Twofold within search tree (repetition > 0 && repetition <= ply): Effectively a draw
+    ///    because opponent can force threefold by repeating. Only applies if the first occurrence
+    ///    is within the current search tree.
     #[inline]
     pub fn is_repetition(&self, ply: usize) -> bool {
         // Don't check during null move search
         if self.null_moves > 0 {
             return false;
         }
-        // Simple O(1) check using precomputed repetition distance
-        // repetition > 0 means we found a previous occurrence
-        // repetition <= ply means it's within the current search tree
+        // Threefold: repetition < 0 means position has occurred twice before (this is 3rd time)
+        if self.repetition < 0 {
+            return true;
+        }
+        // Twofold within search tree: repetition > 0 means we found a previous occurrence,
+        // and repetition <= ply means it's within the current search tree (opponent can force 3-fold)
         self.repetition > 0 && (self.repetition as usize) <= ply
     }
 
@@ -1536,22 +1541,34 @@ impl GameState {
         self.turn = self.turn.opponent();
 
         // Stockfish-style repetition detection: compute distance to previous occurrence
-        // of same position. 0 = no repetition, positive = distance, negative = threefold.
+        // of same position. 0 = no repetition, positive = distance to twofold, negative = threefold.
         self.repetition = 0;
         let end = (self.halfmove_clock as usize).min(self.hash_stack.len());
         if end >= 4 {
             let current_hash = self.hash;
             // Check every 2 plies (same side to move)
             let mut i = 4usize;
+            let mut first_match: Option<i32> = None;
             while i <= end {
                 let idx = self.hash_stack.len().saturating_sub(i);
                 if idx < self.hash_stack.len() && self.hash_stack[idx] == current_hash {
-                    // Found a match! Check if that position was already a repetition
-                    // For simplicity, we store positive distance (Stockfish stores negative for 3-fold)
-                    self.repetition = i as i32;
-                    break;
+                    if first_match.is_none() {
+                        // First match: store distance as positive (twofold)
+                        first_match = Some(i as i32);
+                        // Continue searching for a second match (threefold)
+                    } else {
+                        // Second match: this is threefold! Store as negative.
+                        self.repetition = -(first_match.unwrap());
+                        break;
+                    }
                 }
                 i += 2;
+            }
+            // If we only found one match, store it as positive (twofold)
+            if self.repetition == 0 {
+                if let Some(dist) = first_match {
+                    self.repetition = dist;
+                }
             }
         }
 
