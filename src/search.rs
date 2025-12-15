@@ -492,6 +492,11 @@ pub struct Searcher {
     /// Negative values = TT moves often fail.
     /// Uses gravity-based update formula for smoothing.
     pub tt_move_history: i32,
+
+    /// Reduction stack for hindsight depth adjustment.
+    /// Stores the LMR reduction applied at each ply.
+    /// Used to adjust depth based on prior search decisions.
+    pub reduction_stack: Vec<i32>,
 }
 
 impl Searcher {
@@ -540,6 +545,7 @@ impl Searcher {
             material_corrhist: Box::new([[0i32; CORRHIST_SIZE]; 2]),
             lastmove_corrhist: Box::new([0i32; LASTMOVE_CORRHIST_SIZE]),
             tt_move_history: 0,
+            reduction_stack: vec![0; MAX_PLY],
         }
     }
 
@@ -1701,6 +1707,27 @@ fn negamax(
         false // Conservative default
     };
 
+    // Hindsight Depth Adjustment (Stockfish-style)
+    // Uses the reduction applied at the parent ply to adjust our depth.
+    // ONLY applied when not in check (static_eval is meaningless in check).
+    if !in_check && ply > 0 {
+        let prior_reduction = searcher.reduction_stack[ply - 1];
+        let prev_eval = searcher.eval_stack[ply - 1];
+
+        // If we were heavily reduced but the opponent didn't worsen, increase depth
+        // (the reduced move might actually be important).
+        if prior_reduction >= 3 && !opponent_worsening {
+            depth += 1;
+        }
+
+        // If we had some reduction and both evals are high (stable position),
+        // we can decrease depth since the position is unlikely to have tactics.
+        // Stockfish uses: ss->staticEval + (ss - 1)->staticEval > 173
+        if prior_reduction >= 2 && depth >= 2 && static_eval + prev_eval > 173 {
+            depth = depth.saturating_sub(1);
+        }
+    }
+
     // Derive cut_node from node_type parameter
     let cut_node = node_type == NodeType::Cut;
 
@@ -2153,6 +2180,8 @@ fn negamax(
             };
 
             // Null window search with possible reduction
+            // Store reduction for hindsight depth adjustment in child nodes
+            searcher.reduction_stack[ply] = reduction;
             let mut s = -negamax(
                 searcher,
                 game,
