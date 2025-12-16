@@ -505,19 +505,34 @@ fn negamax_noisy(
         0
     };
 
+    // Find enemy king position for check detection (cached lookup)
+    let enemy_king_pos = match game.turn {
+        crate::board::PlayerColor::White => game.black_king_pos,
+        crate::board::PlayerColor::Black => game.white_king_pos,
+        crate::board::PlayerColor::Neutral => None,
+    };
+
     for m in &moves {
         let captured_piece = game.board.get_piece(&m.to.x, &m.to.y);
         let is_capture = captured_piece.map_or(false, |p| !p.piece_type().is_neutral_type());
         let captured_type = captured_piece.map(|p| p.piece_type());
         let is_promotion = m.promotion.is_some();
 
-        if futility_pruning && legal_moves > 0 && !is_capture && !is_promotion {
+        // Stockfish-style: check if this move gives check to the enemy king
+        // Checking moves should bypass quiet move pruning
+        let gives_check = enemy_king_pos
+            .as_ref()
+            .map_or(false, |ek| super::movegen::StagedMoveGen::move_gives_check_simple(game, m, ek));
+
+        // Exempt checking moves from futility pruning (Stockfish-style)
+        if futility_pruning && legal_moves > 0 && !is_capture && !is_promotion && !gives_check {
             if futility_base <= alpha {
                 continue;
             }
         }
 
-        if !in_check && !is_pv && depth <= 4 && depth > 0 && !is_capture && !is_promotion {
+        // Exempt checking moves from LMP (Stockfish-style)
+        if !in_check && !is_pv && depth <= 4 && depth > 0 && !is_capture && !is_promotion && !gives_check {
             let threshold = lmp_threshold(depth);
             if legal_moves >= threshold && best_score > -MATE_SCORE {
                 continue;

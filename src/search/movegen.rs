@@ -331,8 +331,9 @@ impl StagedMoveGen {
     }
 
     /// Simple check detection (direct attacks to enemy king)
+    /// Public so it can be used in main search for pruning exemptions
     #[inline]
-    fn move_gives_check_simple(game: &GameState, m: &Move, enemy_king: &Coordinate) -> bool {
+    pub fn move_gives_check_simple(game: &GameState, m: &Move, enemy_king: &Coordinate) -> bool {
         let to = &m.to;
         let kx = enemy_king.x;
         let ky = enemy_king.y;
@@ -375,7 +376,7 @@ impl StagedMoveGen {
     }
 
     #[inline]
-    fn path_clear(
+    pub fn path_clear(
         game: &GameState,
         from: &Coordinate,
         to: &Coordinate,

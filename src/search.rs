@@ -1846,6 +1846,13 @@ fn negamax(
         0
     };
 
+    // Find enemy king position for check detection (cached lookup)
+    let enemy_king_pos = match game.turn {
+        crate::board::PlayerColor::White => game.black_king_pos,
+        crate::board::PlayerColor::Black => game.white_king_pos,
+        crate::board::PlayerColor::Neutral => None,
+    };
+
     // Main move loop
     while let Some(m) = movegen.next(game, searcher) {
         let captured_piece = game.board.get_piece(&m.to.x, &m.to.y);
@@ -1853,8 +1860,15 @@ fn negamax(
         let captured_type = captured_piece.map(|p| p.piece_type());
         let is_promotion = m.promotion.is_some();
 
+        // Stockfish-style: check if this move gives check to the enemy king
+        // Checking moves should bypass quiet move pruning (Stockfish line 1057: if (capture || givesCheck))
+        let gives_check = enemy_king_pos.as_ref().map_or(false, |ek| {
+            StagedMoveGen::move_gives_check_simple(game, &m, ek)
+        });
+
         // Futility pruning - skip quiet moves that can't raise alpha
-        if futility_pruning && legal_moves > 0 && !is_capture && !is_promotion {
+        // Exempt checking moves from pruning (Stockfish-style)
+        if futility_pruning && legal_moves > 0 && !is_capture && !is_promotion && !gives_check {
             if futility_base <= alpha {
                 continue;
             }
@@ -1862,7 +1876,15 @@ fn negamax(
 
         // Late Move Pruning (LMP) - skip quiet moves late in the move list at shallow depths
         // Only prune after we have at least one legal move (best_score != -INFINITY)
-        if !in_check && !is_pv && depth <= 4 && depth > 0 && !is_capture && !is_promotion {
+        // Exempt checking moves from LMP (Stockfish-style)
+        if !in_check
+            && !is_pv
+            && depth <= 4
+            && depth > 0
+            && !is_capture
+            && !is_promotion
+            && !gives_check
+        {
             let threshold = lmp_threshold(depth);
             if legal_moves >= threshold && best_score > -MATE_SCORE {
                 continue;
@@ -1901,7 +1923,14 @@ fn negamax(
         // Capture History-based Futility Pruning (Stockfish-style)
         // For captures at shallow depths, use capture history to adjust futility threshold.
         // Good captures in history = more likely to be good, less aggressive pruning.
-        if !in_check && !is_pv && is_capture && legal_moves > 0 && best_score > -MATE_SCORE {
+        // Capture futility pruning - exempt captures that give check (Stockfish line 1063)
+        if !in_check
+            && !is_pv
+            && is_capture
+            && !gives_check
+            && legal_moves > 0
+            && best_score > -MATE_SCORE
+        {
             if let Some(cap_type) = captured_type {
                 // Use depth as proxy for lmr_depth (actual LMR reduction happens later)
                 let lmr_depth = depth as i32;
