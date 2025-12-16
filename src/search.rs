@@ -69,10 +69,9 @@ pub enum NodeType {
 // ============================================================================
 pub mod params;
 use params::{
-    aspiration_fail_mult, aspiration_window, futility_margin, history_bonus_base,
-    history_bonus_cap, history_bonus_sub, hlp_history_leaf, hlp_history_reduce, hlp_max_depth,
-    hlp_min_moves, lmp_threshold, lmr_divisor, lmr_min_depth, lmr_min_moves, max_history,
-    nmp_min_depth, nmp_reduction, repetition_penalty, rfp_margin_per_depth, rfp_max_depth,
+    aspiration_fail_mult, aspiration_window, history_bonus_base, history_bonus_cap,
+    history_bonus_sub, hlp_history_leaf, hlp_history_reduce, hlp_max_depth, hlp_min_moves,
+    lmr_divisor, lmr_min_depth, lmr_min_moves, max_history, nmp_min_depth, repetition_penalty,
 };
 
 mod tt;
@@ -96,6 +95,7 @@ mod movegen;
 use movegen::StagedMoveGen;
 
 mod see;
+pub(crate) use see::see_ge;
 pub(crate) use see::static_exchange_eval_impl as static_exchange_eval;
 
 pub mod zobrist;
@@ -1262,7 +1262,7 @@ pub fn get_best_moves_multipv(
         }
 
         // Sort by score descending
-        root_scores.sort_by(|a, b| b.1.cmp(&a.1));
+        root_scores.sort_unstable_by(|a, b| b.1.cmp(&a.1));
 
         // Reorder legal_root_moves by this iteration's scores for better PVS efficiency
         // at the next depth - the previous best move will be searched first
@@ -1570,7 +1570,7 @@ fn negamax_root(
     best_score
 }
 
-/// Main negamax with alpha-beta pruning, NMP, LMR, and TT
+/// Main negamax with alpha-beta pruning
 fn negamax(
     searcher: &mut Searcher,
     game: &mut GameState,
@@ -1581,189 +1581,177 @@ fn negamax(
     allow_null: bool,
     node_type: NodeType,
 ) -> i32 {
-    // Save original alpha/beta for TT flag determination (per Wikipedia pseudocode)
-    let alpha_orig = alpha;
-    let beta_orig = beta;
+    // Node type classification for search behavior
+    let is_pv = node_type == NodeType::PV;
+    let cut_node = node_type == NodeType::Cut;
+    let all_node = !is_pv && !cut_node;
 
-    // CRITICAL: Check for max ply BEFORE any array accesses to prevent out-of-bounds
-    // This must be the very first check to avoid panics when ply >= MAX_PLY
+    // Leaf node: transition to quiescence search
+    if depth == 0 {
+        return quiescence(searcher, game, ply, alpha, beta);
+    }
+
+    // Cap depth to prevent overflow
+    let mut depth = depth.min(MAX_PLY - 1);
+
+    // Safety check
     if ply >= MAX_PLY - 1 {
         return evaluate(game);
     }
 
+    // Initialize node state
+    let in_check = game.is_in_check();
     searcher.nodes += 1;
-    // Initialize PV length to 0; will be updated if alpha is raised
     searcher.pv_length[ply] = 0;
 
-    // Update seldepth
-    if ply > searcher.seldepth {
-        searcher.seldepth = ply;
-    }
-
-    // Time check
+    // Time management and selective depth tracking
     if searcher.check_time() {
         return 0;
     }
-
-    // Fifty-move rule: 100 half-moves without pawn move or capture is a draw
-    if game.is_fifty() {
-        return 0;
+    if is_pv && ply > searcher.seldepth {
+        searcher.seldepth = ply;
     }
 
-    // Generate hash for TT
-    let hash = TranspositionTable::generate_hash(game);
-
-    // Stockfish-style repetition detection:
-    // - Twofold within the current search tree is treated as draw (opponent can force it)
-    // - Threefold from game history also handled via is_repetition
-    if ply > 0 && game.is_repetition(ply) {
-        // Treat repetition as a slightly worse outcome than a neutral eval
-        // from the current side's perspective. This nudges the search away
-        // from pointless repetitions when other equal moves exist, while still
-        // allowing repetition in clearly worse positions.
-        return -repetition_penalty();
-    }
-
-    // Mate distance pruning (not at root)
+    // Non-root node: check for draws and mate distance pruning
     if ply > 0 {
+        // Draw by fifty-move rule or repetition
+        if game.is_fifty() || game.is_repetition(ply) {
+            return -repetition_penalty();
+        }
+
+        // Mate distance pruning: if we already found a faster mate, prune
         let mate_score = MATE_VALUE - ply as i32;
-        if alpha < -mate_score {
-            alpha = -mate_score;
-        }
-        if beta > mate_score - 1 {
-            beta = mate_score - 1;
-        }
+        alpha = alpha.max(-mate_score);
+        beta = beta.min(mate_score - 1);
         if alpha >= beta {
             return alpha;
         }
     }
 
-    let in_check = game.is_in_check();
-    let is_pv = node_type == NodeType::PV;
+    // Save original bounds for TT flag determination
+    let alpha_orig = alpha;
+    let beta_orig = beta;
 
-    // Base case: quiescence search at leaf nodes
-    if depth == 0 {
-        return quiescence(searcher, game, ply, alpha, beta);
-    }
+    // Track reduction from parent ply for hindsight adjustment
+    let prior_reduction = if ply > 0 {
+        searcher.reduction_stack[ply - 1]
+    } else {
+        0
+    };
 
-    // Depth may be adjusted by check extensions and internal iterative
-    // reductions (IIR). Start from the caller-provided depth.
-    let mut depth = depth;
-
-    // Check extension (limited to avoid infinite recursion)
-    // Only extend if we're not too deep already
-    if in_check && ply < MAX_PLY / 2 {
-        depth += 1;
-    }
+    // Transposition table probe for hash move and potential cutoff
+    let hash = TranspositionTable::generate_hash(game);
     let mut tt_move: Option<Move> = None;
 
     if let Some((score, best)) = probe_tt_with_shared(searcher, hash, alpha, beta, depth, ply) {
         tt_move = best;
-
-        // Use TT cutoff in non-PV nodes
+        // In non-PV nodes, use TT cutoff if valid
         if !is_pv && score != INFINITY + 1 {
             return score;
         }
     }
 
     // Static evaluation for pruning decisions
-    // First get raw eval, then apply correction history adjustment
-    let raw_eval = if in_check {
-        -MATE_VALUE + ply as i32
-    } else {
-        evaluate(game)
-    };
-    // Get previous move index for last-move correction (combines from/to hashes)
     let prev_move_idx = if ply > 0 {
         let (from_hash, to_hash) = searcher.prev_move_stack[ply - 1];
         from_hash ^ to_hash
     } else {
         0
     };
-    let static_eval = if in_check {
-        raw_eval
+
+    let (static_eval, raw_eval) = if in_check {
+        // When in check, use a pessimistic value (eval is unreliable in check)
+        let eval = -MATE_VALUE + ply as i32;
+        (eval, eval)
     } else {
-        searcher.adjusted_eval(game, raw_eval, prev_move_idx)
+        let raw = evaluate(game);
+        let adjusted = searcher.adjusted_eval(game, raw, prev_move_idx);
+        (adjusted, raw)
     };
 
-    // Store eval for "improving" heuristic
     searcher.eval_stack[ply] = static_eval;
 
-    // Check if position is improving (eval better than 2 plies ago)
-    // This is used to adjust pruning aggressiveness
-    let improving = if ply >= 2 && !in_check {
+    // Position improving heuristic: compare eval to 2 plies ago
+    // Used to adjust pruning aggressiveness
+    let mut improving = if ply >= 2 && !in_check {
         static_eval > searcher.eval_stack[ply - 2]
     } else {
-        true // Assume improving at root or when in check
+        true
     };
 
-    // Opponent worsening heuristic (Stockfish-style)
-    // True if our static eval is better than the negation of the previous ply's eval.
-    // This means the opponent's last move made their position worse (our position got better).
-    // Used to make pruning more aggressive since opponent is making poor moves.
+    // Opponent worsening: their last move made our position better
+    // Used to increase pruning when opponent is making poor moves
     let opponent_worsening = if ply >= 1 && !in_check {
         static_eval > -searcher.eval_stack[ply - 1]
     } else {
-        false // Conservative default
+        false
     };
 
-    // Hindsight Depth Adjustment (Stockfish-style)
-    // Uses the reduction applied at the parent ply to adjust our depth.
-    // ONLY applied when not in check (static_eval is meaningless in check).
+    // Hindsight depth adjustment based on prior search behavior
+    // If we were reduced heavily but opponent didn't worsen, increase depth
+    // If position is stable, decrease depth
     if !in_check && ply > 0 {
-        let prior_reduction = searcher.reduction_stack[ply - 1];
         let prev_eval = searcher.eval_stack[ply - 1];
-
-        // If we were heavily reduced but the opponent didn't worsen, increase depth
-        // (the reduced move might actually be important).
         if prior_reduction >= 3 && !opponent_worsening {
             depth += 1;
         }
-
-        // If we had some reduction and both evals are high (stable position),
-        // we can decrease depth since the position is unlikely to have tactics.
-        // Stockfish uses: ss->staticEval + (ss - 1)->staticEval > 173
         if prior_reduction >= 2 && depth >= 2 && static_eval + prev_eval > 173 {
             depth = depth.saturating_sub(1);
         }
     }
 
-    // Derive cut_node from node_type parameter
-    let cut_node = node_type == NodeType::Cut;
+    // When in check, skip all pruning - we need to search all evasions
+    if !in_check {
+        // =================================================================
+        // Pre-move pruning techniques
+        // =================================================================
 
-    // Internal Iterative Reductions (IIR): if we have no TT move in an
-    // expected cut-node, and we are not in check, reduce depth slightly.
-    if tt_move.is_none() && cut_node && !in_check && depth >= 4 {
-        depth -= 1;
-    }
-
-    // Pruning techniques (not in check, not PV node)
-    if !in_check && !is_pv {
-        // Reverse Futility Pruning (Static Null Move Pruning)
-        if depth < rfp_max_depth() && static_eval - rfp_margin_per_depth() * depth as i32 >= beta {
-            return static_eval;
+        // Razoring: if static eval is very low, drop to qsearch
+        // Formula: eval < alpha - 485 - 281 * depth²
+        if !is_pv && static_eval < alpha - 485 - 281 * (depth * depth) as i32 {
+            return quiescence(searcher, game, ply, alpha, beta);
         }
 
-        // Null Move Pruning
-        if allow_null && depth >= nmp_min_depth() && static_eval >= beta {
-            // O(1) check for non-pawn material (avoid zugzwang in pawn endgames)
-            let has_pieces = game.has_non_pawn_material(game.turn);
+        // Reverse futility pruning (static null move)
+        // If static eval is much higher than beta, return early
+        if !is_pv && depth < 14 {
+            let futility_mult = 76;
+            let futility_margin = futility_mult * depth as i32
+                - if improving {
+                    2474 * futility_mult / 1024
+                } else {
+                    0
+                }
+                - if opponent_worsening {
+                    331 * futility_mult / 1024
+                } else {
+                    0
+                };
 
-            if has_pieces {
-                // Make null move (proper tracking for repetition detection)
+            if static_eval - futility_margin >= beta && static_eval >= beta {
+                return (2 * beta + static_eval) / 3;
+            }
+        }
+
+        // Null move pruning: give opponent an extra move, if still >= beta, prune
+        // Only in cut nodes with non-pawn material (avoid zugzwang)
+        if cut_node && allow_null && depth >= nmp_min_depth() {
+            let nmp_margin = static_eval - (18 * depth as i32) + 350;
+            if nmp_margin >= beta && game.has_non_pawn_material(game.turn) {
                 let saved_ep = game.en_passant.clone();
                 game.make_null_move();
 
-                let r = nmp_reduction() + depth / 6;
+                // Reduction: R = 7 + depth / 3
+                let r = 7 + depth / 3;
                 let null_score = -negamax(
                     searcher,
                     game,
-                    depth.saturating_sub(1 + r),
+                    depth.saturating_sub(r),
                     ply + 1,
                     -beta,
                     -beta + 1,
                     false,
-                    NodeType::Cut, // NMP verification search
+                    NodeType::Cut,
                 );
 
                 game.unmake_null_move();
@@ -1773,26 +1761,20 @@ fn negamax(
                     return 0;
                 }
 
+                // If null move score >= beta, we can prune
                 if null_score >= beta {
-                    return beta;
+                    return null_score;
                 }
             }
         }
 
-        // Razoring
-        // If static evaluation is very low, drop directly into quiescence search
-        // to see if we can prune this node early.
-        if depth <= 3 && static_eval + 300 + depth as i32 * 150 <= alpha {
-            let razor_score = quiescence(
-                searcher,
-                game,
-                ply,
-                alpha - 300 - depth as i32 * 150,
-                beta - 300 - depth as i32 * 150,
-            );
-            if razor_score + 300 + depth as i32 * 150 <= alpha {
-                return razor_score;
-            }
+        // Update improving flag based on static eval vs beta
+        improving = improving || static_eval >= beta;
+
+        // Internal iterative reductions (IIR)
+        // Without TT move, reduce depth to find one faster
+        if !all_node && depth >= 6 && tt_move.is_none() && prior_reduction <= 3 {
+            depth -= 1;
         }
     }
 
@@ -1825,27 +1807,6 @@ fn negamax(
         None
     };
 
-    // Futility pruning setup
-    // Margin adjustments based on improving/opponent_worsening (Stockfish-style):
-    // - If improving: we can prune more aggressively (reduce margin)
-    // - If opponent_worsening: opponent making poor moves, prune more aggressively
-    let futility_pruning = !in_check && !is_pv && depth <= 3;
-    let futility_base = if futility_pruning {
-        // Base margin from tuned parameters
-        let base_margin = futility_margin(depth);
-        // Reduce margin when improving or opponent_worsening (more aggressive pruning)
-        // Each factor reduces margin by ~20 centipawns per depth level
-        let improving_adj = if improving { 20 * depth as i32 } else { 0 };
-        let opponent_adj = if opponent_worsening {
-            10 * depth as i32
-        } else {
-            0
-        };
-        static_eval + base_margin - improving_adj - opponent_adj
-    } else {
-        0
-    };
-
     // Find enemy king position for check detection (cached lookup)
     let enemy_king_pos = match game.turn {
         crate::board::PlayerColor::White => game.black_king_pos,
@@ -1853,95 +1814,98 @@ fn negamax(
         crate::board::PlayerColor::Neutral => None,
     };
 
-    // Main move loop
+    // New depth for child nodes
+    let new_depth = depth.saturating_sub(1);
+
+    // Main move loop - iterate through staged moves
     while let Some(m) = movegen.next(game, searcher) {
         let captured_piece = game.board.get_piece(&m.to.x, &m.to.y);
         let is_capture = captured_piece.map_or(false, |p| !p.piece_type().is_neutral_type());
         let captured_type = captured_piece.map(|p| p.piece_type());
         let is_promotion = m.promotion.is_some();
 
-        // Stockfish-style: check if this move gives check to the enemy king
-        // Checking moves should bypass quiet move pruning (Stockfish line 1057: if (capture || givesCheck))
+        // Check if this move gives check to enemy king
         let gives_check = enemy_king_pos.as_ref().map_or(false, |ek| {
             StagedMoveGen::move_gives_check_simple(game, &m, ek)
         });
 
-        // Futility pruning - skip quiet moves that can't raise alpha
-        // Exempt checking moves from pruning (Stockfish-style)
-        if futility_pruning && legal_moves > 0 && !is_capture && !is_promotion && !gives_check {
-            if futility_base <= alpha {
-                continue;
+        // In-move pruning at shallow depths (not in PV, have material, not losing)
+        if !is_pv && game.has_non_pawn_material(game.turn) && best_score > -MATE_SCORE {
+            // Late move pruning: skip quiet moves after seeing enough
+            // Threshold: (3 + depth²) / (2 if not improving, else 1)
+            let improving_div = if improving { 1 } else { 2 };
+            let lmp_count = (3 + depth * depth) / improving_div;
+            // Signal movegen to skip quiet generation entirely (truly lazy)
+            if legal_moves >= lmp_count {
+                movegen.skip_quiet_moves();
             }
-        }
 
-        // Late Move Pruning (LMP) - skip quiet moves late in the move list at shallow depths
-        // Only prune after we have at least one legal move (best_score != -INFINITY)
-        // Exempt checking moves from LMP (Stockfish-style)
-        if !in_check
-            && !is_pv
-            && depth <= 4
-            && depth > 0
-            && !is_capture
-            && !is_promotion
-            && !gives_check
-        {
-            let threshold = lmp_threshold(depth);
-            if legal_moves >= threshold && best_score > -MATE_SCORE {
-                continue;
-            }
-        }
+            // LMR depth estimate for pruning decisions
+            let lmr_depth = new_depth as i32;
 
-        // NOTE: Skip Quiet Moves (FutilityMoveCount) was removed to fix quiet check handling.
-        // Previously this called movegen.skip_quiet_moves() which skipped ALL quiet moves
-        // including quiet checks, causing the engine to miss check-fork tactics.
-        // Individual pruning (LMP, futility pruning, HLP) with gives_check exemptions
-        // now handles quiet move pruning correctly while preserving quiet checks.
-
-        // Capture History-based Futility Pruning (Stockfish-style)
-        // For captures at shallow depths, use capture history to adjust futility threshold.
-        // Good captures in history = more likely to be good, less aggressive pruning.
-        // Capture futility pruning - exempt captures that give check (Stockfish line 1063)
-        if !in_check
-            && !is_pv
-            && is_capture
-            && !gives_check
-            && legal_moves > 0
-            && best_score > -MATE_SCORE
-        {
-            if let Some(cap_type) = captured_type {
-                // Use depth as proxy for lmr_depth (actual LMR reduction happens later)
-                let lmr_depth = depth as i32;
-
-                if lmr_depth < 7 {
+            if is_capture || gives_check {
+                // Capture/check pruning
+                if let Some(cap_type) = captured_type {
                     let capt_hist =
                         searcher.capture_history[m.piece.piece_type() as usize][cap_type as usize];
 
-                    // Futility pruning for captures using capture history
-                    // Formula adapted from Stockfish: static_eval + base + depth_factor + piece_value + hist_factor
-                    // Our piece values are ~100-1550, Stockfish's are scaled differently
-                    let cap_value = get_piece_value(cap_type);
-                    let futility_value = static_eval
-                        + 200                           // base margin
-                        + 150 * lmr_depth               // depth contribution
-                        + cap_value                     // captured piece value
-                        + capt_hist / 8; // history contribution (scaled for our max ~16384)
+                    // Capture futility: skip captures that can't raise alpha
+                    // Threshold: eval + 232 + 217*lmrD + pieceVal + histBonus
+                    if !gives_check && lmr_depth < 7 {
+                        let cap_value = get_piece_value(cap_type);
+                        let futility_value = static_eval
+                            + 232
+                            + 217 * lmr_depth
+                            + cap_value
+                            + 131 * capt_hist / 1024;
+                        if futility_value <= alpha {
+                            continue;
+                        }
+                    }
 
+                    // SEE pruning for captures: skip losing captures
+                    // Exempt moves that give check (they have tactical significance)
+                    // Threshold: -max(166*d + captHist/29, 0)
+                    // if !gives_check {
+                    let see_margin = (166 * depth as i32 + capt_hist / 29).max(0);
+                    let see_value = static_exchange_eval(game, &m);
+                    if see_value < -see_margin {
+                        continue;
+                    }
+                    // }
+                }
+            } else {
+                // Quiet move pruning
+                let hist_idx = hash_move_dest(&m);
+                let main_hist = searcher.history[m.piece.piece_type() as usize][hist_idx];
+                let history = main_hist;
+
+                // History-based pruning: skip moves with very bad history
+                // Threshold: history < -4083 * depth
+                if history < -4083 * depth as i32 {
+                    continue;
+                }
+
+                // Adjust LMR depth based on history
+                let adj_lmr_depth = (lmr_depth + history / 3208).max(0);
+
+                // Quiet futility: skip moves that can't raise alpha
+                // Threshold: eval + 42 + 161*(no bestMove) + 127*lmrD
+                if !in_check && adj_lmr_depth < 13 {
+                    let no_best = if best_move.is_none() { 161 } else { 0 };
+                    let futility_value = static_eval + 42 + no_best + 127 * adj_lmr_depth;
                     if futility_value <= alpha {
+                        if best_score <= futility_value {
+                            best_score = futility_value;
+                        }
                         continue;
                     }
                 }
 
-                // SEE-based move pruning with capture history adjustment
-                // Good capture history = more lenient SEE threshold
-                let capt_hist =
-                    searcher.capture_history[m.piece.piece_type() as usize][cap_type as usize];
+                // SEE pruning for quiets: skip moves with bad SEE
+                // Threshold: -25 * lmrD²
+                let see_threshold = -25 * adj_lmr_depth * adj_lmr_depth;
                 let see_value = static_exchange_eval(game, &m);
-
-                // Stockfish uses: max(166 * depth + captHist / 29, 0)
-                // Our capture history scale is similar, so use similar divisor
-                let see_margin = (150 * depth as i32 + capt_hist / 30).max(0);
-                let see_threshold = -see_margin;
-
                 if see_value < see_threshold {
                     continue;
                 }
@@ -2132,6 +2096,12 @@ fn negamax(
                 // since the move ordering from TT may not be trustworthy.
                 // Only adjust for significant negative values to avoid overhead.
                 if searcher.tt_move_history < -1000 && reduction > 0 {
+                    reduction -= 1;
+                }
+
+                // Reduce less for forking piece checks (high tactical importance)
+                let p_type = m.piece.piece_type();
+                if reduction > 0 && (gives_check && (p_type == PieceType::Queen || p_type == PieceType::Amazon)) {
                     reduction -= 1;
                 }
 

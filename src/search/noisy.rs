@@ -358,74 +358,76 @@ fn negamax_noisy(
     allow_null: bool,
     noise_amp: i32,
 ) -> i32 {
-    let alpha_orig = alpha;
-    let beta_orig = beta;
+    // Node type classification for search behavior
+    let is_pv = beta > alpha + 1;
+    let cut_node = !is_pv && beta == alpha + 1;
+    let all_node = !is_pv && !cut_node;
 
-    // CRITICAL: Check for max ply BEFORE any array accesses to prevent out-of-bounds
-    // This must be the very first check to avoid panics when ply >= MAX_PLY
+    // Leaf node: transition to quiescence search
+    if depth == 0 {
+        return quiescence_noisy(searcher, game, ply, alpha, beta, noise_amp);
+    }
+
+    // Cap depth to prevent overflow
+    let mut depth = depth.min(MAX_PLY - 1);
+
+    // Safety check
     if ply >= MAX_PLY - 1 {
         return evaluate_with_noise(game, noise_amp);
     }
 
+    // Initialize node state
+    let in_check = game.is_in_check();
     searcher.nodes += 1;
-    // Initialize PV length to 0; will be updated if alpha is raised
     searcher.pv_length[ply] = 0;
 
-    if ply > searcher.seldepth {
-        searcher.seldepth = ply;
-    }
-
+    // Time management and selective depth tracking
     if searcher.check_time() {
         return 0;
     }
-
-    if game.is_fifty() {
-        return 0;
+    if is_pv && ply > searcher.seldepth {
+        searcher.seldepth = ply;
     }
 
-    let hash = TranspositionTable::generate_hash(game);
-
-    if ply > 0 && game.is_repetition(ply) {
-        return -repetition_penalty();
-    }
-
+    // Non-root node: check for draws and mate distance pruning
     if ply > 0 {
+        if game.is_fifty() || game.is_repetition(ply) {
+            return -repetition_penalty();
+        }
+
         let mate_score = MATE_VALUE - ply as i32;
-        if alpha < -mate_score {
-            alpha = -mate_score;
-        }
-        if beta > mate_score - 1 {
-            beta = mate_score - 1;
-        }
+        alpha = alpha.max(-mate_score);
+        beta = beta.min(mate_score - 1);
         if alpha >= beta {
             return alpha;
         }
     }
 
-    let in_check = game.is_in_check();
-    let is_pv = beta > alpha + 1;
+    // Save original bounds for TT flag determination
+    let alpha_orig = alpha;
+    let beta_orig = beta;
 
-    if depth == 0 {
-        return quiescence_noisy(searcher, game, ply, alpha, beta, noise_amp);
-    }
+    // Track reduction from parent ply for hindsight adjustment
+    let prior_reduction = if ply > 0 {
+        searcher.reduction_stack[ply - 1]
+    } else {
+        0
+    };
 
-    let mut depth = depth;
-
-    if in_check && ply < MAX_PLY / 2 {
-        depth += 1;
-    }
+    // Transposition table probe
+    let hash = TranspositionTable::generate_hash(game);
     let mut tt_move: Option<Move> = None;
 
     if let Some((score, best)) =
         super::probe_tt_with_shared(searcher, hash, alpha, beta, depth, ply)
     {
         tt_move = best;
-
         if !is_pv && score != INFINITY + 1 {
             return score;
         }
     }
 
+    // Static evaluation for pruning decisions
     let static_eval = if in_check {
         -MATE_VALUE + ply as i32
     } else {
@@ -434,38 +436,70 @@ fn negamax_noisy(
 
     searcher.eval_stack[ply] = static_eval;
 
-    let improving = if ply >= 2 && !in_check {
+    // Position improving heuristic
+    let mut improving = if ply >= 2 && !in_check {
         static_eval > searcher.eval_stack[ply - 2]
     } else {
         true
     };
 
-    let cut_node = !is_pv && beta == alpha + 1;
-    if tt_move.is_none() && cut_node && !in_check && depth >= 4 {
-        depth -= 1;
+    // Opponent worsening heuristic
+    let opponent_worsening = if ply >= 1 && !in_check {
+        static_eval > -searcher.eval_stack[ply - 1]
+    } else {
+        false
+    };
+
+    // Hindsight depth adjustment
+    if !in_check && ply > 0 {
+        let prev_eval = searcher.eval_stack[ply - 1];
+        if prior_reduction >= 3 && !opponent_worsening {
+            depth += 1;
+        }
+        if prior_reduction >= 2 && depth >= 2 && static_eval + prev_eval > 173 {
+            depth = depth.saturating_sub(1);
+        }
     }
 
-    if !in_check && !is_pv {
-        if depth < rfp_max_depth() && static_eval - rfp_margin_per_depth() * depth as i32 >= beta {
-            return static_eval;
+    // When in check, skip all pruning
+    if !in_check {
+        // Razoring: if static eval is very low, drop to qsearch
+        if !is_pv && static_eval < alpha - 485 - 281 * (depth * depth) as i32 {
+            return quiescence_noisy(searcher, game, ply, alpha, beta, noise_amp);
         }
 
-        if allow_null && depth >= nmp_min_depth() && static_eval >= beta {
-            let has_pieces = game.board.iter().any(|(_, p)| {
-                p.color() == game.turn
-                    && p.piece_type() != PieceType::Pawn
-                    && p.piece_type() != PieceType::King
-            });
+        // Reverse futility pruning
+        if !is_pv && depth < 14 {
+            let futility_mult = 76;
+            let futility_margin = futility_mult * depth as i32
+                - if improving {
+                    2474 * futility_mult / 1024
+                } else {
+                    0
+                }
+                - if opponent_worsening {
+                    331 * futility_mult / 1024
+                } else {
+                    0
+                };
 
-            if has_pieces {
+            if static_eval - futility_margin >= beta && static_eval >= beta {
+                return (2 * beta + static_eval) / 3;
+            }
+        }
+
+        // Null move pruning
+        if cut_node && allow_null && depth >= nmp_min_depth() {
+            let nmp_margin = static_eval - (18 * depth as i32) + 350;
+            if nmp_margin >= beta && game.has_non_pawn_material(game.turn) {
                 let saved_ep = game.en_passant.clone();
                 game.make_null_move();
 
-                let r = nmp_reduction() + depth / 6;
+                let r = 7 + depth / 3;
                 let null_score = -negamax_noisy(
                     searcher,
                     game,
-                    depth.saturating_sub(1 + r),
+                    depth.saturating_sub(r),
                     ply + 1,
                     -beta,
                     -beta + 1,
@@ -481,9 +515,17 @@ fn negamax_noisy(
                 }
 
                 if null_score >= beta {
-                    return beta;
+                    return null_score;
                 }
             }
+        }
+
+        // Update improving flag
+        improving = improving || static_eval >= beta;
+
+        // Internal iterative reductions
+        if !all_node && depth >= 6 && tt_move.is_none() && prior_reduction <= 3 {
+            depth -= 1;
         }
     }
 
@@ -498,19 +540,15 @@ fn negamax_noisy(
     let mut legal_moves = 0;
     let mut quiets_searched: Vec<Move> = Vec::new();
 
-    let futility_pruning = !in_check && !is_pv && depth <= 3;
-    let futility_base = if futility_pruning {
-        static_eval + futility_margin(depth)
-    } else {
-        0
-    };
-
-    // Find enemy king position for check detection (cached lookup)
+    // Find enemy king position for check detection
     let enemy_king_pos = match game.turn {
         crate::board::PlayerColor::White => game.black_king_pos,
         crate::board::PlayerColor::Black => game.white_king_pos,
         crate::board::PlayerColor::Neutral => None,
     };
+
+    // New depth for child nodes
+    let new_depth = depth.saturating_sub(1);
 
     for m in &moves {
         let captured_piece = game.board.get_piece(&m.to.x, &m.to.y);
@@ -518,24 +556,79 @@ fn negamax_noisy(
         let captured_type = captured_piece.map(|p| p.piece_type());
         let is_promotion = m.promotion.is_some();
 
-        // Stockfish-style: check if this move gives check to the enemy king
-        // Checking moves should bypass quiet move pruning
-        let gives_check = enemy_king_pos
-            .as_ref()
-            .map_or(false, |ek| super::movegen::StagedMoveGen::move_gives_check_simple(game, m, ek));
+        // Check if this move gives check
+        let gives_check = enemy_king_pos.as_ref().map_or(false, |ek| {
+            super::movegen::StagedMoveGen::move_gives_check_simple(game, m, ek)
+        });
 
-        // Exempt checking moves from futility pruning (Stockfish-style)
-        if futility_pruning && legal_moves > 0 && !is_capture && !is_promotion && !gives_check {
-            if futility_base <= alpha {
+        // In-move pruning at shallow depths
+        if !is_pv && game.has_non_pawn_material(game.turn) && best_score > -MATE_SCORE {
+            // LMP: (3+d²) / (2 if not improving)
+            let improving_div = if improving { 1 } else { 2 };
+            let lmp_count = (3 + depth * depth) / improving_div;
+            if legal_moves >= lmp_count && !is_capture && !is_promotion && !gives_check {
                 continue;
             }
-        }
 
-        // Exempt checking moves from LMP (Stockfish-style)
-        if !in_check && !is_pv && depth <= 4 && depth > 0 && !is_capture && !is_promotion && !gives_check {
-            let threshold = lmp_threshold(depth);
-            if legal_moves >= threshold && best_score > -MATE_SCORE {
-                continue;
+            let lmr_depth = new_depth as i32;
+
+            if is_capture || gives_check {
+                // Capture/check pruning
+                if let Some(cap_type) = captured_type {
+                    let capt_hist =
+                        searcher.capture_history[m.piece.piece_type() as usize][cap_type as usize];
+
+                    // Capture futility
+                    if !gives_check && lmr_depth < 7 {
+                        let cap_value = get_piece_value(cap_type);
+                        let futility_value = static_eval
+                            + 232
+                            + 217 * lmr_depth
+                            + cap_value
+                            + 131 * capt_hist / 1024;
+                        if futility_value <= alpha {
+                            continue;
+                        }
+                    }
+
+                    // SEE pruning for captures
+                    let see_margin = (166 * depth as i32 + capt_hist / 29).max(0);
+                    let see_value = static_exchange_eval(game, m);
+                    if see_value < -see_margin {
+                        continue;
+                    }
+                }
+            } else {
+                // Quiet move pruning
+                let hist_idx = hash_move_dest(m);
+                let history = searcher.history[m.piece.piece_type() as usize][hist_idx];
+
+                // History-based pruning
+                if history < -4083 * depth as i32 {
+                    continue;
+                }
+
+                // Adjust LMR depth based on history
+                let adj_lmr_depth = (lmr_depth + history / 3208).max(0);
+
+                // Quiet futility
+                if !in_check && adj_lmr_depth < 13 {
+                    let no_best = if best_move.is_none() { 161 } else { 0 };
+                    let futility_value = static_eval + 42 + no_best + 127 * adj_lmr_depth;
+                    if futility_value <= alpha {
+                        if best_score <= futility_value {
+                            best_score = futility_value;
+                        }
+                        continue;
+                    }
+                }
+
+                // SEE pruning for quiets
+                let see_threshold = -25 * adj_lmr_depth * adj_lmr_depth;
+                let see_value = static_exchange_eval(game, m);
+                if see_value < see_threshold {
+                    continue;
+                }
             }
         }
 

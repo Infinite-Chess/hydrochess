@@ -8,6 +8,34 @@ use arrayvec::ArrayVec;
 /// 128 covers virtually all realistic positions while staying on the stack.
 const SEE_MAX_PIECES: usize = 128;
 
+/// Tests if SEE value of move is >= threshold.
+/// Uses early cutoffs to avoid full SEE calculation when possible.
+#[inline]
+pub(crate) fn see_ge(game: &GameState, m: &Move, threshold: i32) -> bool {
+    let captured = match game.board.get_piece(&m.to.x, &m.to.y) {
+        Some(p) => p,
+        None => return 0 >= threshold, // No capture: SEE = 0
+    };
+
+    let victim_val = get_piece_value(captured.piece_type());
+    let attacker_val = get_piece_value(m.piece.piece_type());
+
+    // Early cutoff 1: if capturing loses material even if undefended, fail
+    let swap = victim_val - threshold;
+    if swap < 0 {
+        return false;
+    }
+
+    // Early cutoff 2: if capturing wins material even if we lose attacker, pass
+    let swap = attacker_val - swap;
+    if swap <= 0 {
+        return true;
+    }
+
+    // Need full SEE for complex cases
+    static_exchange_eval_impl(game, m) >= threshold
+}
+
 /// Static Exchange Evaluation implementation for a capture move on a single square.
 ///
 /// Returns the net material gain (in centipawns) for the side to move if both

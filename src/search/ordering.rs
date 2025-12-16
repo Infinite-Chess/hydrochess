@@ -2,13 +2,12 @@ use crate::board::{Coordinate, PieceType, PlayerColor};
 use crate::evaluation::get_piece_value;
 use crate::game::GameState;
 use crate::moves::Move;
-use crate::search::static_exchange_eval;
 
-use super::params::{
-    see_winning_threshold, sort_countermove, sort_gives_check, sort_hash, sort_killer1,
-    sort_killer2, sort_winning_capture, DEFAULT_SORT_LOSING_CAPTURE, DEFAULT_SORT_QUIET,
-};
 use super::Searcher;
+use super::params::{
+    DEFAULT_SORT_LOSING_CAPTURE, DEFAULT_SORT_QUIET, see_winning_threshold, sort_countermove,
+    sort_gives_check, sort_hash, sort_killer1, sort_killer2, sort_winning_capture,
+};
 
 /// Find the enemy king's position for the current side to move.
 /// Uses cached king positions from GameState for O(1) lookup.
@@ -288,10 +287,8 @@ pub fn sort_moves(
             let attacker_val = get_piece_value(m.piece.piece_type());
             let mvv_lva = victim_val * 10 - attacker_val;
 
-            // Approximate Zig's see_threshold(pos, move, -90): treat captures
-            // that lose more than ~a pawn as "losing" and others as winning.
-            let see_gain = static_exchange_eval(game, m);
-            let is_winning = see_gain >= see_winning_threshold();
+            // Use see_ge with early cutoffs (Stockfish pattern)
+            let is_winning = super::see_ge(game, m, see_winning_threshold());
 
             score += mvv_lva;
             if is_winning {

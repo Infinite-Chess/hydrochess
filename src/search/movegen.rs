@@ -1,12 +1,13 @@
-//! Staged move generation for efficient alpha-beta search.
+//! Stockfish-style staged move generation for efficient alpha-beta search.
 //!
-//! Generates moves in the exact same order as sort_moves:
+//! Implements exact Stockfish movepick.cpp pattern:
 //! 1. TT move (hash move) - highest priority
-//! 2. Good captures (SEE >= threshold, MVV-LVA + capture history sorted)
-//! 3. Killer 1 (if valid quiet move)
-//! 4. Killer 2 (if valid quiet move)  
-//! 5. Quiets (history + continuation history sorted)
-//! 6. Bad captures (SEE < threshold)
+//! 2. CAPTURE_INIT: Generate + score + sort_unstable_by
+//! 3. GOOD_CAPTURE: Select with SEE filter, bad captures collected
+//! 4. QUIET_INIT: Generate + score + sort_unstable_by (skip if skipQuiets)
+//! 5. GOOD_QUIET: Select with score > goodQuietThreshold
+//! 6. BAD_CAPTURE: Iterate collected bad captures
+//! 7. BAD_QUIET: Select with score <= goodQuietThreshold
 
 use super::params::{
     DEFAULT_SORT_QUIET, see_winning_threshold, sort_countermove, sort_gives_check, sort_killer1,
@@ -18,30 +19,46 @@ use crate::evaluation::get_piece_value;
 use crate::game::GameState;
 use crate::moves::{Move, get_quiescence_captures, get_quiet_moves_into};
 
-/// Stages of move generation.
+/// Good quiet threshold (original -4000, not Stockfish's -14000)
+const GOOD_QUIET_THRESHOLD: i32 = -4000;
+
+/// Stages of move generation (hybrid: Stockfish optimizations + trusted killer stages).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MoveStage {
     TTMove,
-    GenerateCaptures,
-    GoodCaptures,
+    CaptureInit,
+    GoodCapture,
     Killer1,
     Killer2,
-    GenerateQuiets,
-    GoodQuiets,  // Quiets with history above threshold
-    BadCaptures, // Bad SEE captures between good and bad quiets
-    BadQuiets,   // Quiets with low history (tried last)
+    QuietInit,
+    GoodQuiet,
+    BadCapture,
+    BadQuiet,
     Done,
 }
 
-/// Staged move generator with exact same ordering as sort_moves.
+/// Move with score for sorting
+#[derive(Clone)]
+struct ScoredMove {
+    m: Move,
+    score: i32,
+}
+
+/// Staged move generator with unified buffer and sort_unstable_by.
 pub struct StagedMoveGen {
     stage: MoveStage,
 
     // TT move
     tt_move: Option<Move>,
-    tt_move_yielded: bool,
 
-    // Ply for history lookups
+    // Unified move buffer (like Stockfish's moves[])
+    moves: Vec<ScoredMove>,
+    cur: usize,              // Current position in buffer
+    end_bad_captures: usize, // End of bad captures section
+    end_captures: usize,     // End of captures section
+    end_generated: usize,    // End of generated moves
+
+    // Ply for scoring
     ply: usize,
 
     // Previous move info for countermove lookup
@@ -51,30 +68,22 @@ pub struct StagedMoveGen {
     // Cached enemy king for check detection
     enemy_king: Option<Coordinate>,
 
-    // Good captures (sorted)
-    good_captures: Vec<(Move, i32)>, // (move, score)
-    good_capture_idx: usize,
-
-    // Bad captures (deferred)
-    bad_captures: Vec<Move>,
-    bad_capture_idx: usize,
-
-    // Killers
+    // Killers (checked during quiet iteration)
     killer1: Option<Move>,
     killer2: Option<Move>,
-    killer1_yielded: bool,
-    killer2_yielded: bool,
 
-    // Excluded move (for singular extension verification)
+    // Skip quiets flag (Stockfish-style LMP)
+    skip_quiets: bool,
+
+    // Excluded move (for singular extension)
     excluded_move: Option<Move>,
+}
 
-    // Good quiets (above threshold, tried before bad captures)
-    good_quiets: Vec<(Move, i32)>,
-    good_quiet_idx: usize,
-
-    // Bad quiets (below threshold, tried after bad captures)
-    bad_quiets: Vec<Move>,
-    bad_quiet_idx: usize,
+/// Sort scored moves by score descending (highest first).
+/// Uses sort_unstable_by which is O(n log n) and faster than stable sort.
+#[inline]
+fn sort_moves_by_score(moves: &mut [ScoredMove]) {
+    moves.sort_unstable_by(|a, b| b.score.cmp(&a.score));
 }
 
 impl StagedMoveGen {
@@ -100,29 +109,23 @@ impl StagedMoveGen {
         Self {
             stage: MoveStage::TTMove,
             tt_move,
-            tt_move_yielded: false,
+            moves: Vec::with_capacity(96),
+            cur: 0,
+            end_bad_captures: 0,
+            end_captures: 0,
+            end_generated: 0,
             ply,
             prev_from_hash,
             prev_to_hash,
             enemy_king,
-            good_captures: Vec::with_capacity(32),
-            good_capture_idx: 0,
-            bad_captures: Vec::with_capacity(16),
-            bad_capture_idx: 0,
             killer1,
             killer2,
-            killer1_yielded: false,
-            killer2_yielded: false,
+            skip_quiets: false,
             excluded_move: None,
-            good_quiets: Vec::with_capacity(48),
-            good_quiet_idx: 0,
-            bad_quiets: Vec::with_capacity(32),
-            bad_quiet_idx: 0,
         }
     }
 
-    /// Create a staged move generator that excludes a specific move.
-    /// Used for Singular Extension verification searches.
+    /// Create with exclusion for singular extension.
     pub fn with_exclusion(
         tt_move: Option<Move>,
         ply: usize,
@@ -135,17 +138,38 @@ impl StagedMoveGen {
         r#gen
     }
 
-    /// Check if a move is the excluded move
+    /// Signal to skip quiet moves entirely (Stockfish-style LMP).
     #[inline]
-    fn is_excluded(&self, m: &Move) -> bool {
-        if let Some(ref excl) = self.excluded_move {
-            m.from == excl.from && m.to == excl.to && m.promotion == excl.promotion
-        } else {
-            false
+    pub fn skip_quiet_moves(&mut self) {
+        self.skip_quiets = true;
+    }
+
+    /// Check if a move matches another
+    #[inline]
+    fn moves_match(a: &Move, b: &Option<Move>) -> bool {
+        match b {
+            Some(bm) => a.from == bm.from && a.to == bm.to && a.promotion == bm.promotion,
+            None => false,
         }
     }
 
-    /// Check if move is pseudo-legal
+    /// Check if move is excluded
+    #[inline]
+    fn is_excluded(&self, m: &Move) -> bool {
+        Self::moves_match(m, &self.excluded_move)
+    }
+
+    /// Check if move is TT move
+    #[inline]
+    fn is_tt_move(&self, m: &Move) -> bool {
+        Self::moves_match(m, &self.tt_move)
+    }
+
+    /// Check if move is a capture
+    #[inline]
+    fn is_capture(game: &GameState, m: &Move) -> bool {
+        game.board.get_piece(&m.to.x, &m.to.y).is_some()
+    }
     #[inline]
     fn is_pseudo_legal(game: &GameState, m: &Move) -> bool {
         if let Some(piece) = game.board.get_piece(&m.from.x, &m.from.y) {
@@ -153,46 +177,28 @@ impl StagedMoveGen {
                 return false;
             }
 
-            // O(1) castling integrity check:
-            // TT moves may be invalid if path is blocked or rook moved. Check:
-            // 1. Rook exists at rook_coord
-            // 2. King's landing squares are clear (m.to and one square between)
-            // 3. Rook's landing square is clear
+            // Castling check
             if piece.piece_type() == PieceType::King && (m.to.x - m.from.x).abs() > 1 {
                 if let Some(rook_coord) = &m.rook_coord {
                     if let Some(rook) = game.board.get_piece(&rook_coord.x, &rook_coord.y) {
                         if rook.color() != game.turn {
                             return false;
                         }
-
-                        // Calculate direction and critical squares
                         let dir = if m.to.x > m.from.x { 1 } else { -1 };
-
-                        // King passes through m.from+dir and lands on m.to (m.from + 2*dir)
-                        let king_path_1 = m.from.x + dir;
-                        let king_path_2 = m.to.x; // = m.from.x + 2*dir
-
-                        // Check king's path squares (these must be empty for castling)
-                        if game.board.get_piece(&king_path_1, &m.from.y).is_some() {
+                        if game.board.get_piece(&(m.from.x + dir), &m.from.y).is_some() {
                             return false;
                         }
-                        if game.board.get_piece(&king_path_2, &m.from.y).is_some() {
+                        if game.board.get_piece(&m.to.x, &m.from.y).is_some() {
                             return false;
                         }
-
-                        // For queenside, also check the square next to rook (b-file)
-                        // The rook passes through this square
-                        if dir < 0 {
-                            let extra_path = m.from.x - 3; // b1 for standard chess
-                            if game.board.get_piece(&extra_path, &m.from.y).is_some() {
-                                return false;
-                            }
+                        if dir < 0 && game.board.get_piece(&(m.from.x - 3), &m.from.y).is_some() {
+                            return false;
                         }
                     } else {
-                        return false; // Rook missing
+                        return false;
                     }
                 } else {
-                    return false; // Rook coord missing
+                    return false;
                 }
             }
             true
@@ -201,89 +207,42 @@ impl StagedMoveGen {
         }
     }
 
-    /// Check if move is a capture
-    #[inline]
-    fn is_capture(game: &GameState, m: &Move) -> bool {
-        game.board.get_piece(&m.to.x, &m.to.y).is_some()
-    }
-
-    /// Check if two moves match
-    #[inline]
-    fn moves_match(a: &Move, b: &Option<Move>) -> bool {
-        match b {
-            Some(bm) => {
-                a.from == bm.from
-                    && a.to == bm.to
-                    && a.promotion == bm.promotion
-                    && a.rook_coord == bm.rook_coord
-            }
-            None => false,
-        }
-    }
-
-    /// Score capture move (MVV-LVA + capture history + check bonus)
-    fn score_capture(
-        game: &GameState,
-        searcher: &Searcher,
-        m: &Move,
-        enemy_king: &Option<Coordinate>,
-    ) -> i32 {
-        let mut score: i32 = 0;
-
+    /// Score capture move (Stockfish formula: captureHistory + 7 * pieceValue)
+    fn score_capture(game: &GameState, searcher: &Searcher, m: &Move) -> i32 {
         if let Some(target) = game.board.get_piece(&m.to.x, &m.to.y) {
             let victim_val = get_piece_value(target.piece_type());
-            let attacker_val = get_piece_value(m.piece.piece_type());
-            let mvv_lva = victim_val * 10 - attacker_val;
-            score += mvv_lva;
-
-            // Capture history
             let cap_hist = searcher.capture_history[m.piece.piece_type() as usize]
                 [target.piece_type() as usize];
-            score += cap_hist / 10;
-
-            // Check bonus for captures that give check
-            if let Some(ek) = enemy_king {
-                if Self::move_gives_check_simple(game, m, ek) {
-                    score += sort_gives_check();
-                }
-            }
+            cap_hist + 7 * victim_val
+        } else {
+            0
         }
-
-        score
     }
 
-    /// Score quiet move (killer + countermove + check + history + continuation)
-    fn score_quiet(
-        game: &GameState,
-        searcher: &Searcher,
-        m: &Move,
-        ply: usize,
-        prev_from_hash: usize,
-        prev_to_hash: usize,
-        enemy_king: &Option<Coordinate>,
-        killer1: &Option<Move>,
-        killer2: &Option<Move>,
-    ) -> i32 {
+    /// Score quiet move (Stockfish formula with histories)
+    fn score_quiet(&self, game: &GameState, searcher: &Searcher, m: &Move) -> i32 {
         let mut score: i32 = DEFAULT_SORT_QUIET;
+        let ply = self.ply;
 
         // Killer bonus
-        if Self::moves_match(m, killer1) {
+        if Self::moves_match(m, &self.killer1) {
             return sort_killer1();
         }
-        if Self::moves_match(m, killer2) {
+        if Self::moves_match(m, &self.killer2) {
             return sort_killer2();
         }
 
         // Check bonus
-        if let Some(ek) = enemy_king {
+        if let Some(ref ek) = self.enemy_king {
             if Self::move_gives_check_simple(game, m, ek) {
                 score += sort_gives_check();
             }
         }
 
         // Countermove bonus
-        if ply > 0 && prev_from_hash < 256 && prev_to_hash < 256 {
-            let (cm_piece, cm_to_x, cm_to_y) = searcher.countermoves[prev_from_hash][prev_to_hash];
+        if self.ply > 0 && self.prev_from_hash < 256 && self.prev_to_hash < 256 {
+            let (cm_piece, cm_to_x, cm_to_y) =
+                searcher.countermoves[self.prev_from_hash][self.prev_to_hash];
             if cm_piece != 0
                 && cm_piece == m.piece.piece_type() as u8
                 && cm_to_x == m.to.x as i16
@@ -293,9 +252,9 @@ impl StagedMoveGen {
             }
         }
 
-        // Main history
+        // Main history (2x weight like Stockfish)
         let idx = hash_move_dest(m);
-        score += searcher.history[m.piece.piece_type() as usize][idx];
+        score += 2 * searcher.history[m.piece.piece_type() as usize][idx];
 
         // Continuation history
         let cur_from_hash = hash_coord_32(m.from.x, m.from.y);
@@ -317,90 +276,44 @@ impl StagedMoveGen {
         score
     }
 
-    /// Simple check detection (direct attacks to enemy king)
-    /// Public so it can be used in main search for pruning exemptions
+    /// Simple check detection
     #[inline]
-    pub fn move_gives_check_simple(game: &GameState, m: &Move, enemy_king: &Coordinate) -> bool {
+    pub fn move_gives_check_simple(_game: &GameState, m: &Move, enemy_king: &Coordinate) -> bool {
         let to = &m.to;
-        let kx = enemy_king.x;
-        let ky = enemy_king.y;
-        let dx = kx - to.x;
-        let dy = ky - to.y;
+        let dx = (enemy_king.x - to.x).abs();
+        let dy = (enemy_king.y - to.y).abs();
 
-        let piece_type = m.promotion.unwrap_or(m.piece.piece_type());
-
-        match piece_type {
+        match m.piece.piece_type() {
+            PieceType::Queen => dx == 0 || dy == 0 || dx == dy,
+            PieceType::Rook => dx == 0 || dy == 0,
+            PieceType::Bishop => dx == dy,
+            PieceType::Knight => (dx == 1 && dy == 2) || (dx == 2 && dy == 1),
             PieceType::Pawn => {
-                let dir = if m.piece.color() == PlayerColor::White {
+                let direction = if m.piece.color() == PlayerColor::White {
                     1
                 } else {
                     -1
                 };
-                dx.abs() == 1 && dy == dir
-            }
-            PieceType::Knight => {
-                let adx = dx.abs();
-                let ady = dy.abs();
-                (adx == 1 && ady == 2) || (adx == 2 && ady == 1)
-            }
-            PieceType::Bishop => {
-                dx.abs() == dy.abs()
-                    && dx != 0
-                    && Self::path_clear(game, to, enemy_king, dx.signum(), dy.signum())
-            }
-            PieceType::Rook => {
-                ((dx == 0 && dy != 0) || (dy == 0 && dx != 0))
-                    && Self::path_clear(game, to, enemy_king, dx.signum(), dy.signum())
-            }
-            PieceType::Queen | PieceType::RoyalQueen => {
-                let is_ortho = (dx == 0 && dy != 0) || (dy == 0 && dx != 0);
-                let is_diag = dx.abs() == dy.abs() && dx != 0;
-                (is_ortho || is_diag)
-                    && Self::path_clear(game, to, enemy_king, dx.signum(), dy.signum())
+                dy == 1 && (to.y - enemy_king.y) == -direction && dx == 1
             }
             _ => false,
         }
     }
 
-    #[inline]
-    pub fn path_clear(
-        game: &GameState,
-        from: &Coordinate,
-        to: &Coordinate,
-        step_x: i64,
-        step_y: i64,
-    ) -> bool {
-        let mut x = from.x + step_x;
-        let mut y = from.y + step_y;
-        let mut steps = 0;
-        const MAX_PATH: i64 = 50;
-
-        while (x != to.x || y != to.y) && steps < MAX_PATH {
-            if game.board.get_piece(&x, &y).is_some() {
-                return false;
-            }
-            x += step_x;
-            y += step_y;
-            steps += 1;
-        }
-        steps < MAX_PATH
-    }
-
+    /// Get next move (Stockfish-style next_move())
     pub fn next(&mut self, game: &GameState, searcher: &Searcher) -> Option<Move> {
         loop {
             match self.stage {
                 MoveStage::TTMove => {
-                    self.stage = MoveStage::GenerateCaptures;
+                    self.stage = MoveStage::CaptureInit;
                     if let Some(ref m) = self.tt_move {
-                        // Skip if this is the excluded move (for SE verification)
                         if !self.is_excluded(m) && Self::is_pseudo_legal(game, m) {
-                            self.tt_move_yielded = true;
                             return Some(m.clone());
                         }
                     }
                 }
 
-                MoveStage::GenerateCaptures => {
+                MoveStage::CaptureInit => {
                     // Generate all captures
                     let mut captures = Vec::with_capacity(32);
                     get_quiescence_captures(
@@ -413,78 +326,90 @@ impl StagedMoveGen {
                         &mut captures,
                     );
 
-                    // Separate good and bad captures with scores
-                    let enemy_king = self.enemy_king;
+                    // Score captures
                     for m in captures {
-                        // Skip TT move or excluded move
-                        if Self::moves_match(&m, &self.tt_move) || self.is_excluded(&m) {
+                        if self.is_tt_move(&m) || self.is_excluded(&m) {
                             continue;
                         }
-
-                        let see_val = static_exchange_eval(game, &m);
-                        if see_val >= see_winning_threshold() {
-                            let score = Self::score_capture(game, searcher, &m, &enemy_king);
-                            self.good_captures.push((m, score));
-                        } else {
-                            self.bad_captures.push(m);
-                        }
+                        let score = Self::score_capture(game, searcher, &m);
+                        self.moves.push(ScoredMove { m, score });
                     }
 
-                    // Sort good captures by score (highest first)
-                    self.good_captures.sort_by(|a, b| b.1.cmp(&a.1));
+                    self.end_captures = self.moves.len();
+                    self.end_bad_captures = 0;
+                    self.cur = 0;
 
-                    self.stage = MoveStage::GoodCaptures;
+                    // Full sort for captures (usually small number)
+                    if !self.moves.is_empty() {
+                        sort_moves_by_score(&mut self.moves[..self.end_captures]);
+                    }
+
+                    self.stage = MoveStage::GoodCapture;
                 }
 
-                MoveStage::GoodCaptures => {
-                    while self.good_capture_idx < self.good_captures.len() {
-                        let (m, _) = self.good_captures[self.good_capture_idx].clone();
-                        self.good_capture_idx += 1;
-                        // Skip excluded move
-                        if self.is_excluded(&m) {
-                            continue;
+                MoveStage::GoodCapture => {
+                    // Select captures with SEE filter
+                    while self.cur < self.end_captures {
+                        let sm = &self.moves[self.cur];
+                        // Use original fixed threshold, not Stockfish's -score/18
+                        if static_exchange_eval(game, &sm.m) >= see_winning_threshold() {
+                            let m = self.moves[self.cur].m.clone();
+                            self.cur += 1;
+                            return Some(m);
+                        } else {
+                            // Move bad capture to end_bad_captures section
+                            // We'll iterate them later
+                            self.end_bad_captures += 1;
                         }
-                        return Some(m);
+                        self.cur += 1;
                     }
                     self.stage = MoveStage::Killer1;
                 }
 
                 MoveStage::Killer1 => {
                     self.stage = MoveStage::Killer2;
-                    if !self.killer1_yielded {
-                        self.killer1_yielded = true;
-                        if let Some(ref k) = self.killer1 {
-                            // Killer must be: not TT move, not a capture, pseudo-legal
-                            if !Self::moves_match(k, &self.tt_move)
-                                && !self.is_excluded(k)
-                                && !Self::is_capture(game, k)
-                                && Self::is_pseudo_legal(game, k)
-                            {
-                                return Some(k.clone());
-                            }
+                    // Skip killers if LMP is active (killers are quiet moves)
+                    if self.skip_quiets {
+                        continue;
+                    }
+                    if let Some(ref k) = self.killer1 {
+                        // Killer must be: not TT move, not a capture, pseudo-legal
+                        if !self.is_tt_move(k)
+                            && !self.is_excluded(k)
+                            && !Self::is_capture(game, k)
+                            && Self::is_pseudo_legal(game, k)
+                        {
+                            return Some(k.clone());
                         }
                     }
                 }
 
                 MoveStage::Killer2 => {
-                    self.stage = MoveStage::GenerateQuiets;
-                    if !self.killer2_yielded {
-                        self.killer2_yielded = true;
-                        if let Some(ref k) = self.killer2 {
-                            if !Self::moves_match(k, &self.tt_move)
-                                && !Self::moves_match(k, &self.killer1)
-                                && !self.is_excluded(k)
-                                && !Self::is_capture(game, k)
-                                && Self::is_pseudo_legal(game, k)
-                            {
-                                return Some(k.clone());
-                            }
+                    self.stage = MoveStage::QuietInit;
+                    // Skip killers if LMP is active
+                    if self.skip_quiets {
+                        continue;
+                    }
+                    if let Some(ref k) = self.killer2 {
+                        if !self.is_tt_move(k)
+                            && !Self::moves_match(k, &self.killer1)
+                            && !self.is_excluded(k)
+                            && !Self::is_capture(game, k)
+                            && Self::is_pseudo_legal(game, k)
+                        {
+                            return Some(k.clone());
                         }
                     }
                 }
 
-                MoveStage::GenerateQuiets => {
-                    let mut quiets_raw = Vec::with_capacity(64);
+                MoveStage::QuietInit => {
+                    if self.skip_quiets {
+                        self.stage = MoveStage::BadCapture;
+                        continue;
+                    }
+
+                    // Generate quiets
+                    let mut quiets = Vec::with_capacity(64);
                     get_quiet_moves_into(
                         &game.board,
                         game.turn,
@@ -492,88 +417,85 @@ impl StagedMoveGen {
                         &game.en_passant,
                         &game.game_rules,
                         &game.spatial_indices,
-                        &mut quiets_raw,
+                        &mut quiets,
                     );
 
-                    // Score and collect quiets
-                    let ply = self.ply;
-                    let prev_from = self.prev_from_hash;
-                    let prev_to = self.prev_to_hash;
-                    let enemy_king = self.enemy_king;
-                    let killer1 = self.killer1.clone();
-                    let killer2 = self.killer2.clone();
-
-                    // Stockfish uses -14000 threshold for good/bad quiet separation.
-                    // Our history scale is similar, so use a proportional threshold.
-                    // -4000 is approximately 25% of max history (16384).
-                    const GOOD_QUIET_THRESHOLD: i32 = -4000;
-
-                    for m in quiets_raw {
-                        // Skip TT move and killers
-                        if Self::moves_match(&m, &self.tt_move) {
+                    // Score quiets
+                    let quiet_start = self.moves.len();
+                    for m in quiets {
+                        if self.is_tt_move(&m) || self.is_excluded(&m) {
                             continue;
                         }
-                        if Self::moves_match(&m, &killer1) || Self::moves_match(&m, &killer2) {
-                            continue;
-                        }
-                        if self.is_excluded(&m) {
-                            continue;
-                        }
-
-                        let score = Self::score_quiet(
-                            game,
-                            searcher,
-                            &m,
-                            ply,
-                            prev_from,
-                            prev_to,
-                            &enemy_king,
-                            &killer1,
-                            &killer2,
-                        );
-
-                        // Separate good and bad quiets by threshold
-                        if score > GOOD_QUIET_THRESHOLD {
-                            self.good_quiets.push((m, score));
-                        } else {
-                            self.bad_quiets.push(m);
-                        }
+                        let score = self.score_quiet(game, searcher, &m);
+                        self.moves.push(ScoredMove { m, score });
                     }
 
-                    // Sort good quiets by score (highest first)
-                    self.good_quiets.sort_by(|a, b| b.1.cmp(&a.1));
+                    self.end_generated = self.moves.len();
+                    self.cur = quiet_start;
 
-                    self.stage = MoveStage::GoodQuiets;
-                }
-
-                MoveStage::GoodQuiets => {
-                    while self.good_quiet_idx < self.good_quiets.len() {
-                        let (m, _) = self.good_quiets[self.good_quiet_idx].clone();
-                        self.good_quiet_idx += 1;
-                        return Some(m);
+                    // Full sort for quiets (like original)
+                    if quiet_start < self.end_generated {
+                        sort_moves_by_score(&mut self.moves[quiet_start..self.end_generated]);
                     }
-                    self.stage = MoveStage::BadCaptures;
+
+                    self.stage = MoveStage::GoodQuiet;
                 }
 
-                MoveStage::BadCaptures => {
-                    while self.bad_capture_idx < self.bad_captures.len() {
-                        let m = self.bad_captures[self.bad_capture_idx].clone();
-                        self.bad_capture_idx += 1;
-                        // Skip excluded move
-                        if self.is_excluded(&m) {
-                            continue;
+                MoveStage::GoodQuiet => {
+                    if self.skip_quiets {
+                        self.stage = MoveStage::BadCapture;
+                        continue;
+                    }
+
+                    // Select quiets with score > goodQuietThreshold
+                    while self.cur < self.end_generated {
+                        if self.moves[self.cur].score > GOOD_QUIET_THRESHOLD {
+                            let m = self.moves[self.cur].m.clone();
+                            self.cur += 1;
+                            return Some(m);
                         }
-                        return Some(m);
+                        self.cur += 1;
                     }
-                    // After bad captures, try bad quiets
-                    self.stage = MoveStage::BadQuiets;
+
+                    // Setup for bad captures
+                    self.cur = 0;
+                    self.stage = MoveStage::BadCapture;
                 }
 
-                MoveStage::BadQuiets => {
-                    while self.bad_quiet_idx < self.bad_quiets.len() {
-                        let m = self.bad_quiets[self.bad_quiet_idx].clone();
-                        self.bad_quiet_idx += 1;
-                        return Some(m);
+                MoveStage::BadCapture => {
+                    // Iterate through captures that failed SEE
+                    while self.cur < self.end_captures {
+                        let sm = &self.moves[self.cur];
+                        let see_threshold = -sm.score / 18;
+
+                        // This capture failed SEE earlier, return it now
+                        if static_exchange_eval(game, &sm.m) < see_threshold {
+                            let m = self.moves[self.cur].m.clone();
+                            self.cur += 1;
+                            return Some(m);
+                        }
+                        self.cur += 1;
+                    }
+
+                    // Setup for bad quiets
+                    self.cur = self.end_captures;
+                    self.stage = MoveStage::BadQuiet;
+                }
+
+                MoveStage::BadQuiet => {
+                    if self.skip_quiets {
+                        self.stage = MoveStage::Done;
+                        return None;
+                    }
+
+                    // Select quiets with score <= goodQuietThreshold
+                    while self.cur < self.end_generated {
+                        if self.moves[self.cur].score <= GOOD_QUIET_THRESHOLD {
+                            let m = self.moves[self.cur].m.clone();
+                            self.cur += 1;
+                            return Some(m);
+                        }
+                        self.cur += 1;
                     }
                     self.stage = MoveStage::Done;
                 }
