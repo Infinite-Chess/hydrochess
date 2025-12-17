@@ -144,38 +144,43 @@ pub fn in_bounds(x: i64, y: i64) -> bool {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SpatialIndices {
-    pub rows: FxHashMap<i64, Vec<i64>>,
-    pub cols: FxHashMap<i64, Vec<i64>>,
-    pub diag1: FxHashMap<i64, Vec<i64>>, // x - y
-    pub diag2: FxHashMap<i64, Vec<i64>>, // x + y
+    /// Row index: y -> [(x, packed_piece), ...] sorted by x
+    pub rows: FxHashMap<i64, Vec<(i64, u8)>>,
+    /// Column index: x -> [(y, packed_piece), ...] sorted by y
+    pub cols: FxHashMap<i64, Vec<(i64, u8)>>,
+    /// Diagonal (x-y constant): key -> [(x, packed_piece), ...] sorted by x
+    pub diag1: FxHashMap<i64, Vec<(i64, u8)>>,
+    /// Anti-diagonal (x+y constant): key -> [(x, packed_piece), ...] sorted by x
+    pub diag2: FxHashMap<i64, Vec<(i64, u8)>>,
 }
 
 impl SpatialIndices {
     pub fn new(board: &Board) -> Self {
-        let mut rows: FxHashMap<i64, Vec<i64>> = FxHashMap::default();
-        let mut cols: FxHashMap<i64, Vec<i64>> = FxHashMap::default();
-        let mut diag1: FxHashMap<i64, Vec<i64>> = FxHashMap::default();
-        let mut diag2: FxHashMap<i64, Vec<i64>> = FxHashMap::default();
+        let mut rows: FxHashMap<i64, Vec<(i64, u8)>> = FxHashMap::default();
+        let mut cols: FxHashMap<i64, Vec<(i64, u8)>> = FxHashMap::default();
+        let mut diag1: FxHashMap<i64, Vec<(i64, u8)>> = FxHashMap::default();
+        let mut diag2: FxHashMap<i64, Vec<(i64, u8)>> = FxHashMap::default();
 
-        for ((x, y), _) in board.iter() {
-            rows.entry(*y).or_default().push(*x);
-            cols.entry(*x).or_default().push(*y);
-            diag1.entry(x - y).or_default().push(*x);
-            diag2.entry(x + y).or_default().push(*x);
+        for ((x, y), piece) in board.iter() {
+            let packed = piece.packed();
+            rows.entry(*y).or_default().push((*x, packed));
+            cols.entry(*x).or_default().push((*y, packed));
+            diag1.entry(x - y).or_default().push((*x, packed));
+            diag2.entry(x + y).or_default().push((*x, packed));
         }
 
-        // Sort vectors for binary search or efficient scanning
+        // Sort vectors by coordinate for binary search
         for list in rows.values_mut() {
-            list.sort();
+            list.sort_by_key(|(coord, _)| *coord);
         }
         for list in cols.values_mut() {
-            list.sort();
+            list.sort_by_key(|(coord, _)| *coord);
         }
         for list in diag1.values_mut() {
-            list.sort();
+            list.sort_by_key(|(coord, _)| *coord);
         }
         for list in diag2.values_mut() {
-            list.sort();
+            list.sort_by_key(|(coord, _)| *coord);
         }
 
         SpatialIndices {
@@ -187,29 +192,32 @@ impl SpatialIndices {
     }
 
     #[inline]
-    fn insert_sorted(vec: &mut Vec<i64>, val: i64) {
-        match vec.binary_search(&val) {
-            Ok(_) => {}
-            Err(pos) => vec.insert(pos, val),
+    fn insert_sorted(vec: &mut Vec<(i64, u8)>, coord: i64, packed: u8) {
+        match vec.binary_search_by_key(&coord, |(c, _)| *c) {
+            Ok(pos) => {
+                // Update existing entry with new piece
+                vec[pos].1 = packed;
+            }
+            Err(pos) => vec.insert(pos, (coord, packed)),
         }
     }
 
     #[inline]
-    fn remove_sorted(vec: &mut Vec<i64>, val: i64) {
-        if let Ok(pos) = vec.binary_search(&val) {
+    fn remove_sorted(vec: &mut Vec<(i64, u8)>, coord: i64) {
+        if let Ok(pos) = vec.binary_search_by_key(&coord, |(c, _)| *c) {
             vec.remove(pos);
         }
     }
 
     /// Incrementally add a piece at (x, y) to the indices.
-    pub fn add(&mut self, x: i64, y: i64) {
-        Self::insert_sorted(self.rows.entry(y).or_default(), x);
-        Self::insert_sorted(self.cols.entry(x).or_default(), y);
+    pub fn add(&mut self, x: i64, y: i64, packed: u8) {
+        Self::insert_sorted(self.rows.entry(y).or_default(), x, packed);
+        Self::insert_sorted(self.cols.entry(x).or_default(), y, packed);
 
         let d1 = x - y;
         let d2 = x + y;
-        Self::insert_sorted(self.diag1.entry(d1).or_default(), x);
-        Self::insert_sorted(self.diag2.entry(d2).or_default(), x);
+        Self::insert_sorted(self.diag1.entry(d1).or_default(), x, packed);
+        Self::insert_sorted(self.diag2.entry(d2).or_default(), x, packed);
     }
 
     /// Incrementally remove a piece at (x, y) from the indices.
@@ -241,6 +249,31 @@ impl SpatialIndices {
                 self.diag2.remove(&d2);
             }
         }
+    }
+
+    /// Helper to find nearest piece in a direction from SpatialIndices.
+    /// Returns (coord, packed_piece) if found.
+    #[inline]
+    pub fn find_nearest(vec: &[(i64, u8)], from: i64, direction: i64) -> Option<(i64, u8)> {
+        let pos = vec.binary_search_by_key(&from, |(c, _)| *c);
+        let idx = match pos {
+            Ok(i) => i,
+            Err(i) => i,
+        };
+
+        if direction > 0 {
+            // Look forward
+            let next_idx = if pos.is_ok() { idx + 1 } else { idx };
+            if next_idx < vec.len() {
+                return Some(vec[next_idx]);
+            }
+        } else {
+            // Look backward
+            if idx > 0 {
+                return Some(vec[idx - 1]);
+            }
+        }
+        None
     }
 }
 
@@ -677,118 +710,71 @@ pub fn is_square_attacked(
     attacker_color: PlayerColor,
     indices: &SpatialIndices,
 ) -> bool {
-    // 1. Check Leapers (Knight, Camel, Giraffe, Zebra, King/Guard/Centaur/RoyalCentaur)
-    // We check the offsets *from* the target. If a piece is there, it can attack *to* the target.
-    let leaper_checks = [
-        (
-            vec![
-                (1, 2),
-                (1, -2),
-                (2, 1),
-                (2, -1),
-                (-1, 2),
-                (-1, -2),
-                (-2, 1),
-                (-2, -1),
-            ],
-            vec![
-                PieceType::Knight,
-                PieceType::Chancellor,
-                PieceType::Archbishop,
-                PieceType::Amazon,
-                PieceType::Centaur,
-                PieceType::RoyalCentaur,
-            ],
-        ),
-        (
-            vec![
-                (1, 3),
-                (1, -3),
-                (3, 1),
-                (3, -1),
-                (-1, 3),
-                (-1, -3),
-                (-3, 1),
-                (-3, -1),
-            ],
-            vec![PieceType::Camel],
-        ),
-        (
-            vec![
-                (1, 4),
-                (1, -4),
-                (4, 1),
-                (4, -1),
-                (-1, 4),
-                (-1, -4),
-                (-4, 1),
-                (-4, -1),
-            ],
-            vec![PieceType::Giraffe],
-        ),
-        (
-            vec![
-                (2, 3),
-                (2, -3),
-                (3, 2),
-                (3, -2),
-                (-2, 3),
-                (-2, -3),
-                (-3, 2),
-                (-3, -2),
-            ],
-            vec![PieceType::Zebra],
-        ),
-        (
-            vec![
-                (0, 1),
-                (0, -1),
-                (1, 0),
-                (-1, 0),
-                (1, 1),
-                (1, -1),
-                (-1, 1),
-                (-1, -1),
-            ],
-            vec![
-                PieceType::King,
-                PieceType::Guard,
-                PieceType::Centaur,
-                PieceType::RoyalCentaur,
-            ],
-        ),
-        // Hawk: (2,0), (3,0), (2,2), (3,3) and rotations
-        (
-            vec![
-                (2, 0),
-                (-2, 0),
-                (0, 2),
-                (0, -2),
-                (3, 0),
-                (-3, 0),
-                (0, 3),
-                (0, -3),
-                (2, 2),
-                (2, -2),
-                (-2, 2),
-                (-2, -2),
-                (3, 3),
-                (3, -3),
-                (-3, 3),
-                (-3, -3),
-            ],
-            vec![PieceType::Hawk],
-        ),
-    ];
+    use crate::attacks::*;
 
-    for (offsets, types) in &leaper_checks {
-        for (dx, dy) in offsets {
-            let x = target.x + dx;
-            let y = target.y + dy;
-            if let Some(piece) = board.get_piece(&x, &y) {
-                if piece.color() == attacker_color && types.contains(&piece.piece_type()) {
-                    return true;
-                }
+    // 1. Check Leapers using static offset arrays (no allocations)
+    // Knight-like attackers
+    for &(dx, dy) in &KNIGHT_OFFSETS {
+        let x = target.x + dx;
+        let y = target.y + dy;
+        if let Some(piece) = board.get_piece(&x, &y) {
+            if piece.color() == attacker_color && matches_mask(piece.piece_type(), KNIGHT_MASK) {
+                return true;
+            }
+        }
+    }
+
+    // King-like attackers (1 square in any direction)
+    for &(dx, dy) in &KING_OFFSETS {
+        let x = target.x + dx;
+        let y = target.y + dy;
+        if let Some(piece) = board.get_piece(&x, &y) {
+            if piece.color() == attacker_color && matches_mask(piece.piece_type(), KING_MASK) {
+                return true;
+            }
+        }
+    }
+
+    // Camel attackers
+    for &(dx, dy) in &CAMEL_OFFSETS {
+        let x = target.x + dx;
+        let y = target.y + dy;
+        if let Some(piece) = board.get_piece(&x, &y) {
+            if piece.color() == attacker_color && piece.piece_type() == PieceType::Camel {
+                return true;
+            }
+        }
+    }
+
+    // Giraffe attackers
+    for &(dx, dy) in &GIRAFFE_OFFSETS {
+        let x = target.x + dx;
+        let y = target.y + dy;
+        if let Some(piece) = board.get_piece(&x, &y) {
+            if piece.color() == attacker_color && piece.piece_type() == PieceType::Giraffe {
+                return true;
+            }
+        }
+    }
+
+    // Zebra attackers
+    for &(dx, dy) in &ZEBRA_OFFSETS {
+        let x = target.x + dx;
+        let y = target.y + dy;
+        if let Some(piece) = board.get_piece(&x, &y) {
+            if piece.color() == attacker_color && piece.piece_type() == PieceType::Zebra {
+                return true;
+            }
+        }
+    }
+
+    // Hawk attackers
+    for &(dx, dy) in &HAWK_OFFSETS {
+        let x = target.x + dx;
+        let y = target.y + dy;
+        if let Some(piece) = board.get_piece(&x, &y) {
+            if piece.color() == attacker_color && piece.piece_type() == PieceType::Hawk {
+                return true;
             }
         }
     }
@@ -810,135 +796,48 @@ pub fn is_square_attacked(
         }
     }
 
-    // 3. Check Sliding Pieces (Orthogonal and Diagonal)
-    // We look outwards from target. The first piece we hit must be a slider of the correct type.
-    let ortho_dirs = [(1, 0), (-1, 0), (0, 1), (0, -1)];
-    let diag_dirs = [(1, 1), (1, -1), (-1, 1), (-1, -1)];
-
-    let ortho_types = [
-        PieceType::Rook,
-        PieceType::Queen,
-        PieceType::Chancellor,
-        PieceType::Amazon,
-        PieceType::RoyalQueen,
-    ];
-    let diag_types = [
-        PieceType::Bishop,
-        PieceType::Queen,
-        PieceType::Archbishop,
-        PieceType::Amazon,
-        PieceType::RoyalQueen,
-    ];
-
-    // Helper to check rays
-    let check_ray = |dirs: &[(i64, i64)], valid_types: &[PieceType]| -> bool {
-        for (dx, dy) in dirs {
-            // Use SpatialIndices if available to jump to nearest piece
-            let mut closest_piece: Option<Piece> = None;
-            let mut found_via_indices = false;
-
-            let line_vec = if *dx == 0 {
+    // 3. Check Sliding Pieces (Orthogonal and Diagonal) using SpatialIndices
+    // Helper to check rays using indices for fast O(log n) nearest-piece lookup
+    // Now uses inline piece data to avoid secondary board lookups
+    let check_ray = |dirs: &[(i64, i64)], type_mask: PieceTypeMask| -> bool {
+        for &(dx, dy) in dirs {
+            let line_vec = if dx == 0 {
                 indices.cols.get(&target.x)
-            } else if *dy == 0 {
+            } else if dy == 0 {
                 indices.rows.get(&target.y)
-            } else if *dx == *dy {
+            } else if dx == dy {
                 indices.diag1.get(&(target.x - target.y))
             } else {
                 indices.diag2.get(&(target.x + target.y))
             };
 
             if let Some(vec) = line_vec {
-                let val = if *dx == 0 { target.y } else { target.x };
-                if let Ok(idx) = vec.binary_search(&val) {
-                    let step_dir = if *dx == 0 { *dy } else { *dx };
-                    if step_dir > 0 {
-                        if idx + 1 < vec.len() {
-                            let next_val = vec[idx + 1];
-                            let (tx, ty) = if *dx == 0 {
-                                (target.x, next_val)
-                            } else if *dy == 0 {
-                                (next_val, target.y)
-                            } else if *dx == *dy {
-                                (next_val, next_val - (target.x - target.y))
-                            } else {
-                                (next_val, (target.x + target.y) - next_val)
-                            };
-                            if let Some(p) = board.get_piece(&tx, &ty) {
-                                closest_piece = Some(p.clone());
-                            }
-                            found_via_indices = true;
-                        }
-                    } else {
-                        if idx > 0 {
-                            let prev_val = vec[idx - 1];
-                            let (tx, ty) = if *dx == 0 {
-                                (target.x, prev_val)
-                            } else if *dy == 0 {
-                                (prev_val, target.y)
-                            } else if *dx == *dy {
-                                (prev_val, prev_val - (target.x - target.y))
-                            } else {
-                                (prev_val, (target.x + target.y) - prev_val)
-                            };
-                            if let Some(p) = board.get_piece(&tx, &ty) {
-                                closest_piece = Some(p.clone());
-                            }
-                            found_via_indices = true;
-                        }
+                let val = if dx == 0 { target.y } else { target.x };
+                let step_dir = if dx == 0 { dy } else { dx };
+
+                // Use new find_nearest helper with inline piece data
+                if let Some((_, packed)) = SpatialIndices::find_nearest(vec, val, step_dir) {
+                    let piece = Piece::from_packed(packed);
+                    if piece.color() == attacker_color
+                        && matches_mask(piece.piece_type(), type_mask)
+                    {
+                        return true;
                     }
-                }
-            }
-
-            if !found_via_indices {
-                // Fallback ray scan
-                let mut k = 1;
-                loop {
-                    let x = target.x + dx * k;
-                    let y = target.y + dy * k;
-
-                    if let Some(piece) = board.get_piece(&x, &y) {
-                        closest_piece = Some(piece.clone());
-                        break;
-                    }
-                    k += 1;
-                    if k > 50 {
-                        break;
-                    } // Safety limit for fallback
-                }
-            }
-
-            if let Some(piece) = closest_piece {
-                if piece.color() == attacker_color && valid_types.contains(&piece.piece_type()) {
-                    return true;
                 }
             }
         }
         false
     };
 
-    if check_ray(&ortho_dirs, &ortho_types) {
+    if check_ray(&ORTHO_DIRS, ORTHO_MASK) {
         return true;
     }
-    if check_ray(&diag_dirs, &diag_types) {
+    if check_ray(&DIAG_DIRS, DIAG_MASK) {
         return true;
     }
 
     // 4. Check Knightrider (Sliding Knight)
-    // Vectors: (1,2), (1,-2), (2,1), (2,-1) etc.
-    // We check rays in these 8 directions.
-    let kr_dirs = [
-        (1, 2),
-        (1, -2),
-        (2, 1),
-        (2, -1),
-        (-1, 2),
-        (-1, -2),
-        (-2, 1),
-        (-2, -1),
-    ];
-    // Reuse check_ray logic but without indices (indices don't support knight lines yet)
-    // Or just manual scan
-    for (dx, dy) in kr_dirs {
+    for &(dx, dy) in &KNIGHTRIDER_DIRS {
         let mut k = 1;
         loop {
             let x = target.x + dx * k;
@@ -958,43 +857,32 @@ pub fn is_square_attacked(
 
     // 5. Check Huygen (Prime Leaper/Slider)
     // Orthogonal directions. Check all prime distances.
-    // Optimization: Use indices to find pieces on the line, then check if distance is prime.
-    for (dx, dy) in ortho_dirs {
+    for &(dx, dy) in &ORTHO_DIRS {
         let line_vec = if dx == 0 {
             indices.cols.get(&target.x)
         } else {
             indices.rows.get(&target.y)
         };
         if let Some(vec) = line_vec {
-            // Iterate all pieces on this line
-            for val in vec {
+            // Iterate all pieces on this line - now includes piece data
+            for &(coord, packed) in vec {
                 let dist = if dx == 0 {
-                    val - target.y
+                    coord - target.y
                 } else {
-                    val - target.x
+                    coord - target.x
                 };
                 let abs_dist = dist.abs();
                 if abs_dist > 0 && is_prime_i64(abs_dist) {
                     // Check direction
                     let sign = if dist > 0 { 1 } else { -1 };
-                    let dir_check = if dx == 0 {
-                        if dy == sign { true } else { false }
-                    } else {
-                        if dx == sign { true } else { false }
-                    };
+                    let dir_check = if dx == 0 { dy == sign } else { dx == sign };
 
                     if dir_check {
-                        let (tx, ty) = if dx == 0 {
-                            (target.x, *val)
-                        } else {
-                            (*val, target.y)
-                        };
-                        if let Some(piece) = board.get_piece(&tx, &ty) {
-                            if piece.color() == attacker_color
-                                && piece.piece_type() == PieceType::Huygen
-                            {
-                                return true;
-                            }
+                        let piece = Piece::from_packed(packed);
+                        if piece.color() == attacker_color
+                            && piece.piece_type() == PieceType::Huygen
+                        {
+                            return true;
                         }
                     }
                 }
@@ -1003,12 +891,6 @@ pub fn is_square_attacked(
     }
 
     // 6. Check Rose (Circular Knight)
-    // Max 8 directions * 7 steps = 56 squares.
-    // We can scan outwards from target in reverse rose moves.
-    // So we generate rose moves from target and see if we hit a Rose.
-    // My generate_rose_moves checks `board.get_piece` and breaks if blocked.
-    // So it is blocked by pieces.
-    // So we can trace out from target.
     let defender_color = attacker_color.opponent();
     let rose_moves =
         generate_rose_moves(board, target, &Piece::new(PieceType::Rose, defender_color));
@@ -1035,7 +917,7 @@ fn generate_pawn_moves(
     let direction = match piece.color() {
         PlayerColor::White => 1,
         PlayerColor::Black => -1,
-        PlayerColor::Neutral => return moves, // Neutral pawns can't move
+        PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
     };
 
     // Get promotion ranks for this color (default to 8 for white, 1 for black if not specified)
@@ -1043,14 +925,14 @@ fn generate_pawn_moves(
         match piece.color() {
             PlayerColor::White => ranks.white.clone(),
             PlayerColor::Black => ranks.black.clone(),
-            PlayerColor::Neutral => vec![],
+            PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
         }
     } else {
         // Default promotion ranks for standard chess
         match piece.color() {
             PlayerColor::White => vec![8],
             PlayerColor::Black => vec![1],
-            PlayerColor::Neutral => vec![],
+            PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
         }
     };
 
@@ -1168,7 +1050,7 @@ fn generate_pawn_capture_moves(
     let direction = match piece.color() {
         PlayerColor::White => 1,
         PlayerColor::Black => -1,
-        PlayerColor::Neutral => return, // Neutral pawns can't move
+        PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
     };
 
     // Get promotion ranks for this color (default to 8 for white, 1 for black if not specified)
@@ -1176,13 +1058,13 @@ fn generate_pawn_capture_moves(
         match piece.color() {
             PlayerColor::White => ranks.white.clone(),
             PlayerColor::Black => ranks.black.clone(),
-            PlayerColor::Neutral => vec![],
+            PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
         }
     } else {
         match piece.color() {
             PlayerColor::White => vec![8],
             PlayerColor::Black => vec![1],
-            PlayerColor::Neutral => vec![],
+            PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
         }
     };
 
@@ -1601,7 +1483,7 @@ fn generate_pawn_quiet_moves(
     let direction = match piece.color() {
         PlayerColor::White => 1,
         PlayerColor::Black => -1,
-        PlayerColor::Neutral => return,
+        PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
     };
 
     // Get promotion ranks
@@ -1616,7 +1498,7 @@ fn generate_pawn_quiet_moves(
             .as_ref()
             .map(|p| p.black.clone())
             .unwrap_or_else(|| vec![1]),
-        PlayerColor::Neutral => vec![],
+        PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
     };
 
     let default_promos = [
@@ -2064,9 +1946,10 @@ pub fn generate_sliding_moves(
 }
 
 /// Find the closest blocker on a ray using spatial indices (O(log n))
+/// Now uses the new SpatialIndices format with inline piece data
 #[inline]
 fn find_blocker_via_indices(
-    board: &Board,
+    _board: &Board,
     from: &Coordinate,
     dir_x: i64,
     dir_y: i64,
@@ -2091,72 +1974,23 @@ fn find_blocker_via_indices(
         let search_val = if is_vertical { from.y } else { from.x };
         let step_dir = if is_vertical { dir_y } else { dir_x };
 
-        // Binary search for our current position
-        // If found (Ok), we look at adjacent indices.
-        // If not found (Err), index is where it *would* be, so that gives us the next piece.
-        let idx_res = vec.binary_search(&search_val);
+        // Use the new find_nearest helper
+        if let Some((next_coord, packed)) = SpatialIndices::find_nearest(vec, search_val, step_dir)
+        {
+            let dist = (next_coord - search_val).abs();
 
-        let target_idx = match idx_res {
-            Ok(i) => {
-                if step_dir > 0 {
-                    i + 1
-                } else {
-                    i.wrapping_sub(1)
-                }
-            }
-            Err(i) => {
-                if step_dir > 0 {
-                    i
-                } else {
-                    i.wrapping_sub(1)
-                }
-            }
-        };
-
-        if target_idx < vec.len() {
-            let next_val = vec[target_idx];
-            let dist = (next_val - search_val).abs();
-
-            // Verify this is actually in the correct direction (wrapping_sub might wrap)
-            if (next_val > search_val) != (step_dir > 0) {
+            // Verify this is actually in the correct direction
+            if (next_coord > search_val) != (step_dir > 0) {
                 return (i64::MAX, false);
             }
 
-            let (tx, ty) =
-                coord_from_index(from, next_val, is_vertical, is_horizontal, dir_x, dir_y);
-
-            let is_enemy = board
-                .get_piece(&tx, &ty)
-                .map(|p| p.color() != our_color && p.color() != PlayerColor::Neutral)
-                .unwrap_or(false);
+            let piece = Piece::from_packed(packed);
+            let is_enemy = piece.color() != our_color && piece.color() != PlayerColor::Neutral;
             return (dist, is_enemy);
         }
     }
 
     (i64::MAX, false)
-}
-
-/// Helper to compute coordinates from index value
-#[inline]
-fn coord_from_index(
-    from: &Coordinate,
-    val: i64,
-    is_vertical: bool,
-    is_horizontal: bool,
-    dir_x: i64,
-    dir_y: i64,
-) -> (i64, i64) {
-    if is_vertical {
-        (from.x, val)
-    } else if is_horizontal {
-        (val, from.y)
-    } else if dir_x == dir_y {
-        // diag1: x-y = from.x - from.y, so y = x - (from.x - from.y)
-        (val, val - (from.x - from.y))
-    } else {
-        // diag2: x+y = from.x + from.y, so y = (from.x + from.y) - x
-        (val, (from.x + from.y) - val)
-    }
 }
 
 fn generate_huygen_moves(
@@ -2234,51 +2068,38 @@ fn generate_huygen_moves(
             };
             if let Some(vec) = line_vec {
                 let val = if dx_raw == 0 { from.y } else { from.x };
-                if let Ok(idx) = vec.binary_search(&val) {
+                // Binary search by coordinate only
+                if let Ok(idx) = vec.binary_search_by_key(&val, |(c, _)| *c) {
                     let step_dir = if dx_raw == 0 { dir_y } else { dir_x };
                     if step_dir > 0 {
                         for i in (idx + 1)..vec.len() {
-                            let next_val = vec[i];
-                            let dist = next_val - val;
+                            let (next_coord, packed) = vec[i];
+                            let dist = next_coord - val;
                             if is_prime_i64(dist) {
                                 closest_prime_dist = Some(dist);
-                                let (tx, ty) = if dx_raw == 0 {
-                                    (from.x, next_val)
+                                let p = Piece::from_packed(packed);
+                                // Treat Void as friendly for capture purposes
+                                closest_piece_color = Some(if p.piece_type() == PieceType::Void {
+                                    piece.color()
                                 } else {
-                                    (next_val, from.y)
-                                };
-                                if let Some(p) = board.get_piece(&tx, &ty) {
-                                    // Treat Void as friendly for capture purposes
-                                    closest_piece_color =
-                                        Some(if p.piece_type() == PieceType::Void {
-                                            piece.color()
-                                        } else {
-                                            p.color()
-                                        });
-                                }
+                                    p.color()
+                                });
                                 break;
                             }
                         }
                     } else {
                         for i in (0..idx).rev() {
-                            let prev_val = vec[i];
-                            let dist = val - prev_val;
+                            let (prev_coord, packed) = vec[i];
+                            let dist = val - prev_coord;
                             if is_prime_i64(dist) {
                                 closest_prime_dist = Some(dist);
-                                let (tx, ty) = if dx_raw == 0 {
-                                    (from.x, prev_val)
+                                let p = Piece::from_packed(packed);
+                                // Treat Void as friendly for capture purposes
+                                closest_piece_color = Some(if p.piece_type() == PieceType::Void {
+                                    piece.color()
                                 } else {
-                                    (prev_val, from.y)
-                                };
-                                if let Some(p) = board.get_piece(&tx, &ty) {
-                                    // Treat Void as friendly for capture purposes
-                                    closest_piece_color =
-                                        Some(if p.piece_type() == PieceType::Void {
-                                            piece.color()
-                                        } else {
-                                            p.color()
-                                        });
-                                }
+                                    p.color()
+                                });
                                 break;
                             }
                         }

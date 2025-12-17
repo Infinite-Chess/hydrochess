@@ -295,7 +295,7 @@ fn evaluate_queen_confined(
         let in_front = match color {
             PlayerColor::White => y > ok.y && y <= ok.y + 2 && (x - ok.x).abs() <= 1,
             PlayerColor::Black => y < ok.y && y >= ok.y - 2 && (x - ok.x).abs() <= 1,
-            _ => false,
+            PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
         };
         if in_front {
             bonus -= 20;
@@ -407,7 +407,7 @@ fn evaluate_knight_confined(x: i64, y: i64, color: PlayerColor) -> i32 {
                 bonus += 25;
             }
         }
-        PlayerColor::Neutral => {}
+        PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
     }
 
     // Central file bonus (files 3-6 are central)
@@ -445,7 +445,7 @@ fn evaluate_bishop_confined(x: i64, y: i64, color: PlayerColor) -> i32 {
                 bonus += 30;
             }
         }
-        PlayerColor::Neutral => {}
+        PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
     }
 
     // Diagonal control (on main diagonals is good for long-range pressure)
@@ -476,7 +476,7 @@ fn evaluate_pawn_confined(
             let dist = (y - black_promo).max(0);
             bonus += ((8 - dist.min(8)) as i32) * 3;
         }
-        PlayerColor::Neutral => {}
+        PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
     }
 
     // CENTER PAWN BONUS - d and e pawn pushes open up the position
@@ -502,7 +502,7 @@ fn evaluate_pawn_confined(
                     bonus += 15;
                 }
             }
-            PlayerColor::Neutral => {}
+            PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
         }
     }
 

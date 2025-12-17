@@ -3,6 +3,7 @@ use crate::evaluation::{evaluate, get_piece_value};
 use crate::game::GameState;
 use crate::moves::{Move, get_quiescence_captures};
 use std::cell::RefCell;
+#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
 use wasm_bindgen::prelude::*;
 
 // For web WASM (browser), use js_sys::Date for timing
@@ -19,10 +20,26 @@ fn now_ms() -> f64 {
     Date::now()
 }
 
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_namespace = Math)]
     fn random() -> f64;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn random() -> f64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let start = SystemTime::now();
+    let since_the_epoch = start
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|_| std::time::Duration::from_secs(0));
+    let nanos = since_the_epoch.as_nanos();
+    let mut x = nanos as u64;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    (x as f64) / (u64::MAX as f64)
 }
 
 pub const MAX_PLY: usize = 64;
@@ -192,6 +209,7 @@ pub fn probe_tt_with_shared(
     beta: i32,
     depth: usize,
     ply: usize,
+    rule50_count: u32,
 ) -> Option<(i32, Option<Move>)> {
     // On WASM with shared TT configured, use SharedTTView
     #[cfg(all(target_arch = "wasm32", feature = "multithreading"))]
@@ -204,7 +222,9 @@ pub fn probe_tt_with_shared(
     }
 
     // Fall back to local TT
-    searcher.tt.probe(hash, alpha, beta, depth, ply)
+    searcher
+        .tt
+        .probe(hash, alpha, beta, depth, ply, rule50_count)
 }
 
 /// Store to the TT, using SharedTTView when available for Lazy SMP.
@@ -1110,10 +1130,20 @@ pub fn get_best_moves_multipv(
     searcher.silent = silent;
     searcher.set_corrhist_mode(game);
 
+    get_best_moves_multipv_impl(&mut searcher, game, max_depth, multi_pv, silent)
+}
+
+fn get_best_moves_multipv_impl(
+    searcher: &mut Searcher,
+    game: &mut GameState,
+    max_depth: usize,
+    multi_pv: usize,
+    silent: bool,
+) -> MultiPVResult {
     // Get all legal moves upfront
     let moves = game.get_legal_moves();
     if moves.is_empty() {
-        let stats = build_search_stats(&searcher);
+        let stats = build_search_stats(searcher);
         return MultiPVResult {
             lines: Vec::new(),
             stats,
@@ -1124,7 +1154,7 @@ pub fn get_best_moves_multipv(
     if moves.len() == 1 {
         let single = moves[0].clone();
         let score = crate::evaluation::evaluate(game);
-        let stats = build_search_stats(&searcher);
+        let stats = build_search_stats(searcher);
         return MultiPVResult {
             lines: vec![PVLine {
                 mv: single,
@@ -1148,7 +1178,7 @@ pub fn get_best_moves_multipv(
     }
 
     if legal_root_moves.is_empty() {
-        let stats = build_search_stats(&searcher);
+        let stats = build_search_stats(searcher);
         return MultiPVResult {
             lines: Vec::new(),
             stats,
@@ -1195,7 +1225,7 @@ pub fn get_best_moves_multipv(
             // First move gets full window, subsequent moves use PVS with MultiPV-aware alpha.
             let score = if move_idx == 0 {
                 -negamax(
-                    &mut searcher,
+                    searcher,
                     game,
                     depth - 1,
                     1,
@@ -1209,7 +1239,7 @@ pub fn get_best_moves_multipv(
                 let alpha = multipv_alpha;
 
                 let mut s = -negamax(
-                    &mut searcher,
+                    searcher,
                     game,
                     depth - 1,
                     1,
@@ -1221,7 +1251,7 @@ pub fn get_best_moves_multipv(
                 if s > alpha && !searcher.stopped {
                     // Re-search with full window to get accurate score
                     s = -negamax(
-                        &mut searcher,
+                        searcher,
                         game,
                         depth - 1,
                         1,
@@ -1363,7 +1393,7 @@ pub fn get_best_moves_multipv(
     }
 
     searcher.tt.increment_age();
-    let stats = build_search_stats(&searcher);
+    let stats = build_search_stats(searcher);
     MultiPVResult {
         lines: best_lines,
         stats,
@@ -1435,7 +1465,11 @@ fn negamax_root(
     let mut tt_move: Option<Move> = None;
 
     // Probe TT for best move from previous search (uses shared TT if configured)
-    if let Some((_, best)) = probe_tt_with_shared(searcher, hash, alpha, beta, depth, 0) {
+    // Stockfish passes rule50_count (halfmove_clock) directly to value_from_tt
+    let rule50_count = game.halfmove_clock;
+    if let Some((_, best)) =
+        probe_tt_with_shared(searcher, hash, alpha, beta, depth, 0, rule50_count)
+    {
         tt_move = best;
     }
 
@@ -1643,10 +1677,17 @@ fn negamax(
     let hash = TranspositionTable::generate_hash(game);
     let mut tt_move: Option<Move> = None;
 
-    if let Some((score, best)) = probe_tt_with_shared(searcher, hash, alpha, beta, depth, ply) {
+    // Stockfish passes rule50_count (halfmove_clock) directly to value_from_tt
+    let rule50_count = game.halfmove_clock;
+    if let Some((score, best)) =
+        probe_tt_with_shared(searcher, hash, alpha, beta, depth, ply, rule50_count)
+    {
         tt_move = best;
-        // In non-PV nodes, use TT cutoff if valid
-        if !is_pv && score != INFINITY + 1 {
+        // In non-PV nodes, use TT cutoff if valid score returned
+        // Stockfish's "graph history interaction" workaround:
+        // - Don't produce TT cutoffs when rule50 is high (>= 96)
+        // - Don't produce TT cutoffs when position has repetition history
+        if !is_pv && score != INFINITY + 1 && game.halfmove_clock < 96 && game.repetition == 0 {
             return score;
         }
     }
@@ -1823,6 +1864,7 @@ fn negamax(
         let is_capture = captured_piece.map_or(false, |p| !p.piece_type().is_neutral_type());
         let captured_type = captured_piece.map(|p| p.piece_type());
         let is_promotion = m.promotion.is_some();
+        let p_type = m.piece.piece_type();
 
         // Check if this move gives check to enemy king
         let gives_check = enemy_king_pos.as_ref().map_or(false, |ek| {
@@ -1846,8 +1888,7 @@ fn negamax(
             if is_capture || gives_check {
                 // Capture/check pruning
                 if let Some(cap_type) = captured_type {
-                    let capt_hist =
-                        searcher.capture_history[m.piece.piece_type() as usize][cap_type as usize];
+                    let capt_hist = searcher.capture_history[p_type as usize][cap_type as usize];
 
                     // Capture futility: skip captures that can't raise alpha
                     // Threshold: eval + 232 + 217*lmrD + pieceVal + histBonus
@@ -1877,7 +1918,7 @@ fn negamax(
             } else {
                 // Quiet move pruning
                 let hist_idx = hash_move_dest(&m);
-                let main_hist = searcher.history[m.piece.piece_type() as usize][hist_idx];
+                let main_hist = searcher.history[p_type as usize][hist_idx];
                 let history = main_hist;
 
                 // History-based pruning: skip moves with very bad history
@@ -1936,7 +1977,7 @@ fn negamax(
         let move_history_backup = searcher.move_history[ply].take();
         let piece_history_backup = searcher.moved_piece_history[ply];
         searcher.move_history[ply] = Some(m.clone());
-        searcher.moved_piece_history[ply] = m.piece.piece_type() as u8;
+        searcher.moved_piece_history[ply] = p_type as u8;
 
         legal_moves += 1;
 
@@ -2070,6 +2111,7 @@ fn negamax(
                 && legal_moves >= lmr_min_moves()
                 && !in_check
                 && !is_capture
+                && !(gives_check && (p_type == PieceType::Queen || p_type == PieceType::Amazon))
             {
                 reduction = 1
                     + ((legal_moves as f32).ln() * (depth as f32).ln() / lmr_divisor() as f32)
@@ -2084,7 +2126,7 @@ fn negamax(
                 // Only use main history - continuation history lookups are too expensive.
                 // Only reduce LESS for good history (safe); don't increase for bad (risky).
                 let hist_idx = hash_move_dest(&m);
-                let hist_score = searcher.history[m.piece.piece_type() as usize][hist_idx];
+                let hist_score = searcher.history[p_type as usize][hist_idx];
 
                 // Reduce less for moves with good history (threshold: ~50% of max)
                 if hist_score > 2000 && reduction > 0 {
@@ -2100,10 +2142,11 @@ fn negamax(
                 }
 
                 // Reduce less for forking piece checks (high tactical importance)
-                let p_type = m.piece.piece_type();
-                if reduction > 0 && (gives_check && (p_type == PieceType::Queen || p_type == PieceType::Amazon)) {
-                    reduction -= 1;
-                }
+                // if reduction > 0
+                //     && (gives_check && (p_type == PieceType::Queen || p_type == PieceType::Amazon))
+                // {
+                //     reduction -= 1;
+                // }
 
                 // Ensure reduction stays in valid range [0, depth-2]
                 reduction = reduction.clamp(0, (depth as i32) - 2);
@@ -2125,7 +2168,7 @@ fn negamax(
                 && best_score > -MATE_SCORE
             {
                 let idx = hash_move_dest(&m);
-                let value = searcher.history[m.piece.piece_type() as usize][idx];
+                let value = searcher.history[p_type as usize][idx];
 
                 if value < hlp_history_reduce() {
                     // Extra reduction based on poor history

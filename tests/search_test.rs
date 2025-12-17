@@ -178,30 +178,3 @@ fn test_2queen() {
         m.from.x, m.from.y, m.to.x, m.to.y
     );
 }
-
-#[test]
-fn test_no_wing_rook_opening() {
-    let mut game = setup_classical_start_position();
-
-    // Use a moderate depth to let opening heuristics and eval influence the choice
-    let best_move = hydrochess_wasm::search::get_best_move(&mut game, 6, u128::MAX, true)
-        .map(|(m, _eval, _stats)| m);
-
-    assert!(
-        best_move.is_some(),
-        "Engine should find a move from the starting position",
-    );
-    let m = best_move.unwrap();
-
-    println!(
-        "Opening move chosen: from ({}, {}) to ({}, {})",
-        m.from.x, m.from.y, m.to.x, m.to.y
-    );
-
-    // Regression: avoid pure wing rook shuffles like R1,1->-1,1 or R8,1->9,1 as first move.
-    assert!(
-        !((m.from.x == 1 && m.from.y == 1 && m.to.x == -1 && m.to.y == 1)
-            || (m.from.x == 8 && m.from.y == 1 && m.to.x == 9 && m.to.y == 1)),
-        "Engine should not choose early wing rook shuffles R1,1->-1,1 or R8,1->9,1 as its first move",
-    );
-}

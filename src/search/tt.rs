@@ -2,15 +2,75 @@ use crate::board::{Coordinate, Piece, PieceType, PlayerColor};
 use crate::game::GameState;
 use crate::moves::Move;
 
-use super::{INFINITY, MATE_SCORE};
+use super::{INFINITY, MATE_SCORE, MATE_VALUE};
+
+/// Stockfish: value_to_tt
+/// Adjusts a mate score from "plies to mate from the root" to
+/// "plies to mate from the current position" for storage in TT.
+/// Standard scores are unchanged.
+#[inline]
+pub fn value_to_tt(value: i32, ply: usize) -> i32 {
+    // is_win: value > MATE_SCORE (positive mate score)
+    if value > MATE_SCORE {
+        value + ply as i32
+    }
+    // is_loss: value < -MATE_SCORE (negative mate score, being mated)
+    else if value < -MATE_SCORE {
+        value - ply as i32
+    } else {
+        value
+    }
+}
+
+/// Stockfish: value_from_tt
+/// Inverse of value_to_tt: adjusts TT score back to root-relative.
+/// Downgrades mate scores that are unreachable due to the 50-move rule.
+///
+/// Parameters:
+/// - value: The score stored in TT
+/// - ply: Current search ply
+/// - rule50_count: Current halfmove clock (NOT remaining moves)
+#[inline]
+pub fn value_from_tt(value: i32, ply: usize, rule50_count: u32) -> i32 {
+    // Handle winning mate scores (we are giving mate)
+    if value > MATE_SCORE {
+        // mate_distance = how many plies until mate from the stored position
+        let mate_distance = MATE_VALUE - value;
+
+        // Stockfish: if (VALUE_MATE - v > 100 - r50c)
+        // Which is: mate_distance > 100 - rule50_count
+        // Or: mate_distance + rule50_count > 100
+        if mate_distance + rule50_count as i32 > 100 {
+            // Downgrade to non-mate winning score (just below mate threshold)
+            return MATE_SCORE - 1;
+        }
+
+        // Adjust back to root-relative
+        return value - ply as i32;
+    }
+
+    // Handle losing mate scores (we are being mated)
+    if value < -MATE_SCORE {
+        let mate_distance = MATE_VALUE + value;
+
+        if mate_distance + rule50_count as i32 > 100 {
+            // Downgrade to non-mate losing score
+            return -MATE_SCORE + 1;
+        }
+
+        return value + ply as i32;
+    }
+
+    value
+}
 
 // ============================================================================
 // Constants
 // ============================================================================
 
-/// Number of entries per bucket (cluster). 4 entries × 48 bytes = 192 bytes.
-/// This is larger than a cache line but still provides good collision handling.
-const ENTRIES_PER_BUCKET: usize = 4;
+/// Number of entries per bucket (cluster). 3 entries × 64 bytes = 192 bytes.
+/// We use 3 entries to allow for larger 64-byte entries (storing full 64-bit hash).
+const ENTRIES_PER_BUCKET: usize = 3;
 
 /// Sentinel value indicating no move is stored
 const NO_MOVE_SENTINEL: i64 = i64::MIN;
@@ -143,23 +203,27 @@ impl TTMove {
 
 /// Transposition Table entry - optimized for memory efficiency.
 ///
-/// Layout (48 bytes total):
-/// - key16: u16       - Partial hash for fast rejection
-/// - depth: u8        - Search depth
-/// - gen_bound: u8    - Generation (6 bits) + Bound type (2 bits)
-/// - score: i32       - Evaluation score
+/// Layout (64 bytes total):
+/// - key: u64         - Full hash key (8 bytes)
+/// - score: i32       - Evaluation score (4 bytes)
+/// - depth: u8        - Search depth (1 byte)
+/// - gen_bound: u8    - Generation (6 bits) + Bound type (2 bits) (1 byte)
+/// - padding: [u8; 10]- Padding to align to 64 bytes/cache line
 /// - tt_move: TTMove  - Best move (40 bytes)
 #[derive(Clone, Copy, Debug)]
-#[repr(C)]
+#[repr(C)] // Ensure C layout for reliable size
 pub struct TTEntry {
-    /// Upper 16 bits of the full hash key, used for verification
-    key16: u16,
+    /// Full 64-bit hash key for verification
+    key: u64,
+    /// Score from the search (with mate score adjustment for storage)
+    score: i32,
     /// Search depth that produced this result
     depth: u8,
     /// Packed: generation (upper 6 bits) + bound type (lower 2 bits)
     gen_bound: u8,
-    /// Score from the search (with mate score adjustment for storage)
-    score: i32,
+    /// Padding to reach 64 bytes (8+4+1+1+10+40 = 64)
+    /// Also ensures alignment if needed.
+    _padding: [u8; 10],
     /// Best move found (or sentinel for none)
     tt_move: TTMove,
 }
@@ -169,10 +233,11 @@ impl TTEntry {
     #[inline]
     pub const fn empty() -> Self {
         TTEntry {
-            key16: 0,
+            key: 0,
+            score: 0,
             depth: 0,
             gen_bound: 0,
-            score: 0,
+            _padding: [0; 10],
             tt_move: TTMove::none(),
         }
     }
@@ -180,7 +245,7 @@ impl TTEntry {
     /// Check if entry is empty (never written to)
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.gen_bound == 0 && self.key16 == 0
+        self.gen_bound == 0 && self.key == 0
     }
 
     /// Extract the bound type from gen_bound
@@ -237,9 +302,9 @@ impl TTBucket {
 /// Transposition Table with bucket-based collision handling.
 ///
 /// Key optimizations:
-/// - Bucket system: 4 entries per index reduces effective collision rate
-/// - Compact entry: ~48 bytes instead of ~64+ bytes
-/// - Smart replacement: considers depth, age, and bound type
+/// - Bucket system: 3 entries per index reduces effective collision rate
+/// - Align entries to cache lines (64 bytes)
+/// - Store FULL 64-bit hash key to prevent collisions
 /// - Power-of-two sizing for fast index calculation
 pub struct TranspositionTable {
     buckets: Vec<TTBucket>,
@@ -311,12 +376,6 @@ impl TranspositionTable {
         (hash as usize) & self.mask
     }
 
-    /// Extract the upper 16 bits for key verification
-    #[inline]
-    fn key16(hash: u64) -> u16 {
-        (hash >> 48) as u16
-    }
-
     /// Probe the TT for a position.
     ///
     /// Returns `Some((score, best_move))` where:
@@ -329,14 +388,15 @@ impl TranspositionTable {
         beta: i32,
         depth: usize,
         ply: usize,
+        rule50_count: u32,
     ) -> Option<(i32, Option<Move>)> {
         let idx = self.bucket_index(hash);
-        let key16 = Self::key16(hash);
         let bucket = &self.buckets[idx];
 
         // Search all entries in the bucket for a match
         for entry in &bucket.entries {
-            if entry.key16 != key16 || entry.is_empty() {
+            // Check full 64-bit key or if empty
+            if entry.key != hash || entry.is_empty() {
                 continue;
             }
 
@@ -345,14 +405,8 @@ impl TranspositionTable {
 
             // Only use score if depth is sufficient
             if entry.depth as usize >= depth {
-                let mut score = entry.score;
-
-                // Adjust mate scores for current ply
-                if score > MATE_SCORE {
-                    score -= ply as i32;
-                } else if score < -MATE_SCORE {
-                    score += ply as i32;
-                }
+                // Adjust score from TT to search value, handling 50-move rule
+                let score = value_from_tt(entry.score, ply, rule50_count);
 
                 // Check if we can use this score for a cutoff
                 let usable_score = match entry.flag() {
@@ -383,11 +437,10 @@ impl TranspositionTable {
         ply: usize,
     ) -> Option<(TTFlag, u8, i32, Option<Move>)> {
         let idx = self.bucket_index(hash);
-        let key16 = Self::key16(hash);
         let bucket = &self.buckets[idx];
 
         for entry in &bucket.entries {
-            if entry.key16 != key16 || entry.is_empty() {
+            if entry.key != hash || entry.is_empty() {
                 continue;
             }
 
@@ -409,7 +462,7 @@ impl TranspositionTable {
     ///
     /// Uses a smart replacement strategy within the bucket:
     /// 1. If we find our position, always update it
-    /// 2. Otherwise, find the least valuable entry to replace
+    /// 2. Otherwise, find the least valuable
     pub fn store(
         &mut self,
         hash: u64,
@@ -420,24 +473,20 @@ impl TranspositionTable {
         ply: usize,
     ) {
         // Adjust mate scores for storage
-        let mut adjusted_score = score;
-        if score > MATE_SCORE {
-            adjusted_score += ply as i32;
-        } else if score < -MATE_SCORE {
-            adjusted_score -= ply as i32;
-        }
+        // Adjust mate scores for storage
+        let adjusted_score = value_to_tt(score, ply);
 
         let idx = self.bucket_index(hash);
-        let key16 = Self::key16(hash);
         let generation = self.generation;
         let bucket = &mut self.buckets[idx];
 
         // Prepare the new entry
         let new_entry = TTEntry {
-            key16,
+            key: hash, // Store full 64-bit key
             depth: depth as u8,
             gen_bound: TTEntry::pack_gen_bound(generation, flag),
             score: adjusted_score,
+            _padding: [0; 10],
             tt_move: best_move.as_ref().map_or(TTMove::none(), TTMove::from_move),
         };
 
@@ -447,7 +496,7 @@ impl TranspositionTable {
 
         for (i, entry) in bucket.entries.iter().enumerate() {
             // If we find our own position, always replace it
-            if entry.key16 == key16 {
+            if entry.key == hash {
                 // Only replace if new info is "better" (deeper or same depth with better bound)
                 if depth >= entry.depth as usize || flag == TTFlag::Exact {
                     if entry.is_empty() {
@@ -468,45 +517,43 @@ impl TranspositionTable {
             }
         }
 
-        // Replace the least valuable entry
-        if bucket.entries[replace_idx].is_empty() {
-            self.used += 1;
+        // Calculate value of the new entry to see if it's worth storing
+        // New entry has age_diff = 0
+        let new_score = Self::calculate_replacement_score(&new_entry, generation);
+
+        // Replace the least valuable entry ONLY if the new entry is more valuable
+        // or if the victim is empty (worst_score for empty is i32::MIN)
+        if new_score >= worst_score {
+            if bucket.entries[replace_idx].is_empty() {
+                self.used += 1;
+            }
+            bucket.entries[replace_idx] = new_entry;
         }
-        bucket.entries[replace_idx] = new_entry;
     }
 
     /// Calculate a score for replacement priority (higher = more valuable, less replaceable).
     ///
     /// Factors considered:
-    /// - Empty entries are always replaceable (score 0)
-    /// - Entries from current generation are more valuable
-    /// - Deeper entries are more valuable
-    /// - Exact bounds are more valuable than upper/lower bounds
+    /// - Empty entries are always replaceable (score i32::MIN)
+    /// - Deeper entries are more valuable (Base value = depth)
+    /// - Older entries are less valuable (Penalty = 2 * age_diff)
+    /// - Exact/PV nodes get a small bonus
     #[inline]
     fn calculate_replacement_score(entry: &TTEntry, current_generation: u8) -> i32 {
         if entry.is_empty() {
-            return 0;
+            return i32::MIN;
         }
 
-        let mut score: i32 = 0;
+        let mut score = entry.depth as i32;
 
-        // Age factor: current generation entries are much more valuable
+        // Age penalty: penalize 2 points per generation old
         // Use 6-bit generation difference (wrapping)
         let age_diff = (current_generation.wrapping_sub(entry.generation())) & 0x3F;
-        if age_diff == 0 {
-            score += 256; // Current generation bonus
-        } else if age_diff <= 2 {
-            score += 128; // Recent generation
-        }
+        score -= (age_diff as i32) * 2;
 
-        // Depth factor: deeper searches are more valuable (up to 100 points)
-        score += entry.depth as i32;
-
-        // Bound type factor: exact bounds are most valuable
-        match entry.flag() {
-            TTFlag::Exact => score += 64,
-            TTFlag::LowerBound | TTFlag::UpperBound => score += 32,
-            TTFlag::None => {}
+        // Bound type bonus: slightly favor exact/PV nodes
+        if entry.flag() == TTFlag::Exact {
+            score += 2;
         }
 
         score
@@ -555,13 +602,13 @@ mod tests {
         );
         assert_eq!(
             std::mem::size_of::<TTEntry>(),
-            48,
-            "TTEntry should be 48 bytes"
+            64,
+            "TTEntry should be 64 bytes"
         );
         assert_eq!(
             std::mem::size_of::<TTBucket>(),
-            48 * ENTRIES_PER_BUCKET,
-            "TTBucket should be 192 bytes (4 x 48)"
+            64 * ENTRIES_PER_BUCKET,
+            "TTBucket should be 192 bytes (3 x 64)"
         );
     }
 
@@ -573,7 +620,7 @@ mod tests {
         let hash = 0x123456789ABCDEF0u64;
         tt.store(hash, 5, TTFlag::Exact, 100, None, 0);
 
-        let result = tt.probe(hash, -1000, 1000, 5, 0);
+        let result = tt.probe(hash, -1000, 1000, 5, 0, 100);
         assert!(result.is_some());
         let (score, _) = result.unwrap();
         assert_eq!(score, 100);
@@ -591,10 +638,11 @@ mod tests {
             ] {
                 let packed = TTEntry::pack_gen_bound(r#gen, flag);
                 let entry = TTEntry {
-                    key16: 0,
+                    key: 0,
+                    score: 0,
                     depth: 0,
                     gen_bound: packed,
-                    score: 0,
+                    _padding: [0; 10],
                     tt_move: TTMove::none(),
                 };
                 assert_eq!(entry.generation(), r#gen & 0x3F);

@@ -1069,7 +1069,7 @@ pub fn evaluate_pawn_position(
                 bonus += ((PAWN_FULL_VALUE_THRESHOLD - dist) as i32) * 4;
             }
         }
-        PlayerColor::Neutral => {}
+        PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
     }
 
     // Central pawns are valuable
@@ -1286,7 +1286,7 @@ fn evaluate_king_shelter(game: &GameState, king: &Coordinate, color: PlayerColor
                     has_pawn_behind = true;
                 }
             }
-            PlayerColor::Neutral => {}
+            PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
         }
     }
 
@@ -1515,7 +1515,7 @@ fn has_promotable_pawn(board: &Board, color: PlayerColor, promo_rank: i64) -> bo
                     return true;
                 }
             }
-            PlayerColor::Neutral => {}
+            PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
         }
     }
     false

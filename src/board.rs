@@ -308,9 +308,8 @@ impl Piece {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(from = "BoardRaw", into = "BoardRaw")]
 pub struct Board {
-    // Pure sorted Vec implementation
-    // We keep 'pieces_vec' private to enforce sorted invariant
-    pieces: Vec<((i64, i64), Piece)>,
+    // Pure FxHashMap implementation for O(1) access
+    pieces: FxHashMap<(i64, i64), Piece>,
     #[serde(skip)]
     pub active_coords: Option<FxHashSet<(i64, i64)>>,
 }
@@ -340,11 +339,8 @@ impl From<BoardRaw> for Board {
             None
         };
 
-        let mut v: Vec<_> = raw.pieces.into_iter().collect();
-        v.sort_by_key(|(k, _)| *k);
-
         Board {
-            pieces: v,
+            pieces: raw.pieces,
             active_coords,
         }
     }
@@ -353,13 +349,13 @@ impl From<BoardRaw> for Board {
 impl From<Board> for BoardRaw {
     fn from(board: Board) -> Self {
         BoardRaw {
-            pieces: board.pieces.into_iter().collect(),
+            pieces: board.pieces,
         }
     }
 }
 
 pub struct BoardIter<'a> {
-    iter: std::slice::Iter<'a, ((i64, i64), Piece)>,
+    iter: std::collections::hash_map::Iter<'a, (i64, i64), Piece>,
 }
 
 impl<'a> Iterator for BoardIter<'a> {
@@ -367,7 +363,7 @@ impl<'a> Iterator for BoardIter<'a> {
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        self.iter.next().map(|(k, v)| (k, v))
+        self.iter.next()
     }
 
     #[inline]
@@ -381,7 +377,7 @@ impl ExactSizeIterator for BoardIter<'_> {}
 impl Board {
     pub fn new() -> Self {
         Board {
-            pieces: Vec::new(),
+            pieces: FxHashMap::default(),
             active_coords: None,
         }
     }
@@ -417,14 +413,7 @@ impl Board {
             self.active_coords = Some(set);
         }
 
-        match self.pieces.binary_search_by_key(&pos, |(p, _)| *p) {
-            Ok(index) => {
-                self.pieces[index].1 = piece;
-            }
-            Err(index) => {
-                self.pieces.insert(index, (pos, piece));
-            }
-        }
+        self.pieces.insert(pos, piece);
 
         if let Some(ref mut active) = self.active_coords {
             if !piece.piece_type().is_neutral_type() {
@@ -437,25 +426,17 @@ impl Board {
 
     #[inline]
     pub fn get_piece(&self, x: &i64, y: &i64) -> Option<&Piece> {
-        let pos = (*x, *y);
-        self.pieces
-            .binary_search_by_key(&pos, |(p, _)| *p)
-            .ok()
-            .map(|i| &self.pieces[i].1)
+        self.pieces.get(&(*x, *y))
     }
 
     pub fn remove_piece(&mut self, x: &i64, y: &i64) -> Option<Piece> {
         let pos = (*x, *y);
-        let removed = if let Ok(index) = self.pieces.binary_search_by_key(&pos, |(p, _)| *p) {
-            Some(self.pieces.remove(index).1)
-        } else {
-            None
-        };
+        let removed = self.pieces.remove(&pos);
 
         if let Some(ref piece) = removed {
             if let Some(ref mut active) = self.active_coords {
                 if !piece.piece_type().is_neutral_type() {
-                    active.remove(&(*x, *y));
+                    active.remove(&pos);
                 }
             }
         }

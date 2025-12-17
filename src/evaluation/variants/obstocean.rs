@@ -180,7 +180,7 @@ fn evaluate_knight_obstocean(_x: i64, y: i64, color: PlayerColor) -> i32 {
     match color {
         PlayerColor::White => y as i32 * 10,
         PlayerColor::Black => (20 - y).max(0) as i32 * 10,
-        PlayerColor::Neutral => 0,
+        PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
     }
 }
 
@@ -205,7 +205,7 @@ fn evaluate_pawn_position_obstocean(
             let dist = (y - black_promo_rank).max(0);
             bonus += ((8 - dist.min(8)) as i32) * 3;
         }
-        PlayerColor::Neutral => {}
+        PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
     }
 
     // Edge pawn priority for Obstocean

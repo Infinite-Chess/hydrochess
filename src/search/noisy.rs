@@ -232,7 +232,11 @@ fn negamax_root_noisy(
     let hash = TranspositionTable::generate_hash(game);
     let mut tt_move: Option<Move> = None;
 
-    if let Some((_, best)) = super::probe_tt_with_shared(searcher, hash, alpha, beta, depth, 0) {
+    // Probe TT for best move from previous search (uses shared TT if configured)
+    let rule50_count = game.halfmove_clock;
+    if let Some((_, best)) =
+        super::probe_tt_with_shared(searcher, hash, alpha, beta, depth, 0, rule50_count)
+    {
         tt_move = best;
     }
 
@@ -418,11 +422,13 @@ fn negamax_noisy(
     let hash = TranspositionTable::generate_hash(game);
     let mut tt_move: Option<Move> = None;
 
+    let rule50_count = game.halfmove_clock;
     if let Some((score, best)) =
-        super::probe_tt_with_shared(searcher, hash, alpha, beta, depth, ply)
+        super::probe_tt_with_shared(searcher, hash, alpha, beta, depth, ply, rule50_count)
     {
         tt_move = best;
-        if !is_pv && score != INFINITY + 1 {
+        // Stockfish's "graph history interaction" workaround:
+        if !is_pv && score != INFINITY + 1 && game.halfmove_clock < 96 && game.repetition == 0 {
             return score;
         }
     }

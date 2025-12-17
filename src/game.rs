@@ -405,8 +405,8 @@ impl GameState {
             return true;
         }
         // Twofold within search tree: repetition > 0 means we found a previous occurrence,
-        // and repetition <= ply means it's within the current search tree (opponent can force 3-fold)
-        self.repetition > 0 && (self.repetition as usize) <= ply
+        // and repetition < ply means it's within the current search tree (opponent can force 3-fold)
+        self.repetition > 0 && (self.repetition as usize) < ply
     }
 
     /// Check if this is a lone king endgame (one side only has a king)
@@ -702,6 +702,9 @@ impl GameState {
 
         let mut checkers: Vec<Coordinate> = Vec::new();
 
+        // Import static attack patterns
+        use crate::attacks::{DIAG_DIRS, KING_OFFSETS, KNIGHT_OFFSETS, ORTHO_DIRS};
+
         let pawn_dir: i64 = match their_color {
             PlayerColor::White => 1,
             PlayerColor::Black => -1,
@@ -719,17 +722,8 @@ impl GameState {
             }
         }
 
-        let knight_offsets = [
-            (1i64, 2),
-            (2, 1),
-            (-1, 2),
-            (-2, 1),
-            (1, -2),
-            (2, -1),
-            (-1, -2),
-            (-2, -1),
-        ];
-        for (dx, dy) in knight_offsets.iter() {
+        // Use static knight offsets
+        for &(dx, dy) in &KNIGHT_OFFSETS {
             let x = king_sq.x + dx;
             let y = king_sq.y + dy;
             if let Some(p) = self.board.get_piece(&x, &y) {
@@ -739,17 +733,8 @@ impl GameState {
             }
         }
 
-        let king_offsets = [
-            (-1i64, -1),
-            (-1, 0),
-            (-1, 1),
-            (0, -1),
-            (0, 1),
-            (1, -1),
-            (1, 0),
-            (1, 1),
-        ];
-        for (dx, dy) in king_offsets.iter() {
+        // Use static king offsets
+        for &(dx, dy) in &KING_OFFSETS {
             let x = king_sq.x + dx;
             let y = king_sq.y + dy;
             if let Some(p) = self.board.get_piece(&x, &y) {
@@ -759,10 +744,8 @@ impl GameState {
             }
         }
 
-        let ortho_dirs = [(1i64, 0), (-1, 0), (0, 1), (0, -1)];
-        let diag_dirs = [(1i64, 1), (1, -1), (-1, 1), (-1, -1)];
-
-        for (dx, dy) in ortho_dirs.iter() {
+        // Use static ortho/diag directions and bitmasks
+        for &(dx, dy) in &ORTHO_DIRS {
             let mut x = king_sq.x + dx;
             let mut y = king_sq.y + dy;
             loop {
@@ -782,7 +765,7 @@ impl GameState {
             }
         }
 
-        for (dx, dy) in diag_dirs.iter() {
+        for &(dx, dy) in &DIAG_DIRS {
             let mut x = king_sq.x + dx;
             let mut y = king_sq.y + dy;
             loop {
@@ -1301,7 +1284,7 @@ impl GameState {
         };
         self.board.set_piece(to_x, to_y, final_piece);
         // Update spatial indices for piece on destination square
-        self.spatial_indices.add(to_x, to_y);
+        self.spatial_indices.add(to_x, to_y, final_piece.packed());
 
         // Update en passant state
         self.en_passant = None;
@@ -1480,7 +1463,7 @@ impl GameState {
                         self.board.set_piece(rook_to_x, m.from.y, rook);
                         // Update spatial indices for rook move
                         self.spatial_indices.remove(rook_coord.x, rook_coord.y);
-                        self.spatial_indices.add(rook_to_x, m.from.y);
+                        self.spatial_indices.add(rook_to_x, m.from.y, rook.packed());
 
                         // Rook also loses special rights
                         if self.special_rights.remove(rook_coord) {
@@ -1508,7 +1491,8 @@ impl GameState {
         );
         self.board.set_piece(m.to.x, m.to.y, final_piece);
         // Update spatial indices for moved piece on destination square
-        self.spatial_indices.add(m.to.x, m.to.y);
+        self.spatial_indices
+            .add(m.to.x, m.to.y, final_piece.packed());
 
         // Update En Passant state
         self.en_passant = None;
@@ -1612,7 +1596,7 @@ impl GameState {
         // Move back to 'from'
         self.board.set_piece(m.from.x, m.from.y, piece);
         // Update spatial indices for moved piece back on source square
-        self.spatial_indices.add(m.from.x, m.from.y);
+        self.spatial_indices.add(m.from.x, m.from.y, piece.packed());
 
         // Restore captured piece
         if let Some(captured) = undo.captured_piece {
@@ -1626,7 +1610,7 @@ impl GameState {
             }
             self.board.set_piece(m.to.x, m.to.y, captured);
             // Update spatial indices for restored captured piece
-            self.spatial_indices.add(m.to.x, m.to.y);
+            self.spatial_indices.add(m.to.x, m.to.y, captured.packed());
         }
 
         // Handle En Passant Capture Revert
@@ -1643,7 +1627,11 @@ impl GameState {
                     self.board
                         .set_piece(ep.pawn_square.x, ep.pawn_square.y, captured_pawn);
                     // Update spatial indices for restored EP pawn
-                    self.spatial_indices.add(ep.pawn_square.x, ep.pawn_square.y);
+                    self.spatial_indices.add(
+                        ep.pawn_square.x,
+                        ep.pawn_square.y,
+                        captured_pawn.packed(),
+                    );
 
                     // Restore material
                     let value = get_piece_value(PieceType::Pawn);
@@ -1669,7 +1657,8 @@ impl GameState {
                         self.board.set_piece(rook_coord.x, rook_coord.y, rook);
                         // Update spatial indices for rook moved back
                         self.spatial_indices.remove(rook_to_x, m.from.y);
-                        self.spatial_indices.add(rook_coord.x, rook_coord.y);
+                        self.spatial_indices
+                            .add(rook_coord.x, rook_coord.y, rook.packed());
                     }
                 }
             }

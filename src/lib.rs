@@ -2,6 +2,7 @@ use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
+pub mod attacks;
 pub mod board;
 pub mod evaluation;
 pub mod game;
