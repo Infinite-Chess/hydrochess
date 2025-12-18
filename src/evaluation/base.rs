@@ -269,6 +269,70 @@ pub fn compute_cloud_center(board: &Board) -> Option<Coordinate> {
 
 // ==================== Main Evaluation ====================
 
+/// Lazy evaluation: Material + Simple Position (PST)
+/// Used for Null Move Pruning and other heuristics where speed is critical.
+pub fn evaluate_lazy(game: &GameState) -> i32 {
+    let mut score = game.material_score;
+
+    for ((x, y), piece) in game.board.iter() {
+        let mut positional_bonus = 0;
+
+        match piece.piece_type() {
+            PieceType::Pawn => {
+                // Determine direction based on color
+                let rank = *y;
+                let promotion_rank = if piece.color() == PlayerColor::White {
+                    game.white_promo_rank
+                } else {
+                    game.black_promo_rank
+                };
+
+                // Advancement bonus
+                let distance_to_promo = (promotion_rank - rank).abs();
+                if distance_to_promo < 6 {
+                    positional_bonus += (6 - distance_to_promo) as i32 * 5;
+                }
+
+                // Centralization
+                if *x >= 2 && *x <= 5 {
+                    positional_bonus += 5;
+                }
+            }
+            PieceType::Knight => {
+                // Centralization
+                if *x >= 2 && *x <= 5 && *y >= 2 && *y <= 5 {
+                    positional_bonus += 10;
+                }
+            }
+            PieceType::Bishop => {
+                // Centralization
+                if *x >= 2 && *x <= 5 && *y >= 2 && *y <= 5 {
+                    positional_bonus += 5;
+                }
+            }
+            // Knights, Bishops, Rooks, Queens: Simple centralization/activity proxy
+            _ => {
+                // Very basic centrality
+                if *x >= 2 && *x <= 5 && *y >= 2 && *y <= 5 {
+                    positional_bonus += 2;
+                }
+            }
+        }
+
+        if piece.color() == PlayerColor::White {
+            score += positional_bonus;
+        } else {
+            score -= positional_bonus;
+        }
+    }
+
+    if game.turn == PlayerColor::Black {
+        -score
+    } else {
+        score
+    }
+}
+
 pub fn evaluate(game: &GameState) -> i32 {
     // Check for insufficient material draw
     match crate::evaluation::insufficient_material::evaluate_insufficient_material(game) {

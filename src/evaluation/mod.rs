@@ -15,7 +15,7 @@ use crate::board::PlayerColor;
 use crate::game::GameState;
 
 // Re-export commonly used items
-pub use base::{calculate_initial_material, get_piece_value};
+pub use base::{calculate_initial_material, evaluate_lazy, get_piece_value};
 
 #[cfg(feature = "eval_tuning")]
 pub use base::{EvalFeatures, reset_eval_features, snapshot_eval_features};

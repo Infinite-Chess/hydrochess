@@ -1,8 +1,8 @@
 use crate::board::{Board, Coordinate, Piece, PieceType, PlayerColor};
 use crate::evaluation::{calculate_initial_material, get_piece_value};
 use crate::moves::{
-    Move, MoveList, SpatialIndices, get_legal_moves, get_legal_moves_into, get_pseudo_legal_moves_for_piece,
-    is_square_attacked,
+    Move, MoveList, SpatialIndices, get_legal_moves, get_legal_moves_into,
+    get_pseudo_legal_moves_for_piece, is_square_attacked,
 };
 use arrayvec::ArrayVec;
 use rustc_hash::FxHashSet;
@@ -556,8 +556,8 @@ impl GameState {
                 continue;
             }
 
-            // Material hash: XOR for each piece type
-            mh ^= material_key(piece.piece_type(), piece.color());
+            // Material hash: Additive to distinguish counts (avoid XOR cancellation)
+            mh = mh.wrapping_add(material_key(piece.piece_type(), piece.color()));
 
             if piece.piece_type() == PieceType::Pawn {
                 // Pawn hash: only pawns (helps CoaIP variants)
@@ -1314,7 +1314,9 @@ impl GameState {
     }
 
     pub fn make_move(&mut self, m: &Move) -> UndoMove {
-        use crate::search::zobrist::{SIDE_KEY, en_passant_key, piece_key, special_right_key};
+        use crate::search::zobrist::{
+            SIDE_KEY, en_passant_key, material_key, piece_key, special_right_key,
+        };
 
         // Push current position hash BEFORE making the move (for repetition detection)
         self.hash_stack.push(self.hash);
@@ -1375,6 +1377,11 @@ impl GameState {
 
             // Only update material/piece counts for non-neutral pieces
             if captured.color() != PlayerColor::Neutral {
+                // Update material hash (subtractive)
+                self.material_hash = self
+                    .material_hash
+                    .wrapping_sub(material_key(captured.piece_type(), captured.color()));
+
                 let value = get_piece_value(captured.piece_type());
                 if captured.color() == PlayerColor::White {
                     self.material_score -= value;
@@ -1407,6 +1414,12 @@ impl GameState {
                         self.spatial_indices
                             .remove(ep.pawn_square.x, ep.pawn_square.y);
 
+                        // Update material hash (subtractive) for EP capture
+                        self.material_hash = self.material_hash.wrapping_sub(material_key(
+                            captured_pawn.piece_type(),
+                            captured_pawn.color(),
+                        ));
+
                         let value = get_piece_value(captured_pawn.piece_type());
                         if captured_pawn.color() == PlayerColor::White {
                             self.material_score -= value;
@@ -1422,6 +1435,14 @@ impl GameState {
 
         // Handle Promotion material update
         if let Some(promo_type) = m.promotion {
+            // Update material hash: remove pawn, add promoted piece
+            self.material_hash = self
+                .material_hash
+                .wrapping_sub(material_key(PieceType::Pawn, piece.color()));
+            self.material_hash = self
+                .material_hash
+                .wrapping_add(material_key(promo_type, piece.color()));
+
             let pawn_val = get_piece_value(PieceType::Pawn);
             let promo_val = get_piece_value(promo_type);
             if piece.color() == PlayerColor::White {
@@ -1560,6 +1581,8 @@ impl GameState {
     }
 
     pub fn undo_move(&mut self, m: &Move, undo: UndoMove) {
+        use crate::search::zobrist::material_key;
+
         // Pop the hash that was pushed in make_move and restore the saved hash
         self.hash_stack.pop();
         self.hash = undo.old_hash;
@@ -1579,6 +1602,14 @@ impl GameState {
 
         // Handle Promotion Revert
         if m.promotion.is_some() {
+            // Convert back to pawn: Remove promo type, Add pawn type
+            self.material_hash = self
+                .material_hash
+                .wrapping_sub(material_key(piece.piece_type(), piece.color()));
+            self.material_hash = self
+                .material_hash
+                .wrapping_add(material_key(PieceType::Pawn, piece.color()));
+
             // Convert back to pawn
             let promo_val = get_piece_value(piece.piece_type());
             let pawn_val = get_piece_value(PieceType::Pawn);
@@ -1600,6 +1631,13 @@ impl GameState {
 
         // Restore captured piece
         if let Some(captured) = undo.captured_piece {
+            // Restore material hash
+            if captured.color() != PlayerColor::Neutral {
+                self.material_hash = self
+                    .material_hash
+                    .wrapping_add(material_key(captured.piece_type(), captured.color()));
+            }
+
             let value = get_piece_value(captured.piece_type());
             if captured.color() == PlayerColor::White {
                 self.material_score += value;
@@ -1634,6 +1672,12 @@ impl GameState {
                     );
 
                     // Restore material
+                    // Restore material hash for EP capture
+                    self.material_hash = self.material_hash.wrapping_add(material_key(
+                        captured_pawn.piece_type(),
+                        captured_pawn.color(),
+                    ));
+
                     let value = get_piece_value(PieceType::Pawn);
                     if captured_pawn.color() == PlayerColor::White {
                         self.material_score += value;
