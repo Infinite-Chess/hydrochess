@@ -1967,6 +1967,21 @@ fn negamax(
             }
         }
 
+        // Prefetch TT entry for child position BEFORE making the move.
+        // This warms the cache so the TT probe in the recursive call is faster.
+        // Compute approximate child hash: toggle side + move piece from->to
+        {
+            let p_type = m.piece.piece_type();
+            let p_color = m.piece.color();
+            let child_hash = game.hash
+                ^ SIDE_KEY
+                ^ piece_key(p_type, p_color, m.from.x, m.from.y)
+                ^ piece_key(p_type, p_color, m.to.x, m.to.y);
+
+            #[cfg(all(target_arch = "x86_64", not(target_arch = "wasm32")))]
+            searcher.tt.prefetch_entry(child_hash);
+        }
+
         let mut undo = game.make_move(&m);
 
         // Check if move is illegal (leaves our king in check)
