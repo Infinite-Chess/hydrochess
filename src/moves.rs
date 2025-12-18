@@ -58,9 +58,24 @@ fn generate_knightrider_moves(board: &Board, from: &Coordinate, piece: &Piece) -
 
     // Pre-collect piece data once
     let mut pieces_data: Vec<(i64, i64, bool)> = Vec::with_capacity(piece_count);
-    for ((px, py), p) in board.iter() {
-        let is_enemy = is_enemy_piece(p, piece.color());
-        pieces_data.push((*px, *py, is_enemy));
+    // BITBOARD: Use tile-based CTZ iteration for O(popcount) piece enumeration
+    for (cx, cy, tile) in board.tiles.iter() {
+        let mut bits = tile.occ_all;
+        while bits != 0 {
+            let idx = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let packed = tile.piece[idx];
+            if packed == 0 {
+                continue;
+            }
+            let p = Piece::from_packed(packed);
+            let lx = (idx % 8) as i64;
+            let ly = (idx / 8) as i64;
+            let px = cx * 8 + lx;
+            let py = cy * 8 + ly;
+            let is_enemy = is_enemy_piece(&p, piece.color());
+            pieces_data.push((px, py, is_enemy));
+        }
     }
 
     for (dx, dy) in KR_DIRS {
@@ -165,12 +180,25 @@ impl SpatialIndices {
         let mut diag1: FxHashMap<i64, Vec<(i64, u8)>> = FxHashMap::default();
         let mut diag2: FxHashMap<i64, Vec<(i64, u8)>> = FxHashMap::default();
 
-        for ((x, y), piece) in board.iter() {
-            let packed = piece.packed();
-            rows.entry(*y).or_default().push((*x, packed));
-            cols.entry(*x).or_default().push((*y, packed));
-            diag1.entry(x - y).or_default().push((*x, packed));
-            diag2.entry(x + y).or_default().push((*x, packed));
+        // BITBOARD: Use tile-based CTZ iteration for O(popcount) enumeration
+        for (cx, cy, tile) in board.tiles.iter() {
+            let mut bits = tile.occ_all;
+            while bits != 0 {
+                let idx = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let packed = tile.piece[idx];
+                if packed == 0 {
+                    continue;
+                }
+                let lx = (idx % 8) as i64;
+                let ly = (idx / 8) as i64;
+                let x = cx * 8 + lx;
+                let y = cy * 8 + ly;
+                rows.entry(y).or_default().push((x, packed));
+                cols.entry(x).or_default().push((y, packed));
+                diag1.entry(x - y).or_default().push((x, packed));
+                diag2.entry(x + y).or_default().push((x, packed));
+            }
         }
 
         // Sort vectors by coordinate for binary search
@@ -330,42 +358,48 @@ pub fn get_legal_moves_into(
     out: &mut MoveList,
     fallback: bool,
 ) {
+    use crate::tiles::TILE_SIZE;
+
     out.clear();
 
-    if let Some(active) = &board.active_coords {
-        for (x, y) in active {
-            let piece = match board.get_piece(x, y) {
-                Some(p) => p,
-                None => continue,
-            };
+    // BITBOARD: Use tile-based CTZ iteration for O(popcount) piece enumeration
+    // This is the Stockfish pattern: iterate occupied tiles, CTZ through occupancy bits
+    let is_white = turn == PlayerColor::White;
 
-            // Skip neutral pieces (already covered by active_coords) and non-turn pieces
-            if piece.color() != turn {
+    for (cx, cy, tile) in board.tiles.iter() {
+        // Get occupancy bitboard for our color
+        let occ = if is_white {
+            tile.occ_white
+        } else {
+            tile.occ_black
+        };
+        if occ == 0 {
+            continue;
+        } // Fast skip empty tiles
+
+        // CTZ loop: extract each set bit (piece position)
+        let mut bits = occ;
+        while bits != 0 {
+            let idx = bits.trailing_zeros() as usize;
+            bits &= bits - 1; // Clear lowest bit
+
+            let packed = tile.piece[idx];
+            if packed == 0 {
                 continue;
             }
 
-            let from = Coordinate::new(*x, *y);
+            let piece = Piece::from_packed(packed);
+
+            // Convert tile-local index to world coordinates
+            let lx = (idx % 8) as i64;
+            let ly = (idx / 8) as i64;
+            let x = cx * TILE_SIZE + lx;
+            let y = cy * TILE_SIZE + ly;
+            let from = Coordinate::new(x, y);
+
             get_pseudo_legal_moves_for_piece_into(
                 board,
-                piece,
-                &from,
-                special_rights,
-                en_passant,
-                indices,
-                game_rules,
-                fallback,
-                out,
-            );
-        }
-    } else {
-        for ((x, y), piece) in board.iter() {
-            if piece.color() != turn || piece.color() == PlayerColor::Neutral {
-                continue;
-            }
-            let from = Coordinate::new(*x, *y);
-            get_pseudo_legal_moves_for_piece_into(
-                board,
-                piece,
+                &piece,
                 &from,
                 special_rights,
                 en_passant,
@@ -428,40 +462,44 @@ pub fn get_quiescence_captures(
     indices: &SpatialIndices,
     out: &mut MoveList,
 ) {
+    use crate::tiles::TILE_SIZE;
+
     out.clear();
 
-    if let Some(active) = &board.active_coords {
-        for (x, y) in active {
-            let piece = match board.get_piece(x, y) {
-                Some(p) => p,
-                None => continue,
-            };
+    // BITBOARD: CTZ iteration for O(popcount) piece enumeration
+    let is_white = turn == PlayerColor::White;
 
-            if piece.color() != turn {
-                continue;
-            }
-
-            let from = Coordinate::new(*x, *y);
-            generate_captures_for_piece(
-                board,
-                piece,
-                &from,
-                special_rights,
-                en_passant,
-                game_rules,
-                indices,
-                out,
-            );
+    for (cx, cy, tile) in board.tiles.iter() {
+        let occ = if is_white {
+            tile.occ_white
+        } else {
+            tile.occ_black
+        };
+        if occ == 0 {
+            continue;
         }
-    } else {
-        for ((x, y), piece) in board.iter() {
-            if piece.color() != turn || piece.color() == PlayerColor::Neutral {
+
+        let mut bits = occ;
+        while bits != 0 {
+            let idx = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+
+            let packed = tile.piece[idx];
+            if packed == 0 {
                 continue;
             }
-            let from = Coordinate::new(*x, *y);
+
+            let piece = Piece::from_packed(packed);
+
+            let lx = (idx % 8) as i64;
+            let ly = (idx / 8) as i64;
+            let x = cx * TILE_SIZE + lx;
+            let y = cy * TILE_SIZE + ly;
+            let from = Coordinate::new(x, y);
+
             generate_captures_for_piece(
                 board,
-                piece,
+                &piece,
                 &from,
                 special_rights,
                 en_passant,
@@ -761,87 +799,66 @@ pub fn is_square_attacked(
     indices: &SpatialIndices,
 ) -> bool {
     use crate::attacks::*;
+    use crate::tiles::{local_index, masks};
 
-    // 1. Check Leapers using static offset arrays (no allocations)
-    // Knight-like attackers
-    for &(dx, dy) in &KNIGHT_OFFSETS {
-        let x = target.x + dx;
-        let y = target.y + dy;
-        if let Some(piece) = board.get_piece(&x, &y) {
-            if piece.color() == attacker_color && matches_mask(piece.piece_type(), KNIGHT_MASK) {
-                return true;
-            }
-        }
+    // OPTIMIZATION: Single-pass tile neighborhood check for all leapers+pawns
+    let neighborhood = board.get_neighborhood(target.x, target.y);
+    let local_idx = local_index(target.x, target.y);
+
+    // Select attacker color bitboard accessor
+    let is_white = attacker_color == PlayerColor::White;
+    if attacker_color == PlayerColor::Neutral {
+        return false; // Neutral can't attack
     }
 
-    // King-like attackers (1 square in any direction)
-    for &(dx, dy) in &KING_OFFSETS {
-        let x = target.x + dx;
-        let y = target.y + dy;
-        if let Some(piece) = board.get_piece(&x, &y) {
-            if piece.color() == attacker_color && matches_mask(piece.piece_type(), KING_MASK) {
-                return true;
-            }
-        }
-    }
+    // Get pawn masks (depends on attacker color)
+    let pawn_masks = masks::pawn_attacker_masks(is_white);
+    let pawn_type_mask = 1u32 << (PieceType::Pawn as u8);
 
-    // Camel attackers
-    for &(dx, dy) in &CAMEL_OFFSETS {
-        let x = target.x + dx;
-        let y = target.y + dy;
-        if let Some(piece) = board.get_piece(&x, &y) {
-            if piece.color() == attacker_color && piece.piece_type() == PieceType::Camel {
-                return true;
-            }
-        }
-    }
+    // SINGLE-PASS: Check all tiles once, checking all leaper+pawn types per tile
+    for n in 0..9 {
+        let Some(tile) = neighborhood[n] else {
+            continue;
+        };
 
-    // Giraffe attackers
-    for &(dx, dy) in &GIRAFFE_OFFSETS {
-        let x = target.x + dx;
-        let y = target.y + dy;
-        if let Some(piece) = board.get_piece(&x, &y) {
-            if piece.color() == attacker_color && piece.piece_type() == PieceType::Giraffe {
-                return true;
-            }
-        }
-    }
+        // Get attacker occupancy for this tile
+        let occ = if is_white {
+            tile.occ_white
+        } else {
+            tile.occ_black
+        };
+        if occ == 0 {
+            continue;
+        } // Fast skip empty tiles
 
-    // Zebra attackers
-    for &(dx, dy) in &ZEBRA_OFFSETS {
-        let x = target.x + dx;
-        let y = target.y + dy;
-        if let Some(piece) = board.get_piece(&x, &y) {
-            if piece.color() == attacker_color && piece.piece_type() == PieceType::Zebra {
-                return true;
-            }
-        }
-    }
+        // Check each leaper type mask against occupancy
+        let masks_to_check = [
+            (masks::KNIGHT_MASKS[local_idx][n], KNIGHT_MASK),
+            (masks::KING_MASKS[local_idx][n], KING_MASK),
+            (masks::CAMEL_MASKS[local_idx][n], CAMEL_MASK),
+            (masks::GIRAFFE_MASKS[local_idx][n], GIRAFFE_MASK),
+            (masks::ZEBRA_MASKS[local_idx][n], ZEBRA_MASK),
+            (masks::HAWK_MASKS[local_idx][n], HAWK_MASK),
+            (pawn_masks[local_idx][n], pawn_type_mask),
+        ];
 
-    // Hawk attackers
-    for &(dx, dy) in &HAWK_OFFSETS {
-        let x = target.x + dx;
-        let y = target.y + dy;
-        if let Some(piece) = board.get_piece(&x, &y) {
-            if piece.color() == attacker_color && piece.piece_type() == PieceType::Hawk {
-                return true;
-            }
-        }
-    }
+        for (attack_mask, type_mask) in masks_to_check {
+            let candidates = occ & attack_mask;
+            if candidates != 0 {
+                // Found potential attackers - verify piece type
+                let mut bits = candidates;
+                while bits != 0 {
+                    let bit_idx = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
 
-    // 2. Check Pawns
-    let pawn_dir = match attacker_color {
-        PlayerColor::White => 1, // White pawns attack upwards (y+1), so they come from y-1
-        PlayerColor::Black => -1, // Black pawns attack downwards (y-1), so they come from y+1
-        PlayerColor::Neutral => 0, // Neutral pawns don't attack
-    };
-    // Attackers are at target.y - dir
-    let pawn_y = target.y - pawn_dir;
-    for pawn_dx in [-1, 1] {
-        let pawn_x = target.x + pawn_dx;
-        if let Some(piece) = board.get_piece(&pawn_x, &pawn_y) {
-            if piece.color() == attacker_color && piece.piece_type() == PieceType::Pawn {
-                return true;
+                    let packed = tile.piece[bit_idx];
+                    if packed != 0 {
+                        let pt = Piece::from_packed(packed).piece_type();
+                        if matches_mask(pt, type_mask) {
+                            return true;
+                        }
+                    }
+                }
             }
         }
     }

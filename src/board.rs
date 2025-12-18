@@ -1,3 +1,4 @@
+use crate::tiles::{Tile, TileTable, local_index, tile_coords};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
@@ -308,10 +309,17 @@ impl Piece {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(from = "BoardRaw", into = "BoardRaw")]
 pub struct Board {
-    // Pure FxHashMap implementation for O(1) access
+    // HashMap for cold-path access and serialization
     pieces: FxHashMap<(i64, i64), Piece>,
     #[serde(skip)]
     pub active_coords: Option<FxHashSet<(i64, i64)>>,
+    /// Sparse tiled bitboards for HOT PATH operations (attack detection, move gen, eval)
+    /// NOT updated incrementally - call rebuild_tiles() before hot path usage
+    #[serde(skip)]
+    pub tiles: TileTable,
+    /// Flag indicating tiles are in sync with pieces
+    #[serde(skip)]
+    tiles_valid: bool,
 }
 
 /// Raw representation for serialization
@@ -339,9 +347,19 @@ impl From<BoardRaw> for Board {
             None
         };
 
+        // Build tiles immediately for hot path usage
+        let mut tiles = TileTable::new();
+        for (&(x, y), &piece) in &raw.pieces {
+            let (cx, cy) = tile_coords(x, y);
+            let idx = local_index(x, y);
+            tiles.get_or_create(cx, cy).set_piece(idx, piece);
+        }
+
         Board {
             pieces: raw.pieces,
             active_coords,
+            tiles,
+            tiles_valid: true,
         }
     }
 }
@@ -379,6 +397,8 @@ impl Board {
         Board {
             pieces: FxHashMap::default(),
             active_coords: None,
+            tiles: TileTable::new(),
+            tiles_valid: true,
         }
     }
 
@@ -415,6 +435,19 @@ impl Board {
 
         self.pieces.insert(pos, piece);
 
+        // INLINE TILE SYNC: Single fast update - set_piece handles overwrite
+        let (cx, cy) = tile_coords(x, y);
+        let idx = local_index(x, y);
+        let tile = self.tiles.get_or_create(cx, cy);
+        // Clear old occupancy bits first to handle overwrites correctly
+        let bit = 1u64 << idx;
+        tile.occ_all &= !bit;
+        tile.occ_white &= !bit;
+        tile.occ_black &= !bit;
+        tile.occ_void &= !bit;
+        // Set new piece
+        tile.set_piece(idx, piece);
+
         if let Some(ref mut active) = self.active_coords {
             if !piece.piece_type().is_neutral_type() {
                 active.insert(pos);
@@ -433,6 +466,13 @@ impl Board {
         let pos = (*x, *y);
         let removed = self.pieces.remove(&pos);
 
+        // INLINE TILE SYNC: Always keep tiles valid for hot path
+        let (cx, cy) = tile_coords(*x, *y);
+        let idx = local_index(*x, *y);
+        if let Some(tile) = self.tiles.get_tile_mut(cx, cy) {
+            tile.remove_piece(idx);
+        }
+
         if let Some(ref piece) = removed {
             if let Some(ref mut active) = self.active_coords {
                 if !piece.piece_type().is_neutral_type() {
@@ -446,6 +486,46 @@ impl Board {
     pub fn clear(&mut self) {
         self.pieces.clear();
         self.active_coords = None;
+        self.tiles.clear();
+        self.tiles_valid = true;
+    }
+
+    /// Rebuild tiles from HashMap. Call this ONCE before hot-path operations
+    /// (attack detection, move generation, evaluation).
+    /// This is O(n) where n = number of pieces, but only needs to be called
+    /// once per position, not per operation.
+    #[inline]
+    pub fn rebuild_tiles(&mut self) {
+        if self.tiles_valid {
+            return;
+        }
+        self.tiles.clear();
+        for (&(x, y), &piece) in &self.pieces {
+            let (cx, cy) = tile_coords(x, y);
+            let idx = local_index(x, y);
+            self.tiles.get_or_create(cx, cy).set_piece(idx, piece);
+        }
+        self.tiles_valid = true;
+    }
+
+    /// Force rebuild tiles (for use after make_move/undo_move cycles)
+    #[inline]
+    pub fn ensure_tiles(&mut self) {
+        self.rebuild_tiles();
+    }
+
+    /// Get 3x3 tile neighborhood around world coordinate.
+    /// Caller should ensure tiles are valid via rebuild_tiles() first.
+    #[inline]
+    pub fn get_neighborhood(&self, x: i64, y: i64) -> [Option<&Tile>; 9] {
+        let (cx, cy) = tile_coords(x, y);
+        self.tiles.get_neighborhood(cx, cy)
+    }
+
+    /// Check if tiles are in sync with pieces
+    #[inline]
+    pub fn tiles_valid(&self) -> bool {
+        self.tiles_valid
     }
 }
 

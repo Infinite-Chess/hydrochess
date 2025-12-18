@@ -744,44 +744,62 @@ impl GameState {
             }
         }
 
-        // Use static ortho/diag directions and bitmasks
+        // Use SpatialIndices for O(log n) slider detection - unlimited range!
         for &(dx, dy) in &ORTHO_DIRS {
-            let mut x = king_sq.x + dx;
-            let mut y = king_sq.y + dy;
-            loop {
-                if let Some(p) = self.board.get_piece(&x, &y) {
+            let line_vec = if dx == 0 {
+                self.spatial_indices.cols.get(&king_sq.x)
+            } else {
+                self.spatial_indices.rows.get(&king_sq.y)
+            };
+
+            if let Some(vec) = line_vec {
+                let val = if dx == 0 { king_sq.y } else { king_sq.x };
+                let step_dir = if dx == 0 { dy } else { dx };
+
+                if let Some((coord, packed)) = SpatialIndices::find_nearest(vec, val, step_dir) {
+                    let p = Piece::from_packed(packed);
                     if p.color() == their_color
                         && (p.piece_type() == PieceType::Rook || p.piece_type() == PieceType::Queen)
                     {
-                        checkers.push(Coordinate::new(x, y));
+                        // Calculate actual position
+                        let (cx, cy) = if dx == 0 {
+                            (king_sq.x, coord)
+                        } else {
+                            (coord, king_sq.y)
+                        };
+                        checkers.push(Coordinate::new(cx, cy));
                     }
-                    break;
-                }
-                x += dx;
-                y += dy;
-                if (x - king_sq.x).abs() > 50 || (y - king_sq.y).abs() > 50 {
-                    break;
                 }
             }
         }
 
         for &(dx, dy) in &DIAG_DIRS {
-            let mut x = king_sq.x + dx;
-            let mut y = king_sq.y + dy;
-            loop {
-                if let Some(p) = self.board.get_piece(&x, &y) {
+            let diag_key = if dx == dy {
+                king_sq.x - king_sq.y
+            } else {
+                king_sq.x + king_sq.y
+            };
+            let line_vec = if dx == dy {
+                self.spatial_indices.diag1.get(&diag_key)
+            } else {
+                self.spatial_indices.diag2.get(&diag_key)
+            };
+
+            if let Some(vec) = line_vec {
+                if let Some((coord, packed)) = SpatialIndices::find_nearest(vec, king_sq.x, dx) {
+                    let p = Piece::from_packed(packed);
                     if p.color() == their_color
                         && (p.piece_type() == PieceType::Bishop
                             || p.piece_type() == PieceType::Queen)
                     {
-                        checkers.push(Coordinate::new(x, y));
+                        // For diagonals, x-coord is stored; y = x - diag_key or y = diag_key - x
+                        let cy = if dx == dy {
+                            coord - diag_key
+                        } else {
+                            diag_key - coord
+                        };
+                        checkers.push(Coordinate::new(coord, cy));
                     }
-                    break;
-                }
-                x += dx;
-                y += dy;
-                if (x - king_sq.x).abs() > 50 || (y - king_sq.y).abs() > 50 {
-                    break;
                 }
             }
         }
