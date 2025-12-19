@@ -283,7 +283,7 @@ pub fn evaluate(game: &GameState) -> i32 {
                 }
 
                 // Rook on open/semi-open file
-                let file = ((x - 1) as usize).min(7);
+                let file = ((*x - 1) as usize).min(7);
                 let own_pawn = if is_white {
                     white_pawn_files[file]
                 } else {

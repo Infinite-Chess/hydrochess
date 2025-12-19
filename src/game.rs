@@ -51,7 +51,7 @@ pub struct UndoMove {
     pub old_en_passant: Option<EnPassantState>,
     pub old_halfmove_clock: u32,
     pub old_hash: u64, // Hash before the move was made
-    pub special_rights_removed: ArrayVec<Coordinate, 4>, // Track which special rights were removed (re-insert on undo)
+    pub special_rights_removed: ArrayVec<Coordinate, 4>, // Track which special rights were removed (re-insert on undo)sert on undo)
     /// If this move caused a piece to leave its original starting square,
     /// we remove that coordinate from starting_squares. Store it here so
     /// undo_move can restore starting_squares exactly.
@@ -61,9 +61,6 @@ pub struct UndoMove {
     pub old_black_king_pos: Option<Coordinate>,
     /// Old repetition value for restoration
     pub old_repetition: i32,
-    pub old_cloud_sum_x: i64,
-    pub old_cloud_sum_y: i64,
-    pub old_cloud_count: u64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -102,13 +99,7 @@ pub struct GameState {
     pub starting_white_pieces: u16,
     #[serde(skip)]
     pub starting_black_pieces: u16,
-    #[serde(skip)]
-    pub cloud_sum_x: i64,
-    #[serde(skip)]
-    pub cloud_sum_y: i64,
-    #[serde(skip)]
-    pub cloud_count: u64,
-    /// Is the tile bitboard infrastructure valid? (Usually true after first access)
+    /// Piece coordinates per color for fast iteration
     #[serde(skip)]
     pub white_pieces: Vec<(i64, i64)>,
     #[serde(skip)]
@@ -208,9 +199,6 @@ impl GameState {
             black_pawn_count: 0,
             starting_white_pieces: 0,
             starting_black_pieces: 0,
-            cloud_sum_x: 0,
-            cloud_sum_y: 0,
-            cloud_count: 0,
             white_pieces: Vec::new(),
             black_pieces: Vec::new(),
             spatial_indices: SpatialIndices::default(),
@@ -250,9 +238,6 @@ impl GameState {
             black_pawn_count: 0,
             starting_white_pieces: 0,
             starting_black_pieces: 0,
-            cloud_sum_x: 0,
-            cloud_sum_y: 0,
-            cloud_count: 0,
             white_pieces: Vec::new(),
             black_pieces: Vec::new(),
             spatial_indices: SpatialIndices::default(),
@@ -369,7 +354,7 @@ impl GameState {
         self.spatial_indices = SpatialIndices::new(&self.board);
     }
 
-    /// Initialize Starting_squares from the current board: all non-pawn,
+    /// Initialize starting_squares from the current board: all non-pawn,
     /// non-royal pieces' current coordinates are treated as their original
     /// squares. Intended to be called once when constructing a GameState
     /// from an initial position before replaying move history.
@@ -1050,7 +1035,7 @@ impl GameState {
 
                 let pseudo = get_pseudo_legal_moves_for_piece(
                     &self.board,
-                    &piece,
+                    piece,
                     &from,
                     &self.special_rights,
                     &self.en_passant,
@@ -1386,34 +1371,17 @@ impl GameState {
         // Hash: remove piece from source
         self.hash ^= piece_key(piece.piece_type(), piece.color(), m.from.x, m.from.y);
 
-        // Update cloud center: remove piece from source
-        if piece.color() != PlayerColor::Neutral {
-            self.cloud_sum_x -= m.from.x;
-            self.cloud_sum_y -= m.from.y;
-            self.cloud_count -= 1;
-        }
-
         let mut undo_info = UndoMove {
             captured_piece: self.board.get_piece(m.to.x, m.to.y).copied(),
             old_en_passant: self.en_passant.clone(),
             old_halfmove_clock: self.halfmove_clock,
-            old_hash: self.hash_stack.last().copied().unwrap_or(0),
+            old_hash: self.hash_stack.last().copied().unwrap_or(0), // Save original hash
             special_rights_removed: ArrayVec::new(),
             starting_square_restored: None,
             old_white_king_pos: None,
             old_black_king_pos: None,
             old_repetition: self.repetition,
-            old_cloud_sum_x: self.cloud_sum_x,
-            old_cloud_sum_y: self.cloud_sum_y,
-            old_cloud_count: self.cloud_count,
         };
-
-        // Update cloud center: add piece to target
-        if piece.color() != PlayerColor::Neutral {
-            self.cloud_sum_x += m.to.x;
-            self.cloud_sum_y += m.to.y;
-            self.cloud_count += 1;
-        }
 
         // Track king position updates for undo
         if piece.piece_type().is_royal() {
@@ -1670,12 +1638,6 @@ impl GameState {
 
         // Pop the hash that was pushed in make_move and restore the saved hash
         self.hash_stack.pop();
-        // Revert Cloud Center
-        self.cloud_sum_x = undo.old_cloud_sum_x;
-        self.cloud_sum_y = undo.old_cloud_sum_y;
-        self.cloud_count = undo.old_cloud_count;
-
-        // Restore saved hash
         self.hash = undo.old_hash;
 
         // Revert turn

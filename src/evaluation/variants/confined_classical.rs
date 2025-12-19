@@ -303,7 +303,7 @@ fn evaluate_queen_confined(
     }
 
     // Idle penalty from pawns on file (same as base)
-    let (own_pawns_on_file, enemy_pawns_on_file) = base::count_pawns_on_file(&game.board, x, color);
+    let (own_pawns_on_file, enemy_pawns_on_file) = base::count_pawns_on_file(game, x, color);
     if own_pawns_on_file > 0 && enemy_pawns_on_file > 0 {
         bonus -= 15;
     }

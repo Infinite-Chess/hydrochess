@@ -1386,16 +1386,14 @@ pub fn get_quiet_moves_into(
 ) {
     out.clear();
 
-    // Use HashMap-based iteration (toggle by renaming to iter_pieces_by_color_bitboard)
+    // BITBOARD: Use fast color-specific bitboard iteration
     let is_white = turn == PlayerColor::White;
-    for ((x, y), piece) in board.iter() {
-        if (piece.color() == PlayerColor::White) != is_white {
-            continue;
-        }
+    for (x, y, piece) in board.iter_pieces_by_color(is_white) {
         if piece.color() == PlayerColor::Neutral {
             continue;
         }
-        let from = Coordinate::new(*x, *y);
+
+        let from = Coordinate::new(x, y);
         generate_quiets_for_piece(
             board,
             &piece,
@@ -1815,11 +1813,17 @@ pub fn generate_sliding_moves(
     indices: &SpatialIndices,
     fallback: bool,
 ) -> MoveList {
+    // Original wiggle values - important for tactics
     const ENEMY_WIGGLE: i64 = 2;
     const FRIEND_WIGGLE: i64 = 1;
+    // Maximum distance for interception - 50 is needed for long-range tactics
+    // We only cap "interception" moves (crossing an enemy's line), not direct captures!
     const MAX_INTERCEPTION_DIST: i64 = 50;
+
+    // Fallback limit for short-range slider moves
     const FALLBACK_LIMIT: i64 = 10;
 
+    let _piece_count = board.len();
     let mut moves = MoveList::new();
     let our_color = piece.color();
 
@@ -1836,15 +1840,20 @@ pub fn generate_sliding_moves(
                 for dist in 1..=FALLBACK_LIMIT {
                     let tx = from.x + dir_x * dist;
                     let ty = from.y + dir_y * dist;
+
+                    // Stop if out of bounds (though unlikely with infinite board coords)
                     if !in_bounds(tx, ty) {
                         break;
                     }
 
                     if let Some(target) = board.get_piece(tx, ty) {
-                        if target.color() != our_color && target.color() != PlayerColor::Neutral {
+                        // If blocked, check if we can capture
+                        let is_enemy =
+                            target.color() != our_color && target.color() != PlayerColor::Neutral;
+                        if is_enemy {
                             moves.push(Move::new(*from, Coordinate::new(tx, ty), *piece));
                         }
-                        break;
+                        break; // blocked
                     } else {
                         moves.push(Move::new(*from, Coordinate::new(tx, ty), *piece));
                     }
@@ -1855,6 +1864,7 @@ pub fn generate_sliding_moves(
             let is_vertical = dir_x == 0;
             let is_horizontal = dir_y == 0;
 
+            // Use spatial indices for O(log n) blocker finding when available
             let (closest_dist, closest_is_enemy) =
                 find_blocker_via_indices(board, from, dir_x, dir_y, indices, our_color);
 
@@ -1867,7 +1877,7 @@ pub fn generate_sliding_moves(
             } else {
                 match ray_border_distance(from, dir_x, dir_y) {
                     Some(d) if d > 0 => d,
-                    _ => i64::MAX / 2,
+                    _ => 0,
                 }
             };
 
@@ -1875,143 +1885,137 @@ pub fn generate_sliding_moves(
                 continue;
             }
 
+            // Efficient interception limit for OFF-RAY pieces
             let interception_limit = max_dist.min(MAX_INTERCEPTION_DIST);
-            let mut target_dists: Vec<i64> = Vec::with_capacity(32);
 
+            // Use Vec for target distances to avoid overflow
+            let mut target_dists: Vec<i64> = Vec::with_capacity(64);
+
+            // Start wiggle room (always add these)
             for d in 1..=ENEMY_WIGGLE {
                 target_dists.push(d);
             }
 
-            if is_horizontal {
-                for y in (from.y - ENEMY_WIGGLE)..=(from.y + ENEMY_WIGGLE) {
-                    if let Some(list) = indices.rows.get(&y) {
-                        let diff_y = (y - from.y).abs();
-                        for &(px, packed) in list {
-                            let p = Piece::from_packed(packed);
-                            let is_enemy =
-                                p.color() != our_color && p.color() != PlayerColor::Neutral;
-                            let wiggle = if is_enemy {
-                                ENEMY_WIGGLE
-                            } else {
-                                FRIEND_WIGGLE
-                            };
-                            if diff_y > wiggle {
-                                continue;
-                            }
+            // Process ALL pieces for interception (needed for tactics)
+            for ((px, py), p) in board.iter() {
+                let is_enemy = p.color() != our_color && p.color() != PlayerColor::Neutral;
+                let wiggle = if is_enemy {
+                    ENEMY_WIGGLE
+                } else {
+                    FRIEND_WIGGLE
+                };
 
-                            for w in -wiggle..=wiggle {
-                                let tx = px + w;
-                                let dx = tx - from.x;
-                                if dx != 0 && dx.signum() == dir_x.signum() {
-                                    let d = dx.abs();
-                                    let is_direct = is_enemy && y == from.y && w == 0;
-                                    let limit = if is_direct {
-                                        max_dist
-                                    } else {
-                                        interception_limit
-                                    };
-                                    if d <= limit {
-                                        target_dists.push(d);
-                                    }
-                                }
+                let pdx = *px - from.x;
+                let pdy = *py - from.y;
+
+                if is_horizontal {
+                    // Check x coordinates
+                    for w in -wiggle..=wiggle {
+                        let tx = *px + w;
+                        let dx = tx - from.x;
+                        if dx != 0 && dx.signum() == dir_x.signum() {
+                            let d = dx.abs();
+                            // CRITICAL: specific check
+                            // - If enemy is exactly on the ray (capture), use max_dist
+                            // - If enemy is offset (interception), use interception_limit
+                            let is_direct_capture = is_enemy && *py == from.y && w == 0;
+                            let limit = if is_direct_capture {
+                                max_dist
+                            } else {
+                                interception_limit
+                            };
+
+                            if d <= limit {
+                                target_dists.push(d);
                             }
                         }
                     }
-                }
-            } else if is_vertical {
-                for x in (from.x - ENEMY_WIGGLE)..=(from.x + ENEMY_WIGGLE) {
-                    if let Some(list) = indices.cols.get(&x) {
-                        let diff_x = (x - from.x).abs();
-                        for &(py, packed) in list {
-                            let p = Piece::from_packed(packed);
-                            let is_enemy =
-                                p.color() != our_color && p.color() != PlayerColor::Neutral;
-                            let wiggle = if is_enemy {
-                                ENEMY_WIGGLE
+                } else if is_vertical {
+                    // Check y coordinates
+                    for w in -wiggle..=wiggle {
+                        let ty = *py + w;
+                        let dy = ty - from.y;
+                        if dy != 0 && dy.signum() == dir_y.signum() {
+                            let d = dy.abs();
+                            // CRITICAL: specific check
+                            let is_direct_capture = is_enemy && *px == from.x && w == 0;
+                            let limit = if is_direct_capture {
+                                max_dist
                             } else {
-                                FRIEND_WIGGLE
+                                interception_limit
                             };
-                            if diff_x > wiggle {
-                                continue;
-                            }
 
-                            for w in -wiggle..=wiggle {
-                                let ty = py + w;
-                                let dy = ty - from.y;
-                                if dy != 0 && dy.signum() == dir_y.signum() {
-                                    let d = dy.abs();
-                                    let is_direct = is_enemy && x == from.x && w == 0;
-                                    let limit = if is_direct {
-                                        max_dist
-                                    } else {
-                                        interception_limit
-                                    };
-                                    if d <= limit {
-                                        target_dists.push(d);
-                                    }
-                                }
+                            if d <= limit {
+                                target_dists.push(d);
                             }
                         }
                     }
-                }
-            } else {
-                let is_diag1 = dir_x == dir_y;
-                let k = if is_diag1 {
-                    from.x - from.y
                 } else {
-                    from.x + from.y
-                };
-                let map = if is_diag1 {
-                    &indices.diag1
-                } else {
-                    &indices.diag2
-                };
-                for offset in -ENEMY_WIGGLE..=ENEMY_WIGGLE {
-                    if let Some(list) = map.get(&(k + offset)) {
-                        for &(px, packed) in list {
-                            let py = if is_diag1 {
-                                px - (k + offset)
-                            } else {
-                                (k + offset) - px
-                            };
-                            let p = Piece::from_packed(packed);
-                            let is_enemy =
-                                p.color() != our_color && p.color() != PlayerColor::Neutral;
-                            let wiggle = if is_enemy {
-                                ENEMY_WIGGLE
-                            } else {
-                                FRIEND_WIGGLE
-                            };
-                            for wx in -wiggle..=wiggle {
-                                for wy in -wiggle..=wiggle {
-                                    let tx = px + wx;
-                                    let ty = py + wy;
-                                    let rdx = tx - from.x;
-                                    let rdy = ty - from.y;
-                                    if rdx != 0
-                                        && rdx.signum() == dir_x.signum()
-                                        && rdx.abs() == rdy.abs()
-                                    {
-                                        if rdy.signum() == dir_y.signum() {
-                                            let d = rdx.abs();
-                                            let is_direct = is_enemy && wx == 0 && wy == 0;
-                                            let limit = if is_direct {
-                                                max_dist
-                                            } else {
-                                                interception_limit
-                                            };
-                                            if d <= limit {
-                                                target_dists.push(d);
-                                            }
-                                        }
-                                    }
-                                }
+                    // Diagonal movement
+                    // Check if this piece is on the SAME ray we're moving along
+                    let on_this_ray = pdx.abs() == pdy.abs()
+                        && pdx != 0
+                        && pdx.signum() == dir_x.signum()
+                        && pdy.signum() == dir_y.signum();
+
+                    if on_this_ray {
+                        // Piece is on our ray - handled by blocker wiggle (which uses max_dist/closest_dist)
+                        continue;
+                    }
+
+                    // Orthogonal interception
+                    for w in -wiggle..=wiggle {
+                        let tx = *px + w;
+                        let dx = tx - from.x;
+                        if dx != 0 && dx.signum() == dir_x.signum() {
+                            let d = dx.abs();
+                            if d <= interception_limit {
+                                target_dists.push(d);
+                            }
+                        }
+
+                        let ty = *py + w;
+                        let dy = ty - from.y;
+                        if dy != 0 && dy.signum() == dir_y.signum() {
+                            let d = dy.abs();
+                            if d <= interception_limit {
+                                target_dists.push(d);
+                            }
+                        }
+                    }
+
+                    // Diagonal proximity
+                    let diag_wiggle: i64 = 1;
+
+                    if dir_x * dir_y > 0 {
+                        let from_sum = from.x + from.y;
+                        let piece_sum = *px + *py;
+                        let diff = piece_sum - from_sum;
+                        let base_d = if dir_x > 0 { diff / 2 } else { -diff / 2 };
+
+                        for dw in -diag_wiggle..=diag_wiggle {
+                            let d = base_d + dw;
+                            if d > 0 && d <= interception_limit {
+                                target_dists.push(d);
+                            }
+                        }
+                    } else {
+                        let from_diff = from.x - from.y;
+                        let piece_diff = *px - *py;
+                        let diff = piece_diff - from_diff;
+                        let base_d = if dir_x > 0 { diff / 2 } else { -diff / 2 };
+
+                        for dw in -diag_wiggle..=diag_wiggle {
+                            let d = base_d + dw;
+                            if d > 0 && d <= interception_limit {
+                                target_dists.push(d);
                             }
                         }
                     }
                 }
             }
 
+            // Add blocker wiggle room (up to max_dist)
             if closest_dist < i64::MAX {
                 let wr = if closest_is_enemy {
                     ENEMY_WIGGLE
@@ -2026,24 +2030,33 @@ pub fn generate_sliding_moves(
                 }
             }
 
+            // Sort and deduplicate
             target_dists.sort_unstable();
             target_dists.dedup();
 
+            // Generate moves
             for d in target_dists {
                 if d <= 0 || d > max_dist {
                     continue;
                 }
+
+                // Skip if this is a friendly blocker square
                 if d == closest_dist && !closest_is_enemy {
                     continue;
                 }
+
                 let sq_x = from.x + dir_x * d;
                 let sq_y = from.y + dir_y * d;
-                if in_bounds(sq_x, sq_y) {
-                    moves.push(Move::new(*from, Coordinate::new(sq_x, sq_y), *piece));
+
+                if !in_bounds(sq_x, sq_y) {
+                    continue;
                 }
+
+                moves.push(Move::new(*from, Coordinate::new(sq_x, sq_y), *piece));
             }
         }
     }
+
     moves
 }
 
@@ -2212,8 +2225,8 @@ fn generate_huygen_moves(
 
             if !found_via_indices {
                 for ((px, py), target_piece) in board.iter() {
-                    let dx = *px - from.x;
-                    let dy = *py - from.y;
+                    let dx = px - from.x;
+                    let dy = py - from.y;
                     let k = if dir_x != 0 {
                         if dx % dir_x == 0 && dy == 0 {
                             Some(dx / dir_x)

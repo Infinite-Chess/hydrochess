@@ -435,9 +435,6 @@ impl Engine {
             repetition: 0,
             white_non_pawn_material: false,
             black_non_pawn_material: false,
-            cloud_sum_x: 0,
-            cloud_sum_y: 0,
-            cloud_count: 0,
         };
 
         game.material_score = calculate_initial_material(&game.board);

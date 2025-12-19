@@ -844,7 +844,7 @@ pub fn evaluate_rook(
     }
 
     // Penalize completely idle rooks stuck behind both own and enemy pawns on their file.
-    let (own_pawns_on_file, enemy_pawns_on_file) = count_pawns_on_file(&game.board, x, color);
+    let (own_pawns_on_file, enemy_pawns_on_file) = count_pawns_on_file(game, x, color);
     if own_pawns_on_file > 0 && enemy_pawns_on_file > 0 {
         bonus -= ROOK_IDLE_PENALTY;
         bump_feat!(rook_idle_penalty, -1);
@@ -1645,50 +1645,76 @@ pub fn is_lone_king(game: &GameState, color: PlayerColor) -> bool {
 
 /// Check if a side has any pawn that can still promote (not past the promotion rank)
 fn has_promotable_pawn(board: &Board, color: PlayerColor, promo_rank: i64) -> bool {
-    for (_, y, _) in board
-        .tiles
-        .iter_pieces_by_color_and_type(color, PieceType::Pawn)
-    {
-        match color {
-            PlayerColor::White => {
-                if y < promo_rank {
-                    return true;
+    // BITBOARD: Use occ_pawns for fast pawn detection
+    let is_white = color == PlayerColor::White;
+    for (_cx, cy, tile) in board.tiles.iter() {
+        let color_pawns = tile.occ_pawns
+            & if is_white {
+                tile.occ_white
+            } else {
+                tile.occ_black
+            };
+        if color_pawns == 0 {
+            continue;
+        }
+
+        let mut bits = color_pawns;
+        while bits != 0 {
+            let idx = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let y = cy * 8 + (idx / 8) as i64;
+
+            match color {
+                PlayerColor::White => {
+                    if y < promo_rank {
+                        return true;
+                    }
                 }
-            }
-            PlayerColor::Black => {
-                if y > promo_rank {
-                    return true;
+                PlayerColor::Black => {
+                    if y > promo_rank {
+                        return true;
+                    }
                 }
+                PlayerColor::Neutral => {}
             }
-            PlayerColor::Neutral => {}
         }
     }
     false
 }
 
-/// Count how many pawns of each side are on a specific file (including neighboring files)
-pub fn count_pawns_on_file(board: &Board, x: i64, color: PlayerColor) -> (i32, i32) {
+// (Your existing evaluate_lone_king_endgame + needs_king_for_mate here; unchanged)
+
+pub fn count_pawns_on_file(game: &GameState, file: i64, color: PlayerColor) -> (i32, i32) {
     let mut own_pawns = 0;
     let mut enemy_pawns = 0;
 
-    let enemy_color = color.opponent();
+    // BITBOARD: Only check the tile(s) that contain this file
+    let file_tile_x = file >> 3; // Which tile column contains this file
+    let local_x = (file & 7) as usize;
 
-    // Iterate through pieces of target color and enemy color that are pawns
-    // This is more efficient than iterating all tiles if pieces are sparse.
-    for (px, _, _) in board
-        .tiles
-        .iter_pieces_by_color_and_type(color, PieceType::Pawn)
-    {
-        if (px - x).abs() <= 1 {
-            own_pawns += 1;
+    for (cx, _, tile) in game.board.tiles.iter() {
+        if cx != file_tile_x {
+            continue; // Skip tiles not on this file
         }
-    }
-    for (px, _, _) in board
-        .tiles
-        .iter_pieces_by_color_and_type(enemy_color, PieceType::Pawn)
-    {
-        if (px - x).abs() <= 1 {
-            enemy_pawns += 1;
+
+        // Check each row in the tile for pawns in the target column
+        for row in 0..8 {
+            let idx = row * 8 + local_x;
+            if (tile.occ_pawns >> idx) & 1 != 0 {
+                if (tile.occ_white >> idx) & 1 != 0 {
+                    if color == PlayerColor::White {
+                        own_pawns += 1;
+                    } else {
+                        enemy_pawns += 1;
+                    }
+                } else if (tile.occ_black >> idx) & 1 != 0 {
+                    if color == PlayerColor::Black {
+                        own_pawns += 1;
+                    } else {
+                        enemy_pawns += 1;
+                    }
+                }
+            }
         }
     }
 
@@ -1793,17 +1819,13 @@ pub fn evaluate_lone_king_endgame(
     }
     let mut sliders: Vec<SliderInfo> = Vec::new();
 
-    for (x, y, piece) in game
-        .board
-        .tiles
-        .iter_pieces_by_color(winning_color == PlayerColor::White)
-    {
-        if piece.piece_type().is_royal() {
+    for ((x, y), piece) in game.board.iter() {
+        if piece.color() != winning_color || piece.piece_type().is_royal() {
             continue;
         }
         match piece.piece_type() {
             PieceType::Rook | PieceType::Chancellor | PieceType::Queen | PieceType::Amazon => {
-                sliders.push(SliderInfo { x, y });
+                sliders.push(SliderInfo { x: *x, y: *y });
             }
             _ => {}
         }
@@ -2095,31 +2117,51 @@ pub fn evaluate_lone_king_endgame(
     // the evaluation really wants the short-range pieces to participate.
     let short_base_scale: i32 = if few_sliders { 6 } else { 3 };
 
-    for (px, py, piece) in game
-        .board
-        .tiles
-        .iter_pieces_by_color(winning_color == PlayerColor::White)
-    {
+    for ((px, py), piece) in game.board.iter() {
+        if piece.color() != winning_color {
+            continue;
+        }
+
         // Skip long-range sliders here; they are already handled by the
         // sandwich/fence logic above.
-        if piece.piece_type().is_slider() || piece.piece_type().is_royal() {
+        let is_slider_piece = matches!(
+            piece.piece_type(),
+            PieceType::Rook
+                | PieceType::Chancellor
+                | PieceType::Queen
+                | PieceType::RoyalQueen
+                | PieceType::Bishop
+                | PieceType::Amazon
+                | PieceType::Knightrider
+                | PieceType::Huygen
+        );
+
+        if is_slider_piece {
+            continue;
+        }
+
+        // King proximity is already handled by the king-involvement logic
+        // above; avoid double-counting it here.
+        if piece.piece_type() == PieceType::King {
             continue;
         }
 
         let dist = (px - enemy_king.x).abs() + (py - enemy_king.y).abs();
         let capped = dist.min(12);
         let prox = (12 - capped) as i32; // 1 step closer = positive bonus, far away ~ 0
-        if prox > 0 {
-            // Scale more strongly for true short-range attackers.
-            let piece_scale: i32 = match piece.piece_type() {
-                PieceType::Guard | PieceType::Centaur | PieceType::RoyalCentaur => 3,
-                PieceType::Knight | PieceType::Camel | PieceType::Giraffe | PieceType::Zebra => 3,
-                PieceType::Hawk | PieceType::Rose => 2,
-                _ => 1,
-            };
-
-            bonus += prox * short_base_scale * piece_scale;
+        if prox <= 0 {
+            continue;
         }
+
+        // Scale more strongly for true short-range attackers.
+        let piece_scale: i32 = match piece.piece_type() {
+            PieceType::Guard | PieceType::Centaur | PieceType::RoyalCentaur => 3,
+            PieceType::Knight | PieceType::Camel | PieceType::Giraffe | PieceType::Zebra => 3,
+            PieceType::Hawk | PieceType::Rose => 2,
+            _ => 1,
+        };
+
+        bonus += prox * short_base_scale * piece_scale;
     }
 
     bonus
@@ -2138,10 +2180,10 @@ fn needs_king_for_mate(board: &Board, color: PlayerColor) -> bool {
     let mut hawks = 0;
     let mut guards = 0;
 
-    for (_, _, piece) in board
-        .tiles
-        .iter_pieces_by_color(color == PlayerColor::White)
-    {
+    for (_, piece) in board.iter() {
+        if piece.color() != color {
+            continue;
+        }
         match piece.piece_type() {
             PieceType::Queen | PieceType::RoyalQueen => queens += 1,
             PieceType::Rook => rooks += 1,

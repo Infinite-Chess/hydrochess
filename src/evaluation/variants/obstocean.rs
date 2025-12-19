@@ -481,13 +481,12 @@ fn get_closest_piece_distance(
     color: PlayerColor,
 ) -> i64 {
     let mut min_dist = 1000i64;
-    for (x, y, _piece) in board
-        .tiles
-        .iter_pieces_by_color(color == PlayerColor::White)
-    {
-        let dist = (x - target_x).abs().max((y - target_y).abs());
-        if dist < min_dist {
-            min_dist = dist;
+    for ((x, y), piece) in board.iter() {
+        if piece.color() == color {
+            let dist = (x - target_x).abs().max((y - target_y).abs());
+            if dist < min_dist {
+                min_dist = dist;
+            }
         }
     }
     min_dist
