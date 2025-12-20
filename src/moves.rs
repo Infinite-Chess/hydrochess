@@ -1931,120 +1931,195 @@ pub fn generate_sliding_moves(
                 target_dists.push(d);
             }
 
-            // Process ALL pieces for interception (needed for tactics)
-            for ((px, py), p) in board.iter() {
-                // Obstacles are neutral but capturable - check is_uncapturable()
-                let is_enemy = p.color() != our_color && !p.piece_type().is_uncapturable();
-                let wiggle = if is_enemy {
-                    ENEMY_WIGGLE
-                } else {
-                    FRIEND_WIGGLE
-                };
+            // Process pieces for interception using targeted spatial lookups (O(L) where L is limit)
+            let search_range = interception_limit + ENEMY_WIGGLE;
 
-                let pdx = *px - from.x;
-                let pdy = *py - from.y;
-
-                if is_horizontal {
-                    // Check x coordinates
-                    for w in -wiggle..=wiggle {
-                        let tx = *px + w;
-                        let dx = tx - from.x;
-                        if dx != 0 && dx.signum() == dir_x.signum() {
-                            let d = dx.abs();
-                            // CRITICAL: specific check
-                            // - If enemy is exactly on the ray (capture), use max_dist
-                            // - If enemy is offset (interception), use interception_limit
-                            let is_direct_capture = is_enemy && *py == from.y && w == 0;
-                            let limit = if is_direct_capture {
-                                max_dist
+            if is_horizontal {
+                // Horizontal ray: check only the relevant columns in direction
+                for x_off in -ENEMY_WIGGLE..=search_range {
+                    let col_x = from.x + x_off * dir_x.signum();
+                    if let Some(pieces_at_col) = indices.cols.get(&col_x) {
+                        for &(_py, packed) in pieces_at_col {
+                            let p = Piece::from_packed(packed);
+                            let is_enemy =
+                                p.color() != our_color && !p.piece_type().is_uncapturable();
+                            let wiggle = if is_enemy {
+                                ENEMY_WIGGLE
                             } else {
-                                interception_limit
+                                FRIEND_WIGGLE
                             };
 
-                            if d <= limit {
-                                target_dists.push(d);
+                            for w in -wiggle..=wiggle {
+                                let tx = col_x + w;
+                                let dx = tx - from.x;
+                                if dx != 0 && dx.signum() == dir_x.signum() {
+                                    let d = dx.abs();
+                                    if d <= interception_limit {
+                                        target_dists.push(d);
+                                    }
+                                }
                             }
                         }
                     }
-                } else if is_vertical {
-                    // Check y coordinates
-                    for w in -wiggle..=wiggle {
-                        let ty = *py + w;
-                        let dy = ty - from.y;
-                        if dy != 0 && dy.signum() == dir_y.signum() {
-                            let d = dy.abs();
-                            // CRITICAL: specific check
-                            let is_direct_capture = is_enemy && *px == from.x && w == 0;
-                            let limit = if is_direct_capture {
-                                max_dist
+                }
+            } else if is_vertical {
+                // Vertical ray: check only the relevant rows in direction
+                for y_off in -ENEMY_WIGGLE..=search_range {
+                    let row_y = from.y + y_off * dir_y.signum();
+                    if let Some(pieces_at_row) = indices.rows.get(&row_y) {
+                        for &(_px, packed) in pieces_at_row {
+                            let p = Piece::from_packed(packed);
+                            let is_enemy =
+                                p.color() != our_color && !p.piece_type().is_uncapturable();
+                            let wiggle = if is_enemy {
+                                ENEMY_WIGGLE
                             } else {
-                                interception_limit
+                                FRIEND_WIGGLE
                             };
 
-                            if d <= limit {
-                                target_dists.push(d);
+                            for w in -wiggle..=wiggle {
+                                let ty = row_y + w;
+                                let dy = ty - from.y;
+                                if dy != 0 && dy.signum() == dir_y.signum() {
+                                    let d = dy.abs();
+                                    if d <= interception_limit {
+                                        target_dists.push(d);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Diagonal ray: check relevant columns, rows, and diagonals
+                // 1. Orthogonal x-based interception
+                for x_off in -ENEMY_WIGGLE..=search_range {
+                    let col_x = from.x + x_off * dir_x.signum();
+                    if let Some(pieces_at_col) = indices.cols.get(&col_x) {
+                        for &(py, packed) in pieces_at_col {
+                            let p = Piece::from_packed(packed);
+                            let is_enemy =
+                                p.color() != our_color && !p.piece_type().is_uncapturable();
+                            let wiggle = if is_enemy {
+                                ENEMY_WIGGLE
+                            } else {
+                                FRIEND_WIGGLE
+                            };
+
+                            let pdx = col_x - from.x;
+                            let pdy = py - from.y;
+                            if pdx.abs() == pdy.abs()
+                                && pdx != 0
+                                && pdx.signum() == dir_x.signum()
+                                && pdy.signum() == dir_y.signum()
+                            {
+                                continue;
+                            }
+
+                            for w in -wiggle..=wiggle {
+                                let tx = col_x + w;
+                                let dx = tx - from.x;
+                                if dx != 0 && dx.signum() == dir_x.signum() {
+                                    let d = dx.abs();
+                                    if d <= interception_limit {
+                                        target_dists.push(d);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 2. Orthogonal y-based interception
+                for y_off in -ENEMY_WIGGLE..=search_range {
+                    let row_y = from.y + y_off * dir_y.signum();
+                    if let Some(pieces_at_row) = indices.rows.get(&row_y) {
+                        for &(px, packed) in pieces_at_row {
+                            let p = Piece::from_packed(packed);
+                            let is_enemy =
+                                p.color() != our_color && !p.piece_type().is_uncapturable();
+                            let wiggle = if is_enemy {
+                                ENEMY_WIGGLE
+                            } else {
+                                FRIEND_WIGGLE
+                            };
+
+                            let pdx = px - from.x;
+                            let pdy = row_y - from.y;
+                            if pdx.abs() == pdy.abs()
+                                && pdx != 0
+                                && pdx.signum() == dir_x.signum()
+                                && pdy.signum() == dir_y.signum()
+                            {
+                                continue;
+                            }
+
+                            for w in -wiggle..=wiggle {
+                                let ty = row_y + w;
+                                let dy = ty - from.y;
+                                if dy != 0 && dy.signum() == dir_y.signum() {
+                                    let d = dy.abs();
+                                    if d <= interception_limit {
+                                        target_dists.push(d);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 3. Diagonal proximity using diag1/diag2 indices
+                let diag_wiggle: i64 = 1;
+                if dir_x * dir_y > 0 {
+                    let from_key = from.x + from.y;
+                    for k_off in -2..=2 {
+                        if let Some(pieces_on_diag) = indices.diag2.get(&(from_key + k_off)) {
+                            for &(px, _packed) in pieces_on_diag {
+                                let pdx = px - from.x;
+                                if pdx == 0 || pdx.signum() != dir_x.signum() {
+                                    continue;
+                                }
+
+                                // Original logic used (piece_sum - from_sum) / 2 as base distance
+                                let diff = k_off;
+                                let base_d = if dir_x > 0 {
+                                    pdx - diff / 2
+                                } else {
+                                    -pdx + diff / 2
+                                };
+
+                                for dw in -diag_wiggle..=diag_wiggle {
+                                    let d = base_d + dw;
+                                    if d > 0 && d <= interception_limit {
+                                        target_dists.push(d);
+                                    }
+                                }
                             }
                         }
                     }
                 } else {
-                    // Diagonal movement
-                    // Check if this piece is on the SAME ray we're moving along
-                    let on_this_ray = pdx.abs() == pdy.abs()
-                        && pdx != 0
-                        && pdx.signum() == dir_x.signum()
-                        && pdy.signum() == dir_y.signum();
+                    let from_key = from.x - from.y;
+                    for k_off in -2..=2 {
+                        if let Some(pieces_on_diag) = indices.diag1.get(&(from_key + k_off)) {
+                            for &(px, _packed) in pieces_on_diag {
+                                let pdx = px - from.x;
+                                if pdx == 0 || pdx.signum() != dir_x.signum() {
+                                    continue;
+                                }
 
-                    if on_this_ray {
-                        // Piece is on our ray - handled by blocker wiggle (which uses max_dist/closest_dist)
-                        continue;
-                    }
+                                let diff = k_off;
+                                let base_d = if dir_x > 0 {
+                                    pdx - diff / 2
+                                } else {
+                                    -pdx + diff / 2
+                                };
 
-                    // Orthogonal interception
-                    for w in -wiggle..=wiggle {
-                        let tx = *px + w;
-                        let dx = tx - from.x;
-                        if dx != 0 && dx.signum() == dir_x.signum() {
-                            let d = dx.abs();
-                            if d <= interception_limit {
-                                target_dists.push(d);
-                            }
-                        }
-
-                        let ty = *py + w;
-                        let dy = ty - from.y;
-                        if dy != 0 && dy.signum() == dir_y.signum() {
-                            let d = dy.abs();
-                            if d <= interception_limit {
-                                target_dists.push(d);
-                            }
-                        }
-                    }
-
-                    // Diagonal proximity
-                    let diag_wiggle: i64 = 1;
-
-                    if dir_x * dir_y > 0 {
-                        let from_sum = from.x + from.y;
-                        let piece_sum = *px + *py;
-                        let diff = piece_sum - from_sum;
-                        let base_d = if dir_x > 0 { diff / 2 } else { -diff / 2 };
-
-                        for dw in -diag_wiggle..=diag_wiggle {
-                            let d = base_d + dw;
-                            if d > 0 && d <= interception_limit {
-                                target_dists.push(d);
-                            }
-                        }
-                    } else {
-                        let from_diff = from.x - from.y;
-                        let piece_diff = *px - *py;
-                        let diff = piece_diff - from_diff;
-                        let base_d = if dir_x > 0 { diff / 2 } else { -diff / 2 };
-
-                        for dw in -diag_wiggle..=diag_wiggle {
-                            let d = base_d + dw;
-                            if d > 0 && d <= interception_limit {
-                                target_dists.push(d);
+                                for dw in -diag_wiggle..=diag_wiggle {
+                                    let d = base_d + dw;
+                                    if d > 0 && d <= interception_limit {
+                                        target_dists.push(d);
+                                    }
+                                }
                             }
                         }
                     }
