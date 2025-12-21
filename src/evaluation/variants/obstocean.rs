@@ -2,7 +2,7 @@
 //
 // RULE: Push edge pawns (x=1,8). Nothing else matters as much.
 
-use crate::board::{Coordinate, PieceType, PlayerColor};
+use crate::board::{PieceType, PlayerColor};
 use crate::evaluation::base;
 use crate::game::GameState;
 
