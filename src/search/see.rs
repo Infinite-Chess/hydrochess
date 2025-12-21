@@ -2,6 +2,40 @@ use crate::board::{PieceType, PlayerColor};
 use crate::evaluation::get_piece_value;
 use crate::game::GameState;
 use crate::moves::Move;
+use arrayvec::ArrayVec;
+
+/// Maximum pieces we support for full SEE calculation.
+/// 128 covers virtually all realistic positions while staying on the stack.
+const SEE_MAX_PIECES: usize = 128;
+
+/// Tests if SEE value of move is >= threshold.
+/// Uses early cutoffs to avoid full SEE calculation when possible.
+#[inline]
+pub(crate) fn see_ge(game: &GameState, m: &Move, threshold: i32) -> bool {
+    // BITBOARD: Fast piece check
+    let captured = match game.board.get_piece(m.to.x, m.to.y) {
+        Some(p) => p,
+        None => return 0 >= threshold, // No capture: SEE = 0
+    };
+
+    let victim_val = get_piece_value(captured.piece_type());
+    let attacker_val = get_piece_value(m.piece.piece_type());
+
+    // Early cutoff 1: if capturing loses material even if undefended, fail
+    let swap = victim_val - threshold;
+    if swap < 0 {
+        return false;
+    }
+
+    // Early cutoff 2: if capturing wins material even if we lose attacker, pass
+    let swap = attacker_val - swap;
+    if swap <= 0 {
+        return true;
+    }
+
+    // Need full SEE for complex cases
+    static_exchange_eval_impl(game, m) >= threshold
+}
 
 /// Static Exchange Evaluation implementation for a capture move on a single square.
 ///
@@ -10,8 +44,23 @@ use crate::moves::Move;
 pub(crate) fn static_exchange_eval_impl(game: &GameState, m: &Move) -> i32 {
     // Only meaningful for captures; quiet moves (or moves to empty squares)
     // have no immediate material swing.
-    if game.board.get_piece(&m.to.x, &m.to.y).is_none() {
-        return 0;
+    // BITBOARD: Fast piece check
+    let captured = match game.board.get_piece(m.to.x, m.to.y) {
+        Some(p) => p,
+        None => return 0,
+    };
+
+    // For very large boards (> SEE_MAX_PIECES), use approximate SEE
+    // based on simple MVV-LVA rather than full exchange sequence
+    if game.board.len() > SEE_MAX_PIECES {
+        let victim_val = get_piece_value(captured.piece_type());
+        let attacker_val = get_piece_value(m.piece.piece_type());
+        // Simple approximation: gain if victim > attacker, otherwise assume even exchange
+        return if victim_val >= attacker_val {
+            victim_val - attacker_val
+        } else {
+            victim_val - attacker_val // Could be negative, which is correct
+        };
     }
 
     #[derive(Clone, Copy)]
@@ -23,16 +72,28 @@ pub(crate) fn static_exchange_eval_impl(game: &GameState, m: &Move) -> i32 {
         alive: bool,
     }
 
-    // Build piece list from the board HashMap.
-    let mut pieces: Vec<PieceInfo> = Vec::with_capacity(game.board.pieces.len());
-    for ((x, y), piece) in &game.board.pieces {
-        pieces.push(PieceInfo {
-            x: *x,
-            y: *y,
-            piece_type: piece.piece_type(),
-            color: piece.color(),
-            alive: true,
-        });
+    // Build piece list using tile bitboards - faster than HashMap iteration
+    let mut pieces: ArrayVec<PieceInfo, SEE_MAX_PIECES> = ArrayVec::new();
+    for (cx, cy, tile) in game.board.tiles.iter() {
+        let mut bits = tile.occ_all;
+        while bits != 0 {
+            let idx = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let packed = tile.piece[idx];
+            if packed == 0 {
+                continue;
+            }
+            let piece = crate::board::Piece::from_packed(packed);
+            let x = cx * 8 + (idx % 8) as i64;
+            let y = cy * 8 + (idx / 8) as i64;
+            pieces.push(PieceInfo {
+                x,
+                y,
+                piece_type: piece.piece_type(),
+                color: piece.color(),
+                alive: true,
+            });
+        }
     }
 
     // Helper to find the index of a live piece at given coordinates.

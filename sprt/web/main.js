@@ -944,12 +944,32 @@ async function runSprt() {
                         }
                     } else if (msg.type === 'error') {
                         console.error('Worker error for game', msg.gameIndex, msg.error);
+
+                        // Check for WASM unreachable or panic
+                        const errStr = (msg.error || '').toString();
+                        if (errStr.includes("unreachable") || errStr.includes("panic") || errStr.includes("RuntimeError")) {
+                            stopRequested = true;
+                            log("CRITICAL ERROR: WASM Panic detected in game " + msg.gameIndex, "error");
+                            sprtLog("CRITICAL ERROR: WASM Panic detected in game " + msg.gameIndex);
+                            sprtLog("Variant: " + (msg.variantName || 'Classical'));
+                            sprtLog("Error: " + msg.error);
+                            if (msg.log) {
+                                sprtLog("--- Game History ---");
+                                sprtLog(msg.log);
+                                sprtLog("--------------------");
+                            }
+                            // Force stop all workers immediately
+                            workers.forEach(w => w.terminate());
+                            activeSprtWorkers = [];
+                            resolve(undefined);
+                            return;
+                        }
+
                         activeWorkers--;
 
                         // If this looks like a WebAssembly out-of-memory error,
                         // dynamically lower the stored max safe concurrency so
                         // future runs with "max" avoid this level.
-                        const errStr = (msg.error || '').toString();
                         const oomLike = errStr.includes('Out of memory') ||
                             errStr.includes('Cannot allocate Wasm memory');
                         if (oomLike) {

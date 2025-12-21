@@ -17,19 +17,30 @@ use crate::evaluation::base;
 #[inline]
 pub fn evaluate(game: &GameState) -> i32 {
     // Check for insufficient material draw
-    if base::is_insufficient_material(&game.board) {
-        return 0;
+    match crate::evaluation::insufficient_material::evaluate_insufficient_material(game) {
+        Some(0) => return 0, // Dead draw
+        Some(divisor) => {
+            // Drawish - dampen eval
+            return evaluate_inner(game) / divisor;
+        }
+        None => {} // Sufficient - continue to normal eval
     }
 
+    evaluate_inner(game)
+}
+
+/// Core evaluation logic - skips insufficient material check
+#[inline]
+fn evaluate_inner(game: &GameState) -> i32 {
     // Start with material score
     let mut score = game.material_score;
 
-    // Find king positions
-    let (white_king, black_king) = base::find_kings(&game.board);
+    // Use cached king positions (O(1) instead of O(n) board scan)
+    let (white_king, black_king) = (game.white_king_pos, game.black_king_pos);
 
     // Check for endgame with lone king
-    let white_only_king = base::is_lone_king(&game.board, PlayerColor::White);
-    let black_only_king = base::is_lone_king(&game.board, PlayerColor::Black);
+    let white_only_king = base::is_lone_king(game, PlayerColor::White);
+    let black_only_king = base::is_lone_king(game, PlayerColor::Black);
 
     // Handle lone king endgames
     if black_only_king && black_king.is_some() {
@@ -81,7 +92,7 @@ fn evaluate_pieces_obstocean(
     let mut white_bishop_colors: (bool, bool) = (false, false);
     let mut black_bishop_colors: (bool, bool) = (false, false);
 
-    for ((x, y), piece) in &game.board.pieces {
+    for ((x, y), piece) in game.board.iter() {
         if piece.color() == PlayerColor::Neutral {
             continue;
         }
@@ -169,7 +180,7 @@ fn evaluate_knight_obstocean(_x: i64, y: i64, color: PlayerColor) -> i32 {
     match color {
         PlayerColor::White => y as i32 * 10,
         PlayerColor::Black => (20 - y).max(0) as i32 * 10,
-        PlayerColor::Neutral => 0,
+        PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
     }
 }
 
@@ -194,7 +205,7 @@ fn evaluate_pawn_position_obstocean(
             let dist = (y - black_promo_rank).max(0);
             bonus += ((8 - dist.min(8)) as i32) * 3;
         }
-        PlayerColor::Neutral => {}
+        PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
     }
 
     // Edge pawn priority for Obstocean
@@ -217,7 +228,7 @@ fn evaluate_pawn_structure_obstocean(game: &GameState) -> i32 {
     let mut white_pawn_files: Vec<i64> = Vec::new();
     let mut black_pawn_files: Vec<i64> = Vec::new();
 
-    for ((x, y), piece) in &game.board.pieces {
+    for ((x, y), piece) in game.board.iter() {
         if piece.piece_type() == PieceType::Pawn {
             if piece.color() == PlayerColor::White {
                 white_pawns.push((*x, *y));
@@ -346,19 +357,19 @@ fn evaluate_tunnel(px: i64, py: i64, promo_rank: i64, board: &Board, is_white: b
         let check_y = if is_white { py + i } else { py - i };
 
         // Center obstacle
-        if let Some(p) = board.get_piece(&px, &check_y) {
+        if let Some(p) = board.get_piece(px, check_y) {
             if p.piece_type() == PieceType::Obstacle {
                 weighted_density += 1.0;
             }
         }
 
         // Adjacent obstacles (eating shield) - worth more
-        if let Some(p) = board.get_piece(&(px - 1), &check_y) {
+        if let Some(p) = board.get_piece(px - 1, check_y) {
             if p.piece_type() == PieceType::Obstacle {
                 weighted_density += 2.0;
             }
         }
-        if let Some(p) = board.get_piece(&(px + 1), &check_y) {
+        if let Some(p) = board.get_piece(px + 1, check_y) {
             if p.piece_type() == PieceType::Obstacle {
                 weighted_density += 2.0;
             }
@@ -433,7 +444,7 @@ fn evaluate_free_runner(
     // Check if contested
     for i in 1..=limit {
         let check_y = if is_white { py + i } else { py - i };
-        if let Some(p) = board.get_piece(&px, &check_y) {
+        if let Some(p) = board.get_piece(px, check_y) {
             if p.color() == enemy_color {
                 return 0; // Contested, no bonus
             }
@@ -470,7 +481,7 @@ fn get_closest_piece_distance(
     color: PlayerColor,
 ) -> i64 {
     let mut min_dist = 1000i64;
-    for ((x, y), piece) in &board.pieces {
+    for ((x, y), piece) in board.iter() {
         if piece.color() == color {
             let dist = (x - target_x).abs().max((y - target_y).abs());
             if dist < min_dist {

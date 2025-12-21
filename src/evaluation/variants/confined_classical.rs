@@ -23,19 +23,30 @@ const BACK_OBSTACLE_VALUE: i32 = 30; // Value of each back-rank obstacle (protec
 #[inline]
 pub fn evaluate(game: &GameState) -> i32 {
     // Check for insufficient material draw
-    if base::is_insufficient_material(&game.board) {
-        return 0;
+    match crate::evaluation::insufficient_material::evaluate_insufficient_material(game) {
+        Some(0) => return 0, // Dead draw
+        Some(divisor) => {
+            // Drawish - dampen eval
+            return evaluate_inner(game) / divisor;
+        }
+        None => {} // Sufficient - continue to normal eval
     }
 
+    evaluate_inner(game)
+}
+
+/// Core evaluation logic - skips insufficient material check
+#[inline]
+fn evaluate_inner(game: &GameState) -> i32 {
     // Start with material score
     let mut score = game.material_score;
 
-    // Find king positions
-    let (white_king, black_king) = base::find_kings(&game.board);
+    // Use cached king positions (O(1) instead of O(n) board scan)
+    let (white_king, black_king) = (game.white_king_pos, game.black_king_pos);
 
     // Check for endgame with lone king
-    let white_only_king = base::is_lone_king(&game.board, PlayerColor::White);
-    let black_only_king = base::is_lone_king(&game.board, PlayerColor::Black);
+    let white_only_king = base::is_lone_king(game, PlayerColor::White);
+    let black_only_king = base::is_lone_king(game, PlayerColor::Black);
 
     // Handle lone king endgames
     if black_only_king && black_king.is_some() {
@@ -98,7 +109,7 @@ fn evaluate_pieces_confined(
     let mut white_queen_out = false;
     let mut black_queen_out = false;
 
-    for ((x, y), piece) in &game.board.pieces {
+    for ((x, y), piece) in game.board.iter() {
         if piece.color() == PlayerColor::Neutral {
             continue;
         }
@@ -284,7 +295,7 @@ fn evaluate_queen_confined(
         let in_front = match color {
             PlayerColor::White => y > ok.y && y <= ok.y + 2 && (x - ok.x).abs() <= 1,
             PlayerColor::Black => y < ok.y && y >= ok.y - 2 && (x - ok.x).abs() <= 1,
-            _ => false,
+            PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
         };
         if in_front {
             bonus -= 20;
@@ -342,7 +353,7 @@ fn evaluate_development_confined(game: &GameState) -> i32 {
     let mut white_back_obstacles = 0;
     let mut black_back_obstacles = 0;
 
-    for ((_, y), piece) in &game.board.pieces {
+    for ((_, y), piece) in game.board.iter() {
         if piece.piece_type() == PieceType::Obstacle {
             if *y == 0 {
                 white_back_obstacles += 1;
@@ -396,7 +407,7 @@ fn evaluate_knight_confined(x: i64, y: i64, color: PlayerColor) -> i32 {
                 bonus += 25;
             }
         }
-        PlayerColor::Neutral => {}
+        PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
     }
 
     // Central file bonus (files 3-6 are central)
@@ -434,7 +445,7 @@ fn evaluate_bishop_confined(x: i64, y: i64, color: PlayerColor) -> i32 {
                 bonus += 30;
             }
         }
-        PlayerColor::Neutral => {}
+        PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
     }
 
     // Diagonal control (on main diagonals is good for long-range pressure)
@@ -465,7 +476,7 @@ fn evaluate_pawn_confined(
             let dist = (y - black_promo).max(0);
             bonus += ((8 - dist.min(8)) as i32) * 3;
         }
-        PlayerColor::Neutral => {}
+        PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
     }
 
     // CENTER PAWN BONUS - d and e pawn pushes open up the position
@@ -491,7 +502,7 @@ fn evaluate_pawn_confined(
                     bonus += 15;
                 }
             }
-            PlayerColor::Neutral => {}
+            PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
         }
     }
 

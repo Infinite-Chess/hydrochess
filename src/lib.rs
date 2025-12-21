@@ -1,15 +1,26 @@
+use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use wasm_bindgen::prelude::*;
 
+pub mod attacks;
 pub mod board;
 pub mod evaluation;
 pub mod game;
 pub mod moves;
 pub mod search;
+pub mod simd;
+pub mod tiles;
 mod utils;
 
-use crate::moves::{set_world_bounds, SpatialIndices};
+// Initialize panic hook for better error messages in WASM
+// This will show actual line numbers instead of just "unreachable"
+#[cfg(feature = "debug")]
+#[wasm_bindgen(start)]
+fn init_panic_hook() {
+    console_error_panic_hook::set_once();
+}
+
+use crate::moves::{SpatialIndices, set_world_bounds};
 use board::{Board, Coordinate, Piece, PieceType, PlayerColor};
 use evaluation::calculate_initial_material;
 use game::{EnPassantState, GameState};
@@ -69,10 +80,65 @@ extern "C" {
     pub fn log(s: &str);
 }
 
-// #[wasm_bindgen]
-// pub fn init_panic_hook() {
-//     utils::set_panic_hook();
-// }
+// ============================================================================
+// Shared TT WASM Bindings (for Lazy SMP with SharedArrayBuffer)
+// ============================================================================
+
+/// Size of the shared TT in u64 words (32MB = 4M words at 8 bytes each)
+#[cfg(feature = "multithreading")]
+const SHARED_TT_SIZE_WORDS: usize = 32 * 1024 * 1024 / 8;
+
+/// Size of work queue in u64 words (header + 256 moves * 6 words each)
+#[cfg(feature = "multithreading")]
+const WORK_QUEUE_SIZE_WORDS: usize = 6 + 256 * 6; // ~12KB
+
+/// Static buffer for shared TT - lives in WASM linear memory
+/// When WASM memory is backed by SharedArrayBuffer, all workers share this
+#[cfg(feature = "multithreading")]
+static mut SHARED_TT_BUFFER: [u64; SHARED_TT_SIZE_WORDS] = [0u64; SHARED_TT_SIZE_WORDS];
+
+/// Static buffer for work queue - for root move splitting
+#[cfg(feature = "multithreading")]
+static mut SHARED_WORK_QUEUE: [u64; WORK_QUEUE_SIZE_WORDS] = [0u64; WORK_QUEUE_SIZE_WORDS];
+
+/// Get the pointer to the shared TT buffer in WASM memory.
+/// JavaScript can use this with the WASM memory buffer to share between workers.
+#[cfg(feature = "multithreading")]
+#[wasm_bindgen]
+pub fn get_shared_tt_ptr() -> u32 {
+    unsafe { SHARED_TT_BUFFER.as_ptr() as u32 }
+}
+
+/// Get the size of the shared TT buffer in u64 words.
+#[cfg(feature = "multithreading")]
+#[wasm_bindgen]
+pub fn get_shared_tt_size() -> u32 {
+    SHARED_TT_SIZE_WORDS as u32
+}
+
+/// Initialize the shared TT view in search module.
+/// Call this after WASM is loaded to set up TT for search.
+#[cfg(feature = "multithreading")]
+#[wasm_bindgen]
+pub fn init_shared_tt() {
+    let ptr = unsafe { SHARED_TT_BUFFER.as_mut_ptr() };
+    let len = SHARED_TT_SIZE_WORDS;
+
+    // Store in the search module's thread-local state
+    search::set_shared_tt_ptr(ptr, len);
+
+    // Also initialize work queue
+    let wq_ptr = unsafe { SHARED_WORK_QUEUE.as_mut_ptr() };
+    let wq_len = WORK_QUEUE_SIZE_WORDS;
+    search::set_shared_work_queue_ptr(wq_ptr, wq_len);
+
+    log(&format!(
+        "[WASM] Shared TT initialized: {} words ({} MB) at {:p}",
+        len,
+        (len * 8) / (1024 * 1024),
+        ptr
+    ));
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct JsMove {
@@ -207,6 +273,9 @@ pub struct Engine {
 impl Engine {
     #[wasm_bindgen(constructor)]
     pub fn new(json_state: JsValue) -> Result<Engine, JsValue> {
+        // Initialize magic bitboards for O(1) slider attacks
+        // crate::tiles::magic::init();
+
         let js_game: JsFullGame = serde_wasm_bindgen::from_value(json_state)?;
 
         // If this looks like a fresh game, clear any persistent search/TT state.
@@ -245,7 +314,7 @@ impl Engine {
         let js_turn = PlayerColor::from_str(&js_game.turn).unwrap_or(PlayerColor::White);
 
         // Parse initial special rights (castling + pawn double-move)
-        let mut special_rights = HashSet::new();
+        let mut special_rights = FxHashSet::default();
         for sr in js_game.special_rights {
             let parts: Vec<&str> = sr.split(',').collect();
             if parts.len() == 2 {
@@ -337,8 +406,8 @@ impl Engine {
             turn: js_turn,
             special_rights,
             en_passant: None,
-            halfmove_clock: 0,
-            fullmove_number: 1,
+            halfmove_clock: js_game.halfmove_clock,
+            fullmove_number: 1, // Final value set from JS after history replay
             material_score: 0,
             game_rules,
             variant: js_game
@@ -350,23 +419,33 @@ impl Engine {
             null_moves: 0,
             white_piece_count: 0,
             black_piece_count: 0,
+            white_pawn_count: 0,
+            black_pawn_count: 0,
             starting_white_pieces: 0,
             starting_black_pieces: 0,
             white_pieces: Vec::new(),
             black_pieces: Vec::new(),
             spatial_indices: SpatialIndices::default(),
-            starting_squares: std::collections::HashSet::new(),
+            starting_squares: FxHashSet::default(),
             white_back_rank,
             black_back_rank,
             white_promo_rank,
             black_promo_rank,
+            white_king_pos: None,
+            black_king_pos: None,
+            pawn_hash: 0,
+            nonpawn_hash: 0,
+            material_hash: 0,
+            repetition: 0,
+            white_non_pawn_material: false,
+            black_non_pawn_material: false,
         };
 
         game.material_score = calculate_initial_material(&game.board);
         game.recompute_piece_counts(); // Rebuild piece lists and counts
         game.init_starting_piece_counts(); // Cache starting non-pawn piece counts for phase detection
-                                           // Initialize development starting squares from the initial board
-                                           // before replaying move history.
+        // Initialize development starting squares from the initial board
+        // before replaying move history.
         game.init_starting_squares();
         game.recompute_hash(); // Compute initial hash from position
 
@@ -396,13 +475,9 @@ impl Engine {
                     game.make_move_coords(from_x, from_y, to_x, to_y, promo);
                 }
             }
-            // After replay, GameState.turn, clocks, and en_passant have been
-            // updated naturally by make_move_coords.
         }
 
-        // Always use the clocks passed from JS, as they reflect the authoritative state
-        // (e.g. edited counters in board editor, or simple synchronization).
-        game.halfmove_clock = js_game.halfmove_clock;
+        // Apply target fullmove number from JS (the "end" value)
         game.fullmove_number = if js_game.fullmove_number == 0 {
             1
         } else {
@@ -562,6 +637,7 @@ impl Engine {
 
     /// Timed search. This also exposes the search evaluation as an `eval` field alongside the move,
     /// so callers can reuse the same search for adjudication.
+    /// thread_id is used for Lazy SMP - helper threads (id > 0) skip the first move.
     #[wasm_bindgen]
     pub fn get_best_move_with_time(
         &mut self,
@@ -569,6 +645,7 @@ impl Engine {
         silent: Option<bool>,
         max_depth: Option<usize>,
         noise_amp: Option<i32>,
+        thread_id: Option<u32>,
     ) -> JsValue {
         let effective_limit = if time_limit_ms == 0 && max_depth.is_some() {
             // If explicit depth is requested with 0 time, treat as infinite time (fixed depth search)
@@ -644,6 +721,7 @@ impl Engine {
         }
 
         // Choose search path based on effective noise.
+        let tid = thread_id.unwrap_or(0) as usize;
         let (best_move, eval) = if effective_noise > 0 {
             // Use noisy search
             if let Some((bm, ev, _stats)) = search::get_best_move_with_noise(
@@ -658,9 +736,9 @@ impl Engine {
                 return JsValue::NULL;
             }
         } else {
-            // Normal search (no noise)
+            // Normal search with thread_id for Lazy SMP
             if let Some((bm, ev, _stats)) =
-                search::get_best_move(&mut self.game, depth, effective_limit, silent)
+                search::get_best_move_threaded(&mut self.game, depth, effective_limit, silent, tid)
             {
                 (bm, ev)
             } else {

@@ -1,5 +1,18 @@
 use crate::board::{Board, Coordinate, PieceType, PlayerColor};
 use crate::game::GameState;
+use rustc_hash::FxHashMap;
+use std::cell::RefCell;
+
+// Thread-local pawn structure cache: pawn_hash -> evaluation score
+// This avoids recomputing pawn structure for positions with identical pawn configurations.
+thread_local! {
+    static PAWN_CACHE: RefCell<FxHashMap<u64, i32>> = RefCell::new(FxHashMap::default());
+}
+
+/// Clear the pawn structure cache. Call at the start of a new game.
+pub fn clear_pawn_cache() {
+    PAWN_CACHE.with(|cache| cache.borrow_mut().clear());
+}
 
 #[cfg(feature = "eval_tuning")]
 use once_cell::sync::Lazy;
@@ -216,7 +229,10 @@ const DEVELOPED_PHASE_ATTACK_SCALE: i32 = 100;
 #[inline]
 fn calculate_game_phase(game: &GameState) -> i32 {
     // Use the cached counts from GameState (set at game start, updated by make/undo)
-    let current_pieces = (game.white_piece_count + game.black_piece_count) as i32;
+    // We only count non-pawn pieces for game phase.
+    let current_pieces = (game.white_piece_count.saturating_sub(game.white_pawn_count)
+        + game.black_piece_count.saturating_sub(game.black_pawn_count))
+        as i32;
     let starting_pieces = (game.starting_white_pieces + game.starting_black_pieces) as i32;
 
     if starting_pieces == 0 {
@@ -233,15 +249,17 @@ pub fn compute_cloud_center(board: &Board) -> Option<Coordinate> {
     let mut sum_y: i64 = 0;
     let mut count: i64 = 0;
 
-    for ((x, y), piece) in &board.pieces {
-        if piece.piece_type() != PieceType::Void
-            && piece.piece_type() != PieceType::Obstacle
-            && piece.piece_type() != PieceType::Pawn
-        {
-            sum_x += *x;
-            sum_y += *y;
-            count += 1;
+    // BITBOARD: O(1) per tile summation using bitwise helpers
+    for (cx, cy, tile) in board.tiles.iter() {
+        let bits = tile.occ_all & !tile.occ_void & !tile.occ_pawns;
+        if bits == 0 {
+            continue;
         }
+
+        let n = bits.count_ones() as i64;
+        sum_x += n * cx * 8 + tile.sum_lx(bits) as i64;
+        sum_y += n * cy * 8 + tile.sum_ly(bits) as i64;
+        count += n;
     }
 
     if count > 0 {
@@ -256,21 +274,102 @@ pub fn compute_cloud_center(board: &Board) -> Option<Coordinate> {
 
 // ==================== Main Evaluation ====================
 
-pub fn evaluate(game: &GameState) -> i32 {
-    // Check for insufficient material draw
-    if is_insufficient_material(&game.board) {
-        return 0;
+/// Lazy evaluation: Material + Simple Position (PST)
+/// Used for Null Move Pruning and other heuristics where speed is critical.
+pub fn evaluate_lazy(game: &GameState) -> i32 {
+    let mut score = game.material_score;
+
+    // BITBOARD: Use tile-based CTZ iteration for O(popcount) positional scoring
+    for (cx, cy, tile) in game.board.tiles.iter() {
+        // SIMD: Fast skip empty tiles
+        if crate::simd::both_zero(tile.occ_white, tile.occ_black) {
+            continue;
+        }
+
+        let mut bits = tile.occ_all;
+        while bits != 0 {
+            let idx = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+
+            let packed = tile.piece[idx];
+            if packed == 0 {
+                continue;
+            }
+            let piece = crate::board::Piece::from_packed(packed);
+
+            let mut positional_bonus = 0;
+            let x = cx * 8 + (idx % 8) as i64;
+            let y = cy * 8 + (idx / 8) as i64;
+
+            match piece.piece_type() {
+                PieceType::Pawn => {
+                    let rank = y;
+                    let promotion_rank = if piece.color() == PlayerColor::White {
+                        game.white_promo_rank
+                    } else {
+                        game.black_promo_rank
+                    };
+                    let distance_to_promo = (promotion_rank - rank).abs();
+                    if distance_to_promo < 6 {
+                        positional_bonus += (6 - distance_to_promo) as i32 * 5;
+                    }
+                    if x >= 2 && x <= 5 {
+                        positional_bonus += 5;
+                    }
+                }
+                PieceType::Knight | PieceType::Bishop => {
+                    if x >= 2 && x <= 5 && y >= 2 && y <= 5 {
+                        positional_bonus += 10;
+                    }
+                }
+                _ => {
+                    if x >= 2 && x <= 5 && y >= 2 && y <= 5 {
+                        positional_bonus += 2;
+                    }
+                }
+            }
+
+            if piece.color() == PlayerColor::White {
+                score += positional_bonus;
+            } else {
+                score -= positional_bonus;
+            }
+        }
     }
 
+    if game.turn == PlayerColor::Black {
+        -score
+    } else {
+        score
+    }
+}
+
+pub fn evaluate(game: &GameState) -> i32 {
+    // Check for insufficient material draw
+    match crate::evaluation::insufficient_material::evaluate_insufficient_material(game) {
+        Some(0) => return 0, // Dead draw
+        Some(divisor) => {
+            // Drawish - dampen eval
+            return evaluate_inner(game) / divisor;
+        }
+        None => {} // Sufficient - continue to normal eval
+    }
+
+    evaluate_inner(game)
+}
+
+/// Core evaluation logic - skips insufficient material check
+#[inline]
+fn evaluate_inner(game: &GameState) -> i32 {
     // Start with material score
     let mut score = game.material_score;
 
-    // Find king positions
-    let (white_king, black_king) = find_kings(&game.board);
+    // Use cached king positions (O(1) instead of O(n) board scan)
+    let (white_king, black_king) = (game.white_king_pos, game.black_king_pos);
 
     // Check for endgame with lone king
-    let white_only_king = is_lone_king(&game.board, PlayerColor::White);
-    let black_only_king = is_lone_king(&game.board, PlayerColor::Black);
+    let white_only_king = is_lone_king(game, PlayerColor::White);
+    let black_only_king = is_lone_king(game, PlayerColor::Black);
 
     // Check if attacking side has promotable pawns - if so, prioritize promotion over mating net
     let white_has_promotable_pawn =
@@ -319,25 +418,6 @@ pub fn evaluate(game: &GameState) -> i32 {
 
 // ==================== Piece Evaluation ====================
 
-/// Count undeveloped minor pieces (knights/bishops) for a color
-fn count_undeveloped_minors(game: &GameState, color: PlayerColor) -> i32 {
-    let mut count = 0;
-    for ((x, y), piece) in &game.board.pieces {
-        if piece.color() != color {
-            continue;
-        }
-        match piece.piece_type() {
-            PieceType::Knight | PieceType::Bishop => {
-                if game.starting_squares.contains(&Coordinate::new(*x, *y)) {
-                    count += 1;
-                }
-            }
-            _ => {}
-        }
-    }
-    count
-}
-
 pub fn evaluate_pieces(
     game: &GameState,
     white_king: &Option<Coordinate>,
@@ -345,20 +425,92 @@ pub fn evaluate_pieces(
 ) -> i32 {
     let mut score: i32 = 0;
 
-    // let white_back_rank = game.white_back_rank;
-    // let black_back_rank = game.black_back_rank;
     let white_promo_rank = game.white_promo_rank;
     let black_promo_rank = game.black_promo_rank;
 
-    // Calculate GAME PHASE based on piece count (not pawns)
-    // 100 = opening (full pieces), 0 = pure endgame
     let game_phase = calculate_game_phase(game);
-    let is_opening = game_phase >= MIDDLEGAME_PIECE_THRESHOLD; // >= 70%
-    let is_endgame = game_phase < ENDGAME_PIECE_THRESHOLD; // < 30%
+    let is_opening = game_phase >= MIDDLEGAME_PIECE_THRESHOLD;
+    let is_endgame = game_phase < ENDGAME_PIECE_THRESHOLD;
 
-    // Determine development status for attack scaling
-    let white_undeveloped = count_undeveloped_minors(game, PlayerColor::White);
-    let black_undeveloped = count_undeveloped_minors(game, PlayerColor::Black);
+    // BITBOARD: Pass 1 - Single metadata collection
+    let mut white_undeveloped = 0;
+    let mut black_undeveloped = 0;
+    let mut white_bishops = 0;
+    let mut black_bishops = 0;
+    let mut white_bishop_colors: (bool, bool) = (false, false);
+    let mut black_bishop_colors: (bool, bool) = (false, false);
+    let mut cloud_sum_x: i64 = 0;
+    let mut cloud_sum_y: i64 = 0;
+    let mut cloud_count: i64 = 0;
+
+    for (cx, cy, tile) in game.board.tiles.iter() {
+        // SIMD: Fast skip empty tiles using parallel zero check
+        if crate::simd::both_zero(tile.occ_white, tile.occ_black) {
+            continue;
+        }
+
+        let cloud_bits = tile.occ_all & !tile.occ_void & !tile.occ_pawns;
+        if cloud_bits != 0 {
+            let n = cloud_bits.count_ones() as i64;
+            cloud_sum_x += n * cx * 8 + tile.sum_lx(cloud_bits) as i64;
+            cloud_sum_y += n * cy * 8 + tile.sum_ly(cloud_bits) as i64;
+            cloud_count += n;
+        }
+
+        let w_minors = tile.occ_white & (tile.occ_knights | tile.occ_bishops);
+        if w_minors != 0 {
+            let mut bits = w_minors;
+            while bits != 0 {
+                let idx = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let x = cx * 8 + (idx % 8) as i64;
+                let y = cy * 8 + (idx / 8) as i64;
+                if game.starting_squares.contains(&Coordinate::new(x, y)) {
+                    white_undeveloped += 1;
+                }
+                if ((1 << idx) & tile.occ_bishops) != 0 {
+                    white_bishops += 1;
+                    if (x + y) % 2 == 0 {
+                        white_bishop_colors.0 = true;
+                    } else {
+                        white_bishop_colors.1 = true;
+                    }
+                }
+            }
+        }
+
+        let b_minors = tile.occ_black & (tile.occ_knights | tile.occ_bishops);
+        if b_minors != 0 {
+            let mut bits = b_minors;
+            while bits != 0 {
+                let idx = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let x = cx * 8 + (idx % 8) as i64;
+                let y = cy * 8 + (idx / 8) as i64;
+                if game.starting_squares.contains(&Coordinate::new(x, y)) {
+                    black_undeveloped += 1;
+                }
+                if ((1 << idx) & tile.occ_bishops) != 0 {
+                    black_bishops += 1;
+                    if (x + y) % 2 == 0 {
+                        black_bishop_colors.0 = true;
+                    } else {
+                        black_bishop_colors.1 = true;
+                    }
+                }
+            }
+        }
+    }
+
+    let cloud_center = if cloud_count > 0 {
+        Some(Coordinate {
+            x: cloud_sum_x / cloud_count,
+            y: cloud_sum_y / cloud_count,
+        })
+    } else {
+        None
+    };
+
     let white_attack_scale = if white_undeveloped >= UNDEVELOPED_MINORS_THRESHOLD {
         DEVELOPMENT_PHASE_ATTACK_SCALE
     } else {
@@ -370,303 +522,243 @@ pub fn evaluate_pieces(
         DEVELOPED_PHASE_ATTACK_SCALE
     };
 
-    let mut white_bishops = 0;
-    let mut black_bishops = 0;
-    let mut white_bishop_colors: (bool, bool) = (false, false); // (light, dark)
-    let mut black_bishop_colors: (bool, bool) = (false, false);
+    // BITBOARD: Pass 2 - Main evaluation
+    for (cx, cy, tile) in game.board.tiles.iter() {
+        // SIMD: Fast skip empty tiles
+        if crate::simd::both_zero(tile.occ_white, tile.occ_black) {
+            continue;
+        }
 
-    let cloud_center: Option<Coordinate> = compute_cloud_center(&game.board);
-    for ((x, y), piece) in &game.board.pieces {
-        let mut piece_score = match piece.piece_type() {
-            PieceType::Rook => evaluate_rook(game, *x, *y, piece.color(), white_king, black_king),
-            PieceType::Queen => evaluate_queen(game, *x, *y, piece.color(), white_king, black_king),
-            PieceType::Knight => evaluate_knight(*x, *y, piece.color(), black_king, white_king),
-            PieceType::Bishop => {
-                if piece.color() == PlayerColor::White {
-                    white_bishops += 1;
-                    if (*x + *y) % 2 == 0 {
-                        white_bishop_colors.0 = true;
+        let mut bits = tile.occ_all;
+        while bits != 0 {
+            let idx = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+
+            let packed = tile.piece[idx];
+            if packed == 0 {
+                continue;
+            }
+            let piece = crate::board::Piece::from_packed(packed);
+            let x = cx * 8 + (idx % 8) as i64;
+            let y = cy * 8 + (idx / 8) as i64;
+
+            let mut piece_score = match piece.piece_type() {
+                PieceType::Rook => evaluate_rook(game, x, y, piece.color(), white_king, black_king),
+                PieceType::Queen => {
+                    evaluate_queen(game, x, y, piece.color(), white_king, black_king)
+                }
+                PieceType::Knight => evaluate_knight(x, y, piece.color(), black_king, white_king),
+                PieceType::Bishop => {
+                    evaluate_bishop(game, x, y, piece.color(), white_king, black_king)
+                }
+                PieceType::Pawn => {
+                    let pawn_eval = evaluate_pawn_position(
+                        x,
+                        y,
+                        piece.color(),
+                        white_promo_rank,
+                        black_promo_rank,
+                    );
+                    if is_opening {
+                        if x >= 3 && x <= 6 { 5 } else { 0 }
+                    } else if is_endgame {
+                        pawn_eval
                     } else {
-                        white_bishop_colors.1 = true;
+                        let scale = 100
+                            - ((game_phase - ENDGAME_PIECE_THRESHOLD) * 100
+                                / (MIDDLEGAME_PIECE_THRESHOLD - ENDGAME_PIECE_THRESHOLD));
+                        pawn_eval * scale / 100
                     }
-                } else {
-                    black_bishops += 1;
-                    if (*x + *y) % 2 == 0 {
-                        black_bishop_colors.0 = true;
+                }
+                PieceType::Chancellor => {
+                    let rook_eval =
+                        evaluate_rook(game, x, y, piece.color(), white_king, black_king);
+                    let ek = if piece.color() == PlayerColor::White {
+                        black_king
                     } else {
-                        black_bishop_colors.1 = true;
+                        white_king
+                    };
+                    let mut b = 0;
+                    if let Some(k) = ek {
+                        let d = (x - k.x).abs() + (y - k.y).abs();
+                        if d <= 4 {
+                            b = 15;
+                        } else if d <= 8 {
+                            b = 8;
+                        }
                     }
+                    (rook_eval * CHANCELLOR_ROOK_SCALE / 100) + b
                 }
-                evaluate_bishop(game, *x, *y, piece.color(), white_king, black_king)
-            }
-            PieceType::Pawn => {
-                // Phase-based pawn evaluation:
-                // Opening: NO advancement bonus, only central pawn preference
-                // Middlegame: Partial advancement bonus
-                // Endgame: Full pawn evaluation
-                let pawn_eval = evaluate_pawn_position(
-                    *x,
-                    *y,
-                    piece.color(),
-                    white_promo_rank,
-                    black_promo_rank,
-                );
-
-                if is_opening {
-                    // In opening: only value central pawns, no advancement bonus
-                    // The central pawn bonus is applied in evaluate_pawn_position
-                    // Just check if pawn is central
-                    if *x >= 3 && *x <= 6 {
-                        5 // Small bonus for central pawns only
+                PieceType::Archbishop => {
+                    let bishop_eval =
+                        evaluate_bishop(game, x, y, piece.color(), white_king, black_king);
+                    let ek = if piece.color() == PlayerColor::White {
+                        black_king
                     } else {
-                        0 // Side pawns get NO value in opening
+                        white_king
+                    };
+                    let mut b = 0;
+                    if let Some(k) = ek {
+                        let d = (x - k.x).abs() + (y - k.y).abs();
+                        if d <= 4 {
+                            b = 15;
+                        } else if d <= 8 {
+                            b = 8;
+                        }
                     }
-                } else if is_endgame {
-                    pawn_eval // Full pawn value in endgame
-                } else {
-                    // Middlegame: scale pawn eval by phase
-                    // phase 70 -> 0%, phase 30 -> 100%
-                    let scale = 100
-                        - ((game_phase - ENDGAME_PIECE_THRESHOLD) * 100
-                            / (MIDDLEGAME_PIECE_THRESHOLD - ENDGAME_PIECE_THRESHOLD));
-                    pawn_eval * scale / 100
+                    (bishop_eval * ARCHBISHOP_BISHOP_SCALE / 100) + b
                 }
-            }
-
-            // ===== Fairy Pieces =====
-
-            // Chancellor (R+N): High-value attacking piece
-            // Uses rook eval for slider attacks, plus bonus for being near enemy king
-            // Does NOT get knight defensive bonus - should be attacking!
-            PieceType::Chancellor => {
-                let rook_eval = evaluate_rook(game, *x, *y, piece.color(), white_king, black_king);
-                // Only enemy king tropism, no defensive bonus
-                let enemy_king = if piece.color() == PlayerColor::White {
-                    black_king
-                } else {
-                    white_king
-                };
-                let mut attack_bonus = 0;
-                if let Some(ek) = enemy_king {
-                    let dist = (*x - ek.x).abs() + (*y - ek.y).abs();
-                    if dist <= 4 {
-                        attack_bonus = 15; // Near enemy king = fork potential
-                    } else if dist <= 8 {
-                        attack_bonus = 8;
+                PieceType::Amazon => {
+                    let queen_eval =
+                        evaluate_queen(game, x, y, piece.color(), white_king, black_king);
+                    let rook_eval =
+                        evaluate_rook(game, x, y, piece.color(), white_king, black_king);
+                    let ek = if piece.color() == PlayerColor::White {
+                        black_king
+                    } else {
+                        white_king
+                    };
+                    let mut b = 0;
+                    if let Some(k) = ek {
+                        let d = (x - k.x).abs() + (y - k.y).abs();
+                        if d <= 4 {
+                            b = 20;
+                        } else if d <= 8 {
+                            b = 10;
+                        }
                     }
+                    (queen_eval * AMAZON_QUEEN_SCALE / 100)
+                        + (rook_eval * AMAZON_ROOK_SCALE / 100)
+                        + b
                 }
-                (rook_eval * CHANCELLOR_ROOK_SCALE / 100) + attack_bonus
-            }
-
-            // Archbishop (B+N): High-value attacking piece
-            // Uses bishop eval for slider attacks, plus bonus for being near enemy king
-            PieceType::Archbishop => {
-                let bishop_eval =
-                    evaluate_bishop(game, *x, *y, piece.color(), white_king, black_king);
-                let enemy_king = if piece.color() == PlayerColor::White {
-                    black_king
-                } else {
-                    white_king
-                };
-                let mut attack_bonus = 0;
-                if let Some(ek) = enemy_king {
-                    let dist = (*x - ek.x).abs() + (*y - ek.y).abs();
-                    if dist <= 4 {
-                        attack_bonus = 15;
-                    } else if dist <= 8 {
-                        attack_bonus = 8;
-                    }
+                PieceType::RoyalQueen => {
+                    evaluate_queen(game, x, y, piece.color(), white_king, black_king)
                 }
-                (bishop_eval * ARCHBISHOP_BISHOP_SCALE / 100) + attack_bonus
-            }
-
-            // Amazon (Q+N): Highest value attacking piece
-            // Only attacking bonuses, no defensive knight logic
-            PieceType::Amazon => {
-                let queen_eval =
-                    evaluate_queen(game, *x, *y, piece.color(), white_king, black_king);
-                let rook_eval = evaluate_rook(game, *x, *y, piece.color(), white_king, black_king);
-                // Extra bonus for being near enemy king (massive fork potential)
-                let enemy_king = if piece.color() == PlayerColor::White {
-                    black_king
-                } else {
-                    white_king
-                };
-                let mut attack_bonus = 0;
-                if let Some(ek) = enemy_king {
-                    let dist = (*x - ek.x).abs() + (*y - ek.y).abs();
-                    if dist <= 4 {
-                        attack_bonus = 20;
-                    } else if dist <= 8 {
-                        attack_bonus = 10;
-                    }
+                PieceType::Knightrider => {
+                    evaluate_knightrider(x, y, piece.color(), white_king, black_king, &game.board)
                 }
-                (queen_eval * AMAZON_QUEEN_SCALE / 100)
-                    + (rook_eval * AMAZON_ROOK_SCALE / 100)
-                    + attack_bonus
-            }
-
-            // RoyalQueen: Same as queen
-            PieceType::RoyalQueen => {
-                evaluate_queen(game, *x, *y, piece.color(), white_king, black_king)
-            }
-
-            // Knightrider: Knight-ray mobility
-            PieceType::Knightrider => {
-                evaluate_knightrider(*x, *y, piece.color(), white_king, black_king, &game.board)
-            }
-
-            // Leapers (Hawk, Rose, Camel, Giraffe, Zebra, Centaur): Tropism-based positioning
-            PieceType::Hawk
-            | PieceType::Rose
-            | PieceType::Camel
-            | PieceType::Giraffe
-            | PieceType::Zebra => evaluate_leaper_positioning(
-                *x,
-                *y,
-                piece.color(),
-                white_king,
-                black_king,
-                cloud_center.as_ref(),
-                get_piece_value(piece.piece_type()),
-            ),
-
-            // Centaur / RoyalCentaur: Knight + Guard components
-            PieceType::Centaur | PieceType::RoyalCentaur => {
-                let knight_eval = evaluate_knight(*x, *y, piece.color(), black_king, white_king);
-                let leaper_eval = evaluate_leaper_positioning(
-                    *x,
-                    *y,
+                PieceType::Hawk
+                | PieceType::Rose
+                | PieceType::Camel
+                | PieceType::Giraffe
+                | PieceType::Zebra => evaluate_leaper_positioning(
+                    x,
+                    y,
                     piece.color(),
                     white_king,
                     black_king,
                     cloud_center.as_ref(),
                     get_piece_value(piece.piece_type()),
-                );
-                (knight_eval * CENTAUR_KNIGHT_SCALE / 100)
-                    + (leaper_eval * CENTAUR_GUARD_SCALE / 100)
-            }
-
-            // Huygen: Prime-distance slider, use tropism
-            PieceType::Huygen => evaluate_leaper_positioning(
-                *x,
-                *y,
-                piece.color(),
-                white_king,
-                black_king,
-                cloud_center.as_ref(),
-                get_piece_value(PieceType::Huygen),
-            ),
-
-            // Guard: King-like, positional
-            PieceType::Guard => evaluate_leaper_positioning(
-                *x,
-                *y,
-                piece.color(),
-                white_king,
-                black_king,
-                cloud_center.as_ref(),
-                get_piece_value(PieceType::Guard),
-            ),
-
-            _ => 0,
-        };
-
-        // Cloud penalty: pieces too far from piece centroid
-        // Scale by piece value - high value pieces far from action are worse
-        if let Some(center) = &cloud_center {
-            let cheb = (*x - center.x).abs().max((*y - center.y).abs());
-
-            if piece.piece_type() != PieceType::Pawn && !piece.piece_type().is_royal() {
-                if cheb > PIECE_CLOUD_CHEB_RADIUS {
-                    // Far from action - penalty scaled by piece value
-                    let piece_val = get_piece_value(piece.piece_type());
-                    let value_factor = (piece_val / 100).max(1);
-                    let excess =
-                        (cheb - PIECE_CLOUD_CHEB_RADIUS).min(PIECE_CLOUD_CHEB_MAX_EXCESS) as i32;
-                    let penalty = excess * CLOUD_PENALTY_PER_100_VALUE * value_factor;
-                    piece_score -= penalty;
+                ),
+                PieceType::Centaur | PieceType::RoyalCentaur => {
+                    let knight_eval = evaluate_knight(x, y, piece.color(), black_king, white_king);
+                    let leaper_eval = evaluate_leaper_positioning(
+                        x,
+                        y,
+                        piece.color(),
+                        white_king,
+                        black_king,
+                        cloud_center.as_ref(),
+                        get_piece_value(piece.piece_type()),
+                    );
+                    (knight_eval * CENTAUR_KNIGHT_SCALE / 100)
+                        + (leaper_eval * CENTAUR_GUARD_SCALE / 100)
                 }
-            }
-        }
+                PieceType::Huygen => evaluate_leaper_positioning(
+                    x,
+                    y,
+                    piece.color(),
+                    white_king,
+                    black_king,
+                    cloud_center.as_ref(),
+                    get_piece_value(PieceType::Huygen),
+                ),
+                PieceType::Guard => evaluate_leaper_positioning(
+                    x,
+                    y,
+                    piece.color(),
+                    white_king,
+                    black_king,
+                    cloud_center.as_ref(),
+                    get_piece_value(PieceType::Guard),
+                ),
+                _ => 0,
+            };
 
-        // Starting square penalty: encourage developing minors early
-        // Rooks and queens are exempt - they develop later (rooks via castling, queens after minors)
-        if piece.piece_type() != PieceType::Pawn && !piece.piece_type().is_royal() {
-            if game.starting_squares.contains(&Coordinate::new(*x, *y)) {
-                // Only minors should be penalized for not developing
-                let penalty = match piece.piece_type() {
-                    PieceType::Knight | PieceType::Bishop => MIN_DEVELOPMENT_PENALTY + 3,
-                    // Rooks develop via castling or when files open - no starting square penalty
-                    PieceType::Rook | PieceType::Queen => 0,
-                    // Fairy pieces with knight or bishop component should develop
-                    PieceType::Archbishop => MIN_DEVELOPMENT_PENALTY,
-                    // Others exempt (they're handled by cloud penalty if too far)
-                    _ => 0,
-                };
-                piece_score -= penalty;
-            }
-        }
-
-        // King defender logic: low-value pieces near own king = good, high-value = bad
-        let own_king = if piece.color() == PlayerColor::White {
-            &white_king
-        } else {
-            &black_king
-        };
-        if let Some(ok) = own_king {
-            if !piece.piece_type().is_royal() && piece.piece_type() != PieceType::Pawn {
-                let dist = (*x - ok.x).abs().max((*y - ok.y).abs()); // Chebyshev distance
-                let piece_val = get_piece_value(piece.piece_type());
-
-                if dist <= 3 {
-                    // Near own king
-                    if piece_val < KING_DEFENDER_VALUE_THRESHOLD {
-                        // Low-value piece = defensive, good
-                        piece_score += KING_DEFENDER_BONUS;
-                    } else {
-                        // High-value piece = should be attacking, not babysitting
-                        piece_score -= KING_ATTACKER_NEAR_OWN_KING_PENALTY;
+            if let Some(center) = &cloud_center {
+                let cheb = (x - center.x).abs().max((y - center.y).abs());
+                if piece.piece_type() != PieceType::Pawn && !piece.piece_type().is_royal() {
+                    if cheb > PIECE_CLOUD_CHEB_RADIUS {
+                        let piece_val = get_piece_value(piece.piece_type());
+                        let value_factor = (piece_val / 100).max(1);
+                        let excess = (cheb - PIECE_CLOUD_CHEB_RADIUS)
+                            .min(PIECE_CLOUD_CHEB_MAX_EXCESS)
+                            as i32;
+                        piece_score -= excess * CLOUD_PENALTY_PER_100_VALUE * value_factor;
                     }
                 }
             }
-        }
 
-        // Scale attack-focused pieces based on development phase
-        // When undeveloped, reduce attack bonuses to prioritize getting pieces into the game
-        let is_attacking_piece = matches!(
-            piece.piece_type(),
-            PieceType::Rook
-                | PieceType::Queen
-                | PieceType::RoyalQueen
-                | PieceType::Bishop
-                | PieceType::Chancellor
-                | PieceType::Archbishop
-                | PieceType::Amazon
-        );
-        if is_attacking_piece && piece_score > 0 {
-            // Only scale positive eval - we still want penalties to apply fully
-            let attack_scale = if piece.color() == PlayerColor::White {
-                white_attack_scale
+            if piece.piece_type() != PieceType::Pawn && !piece.piece_type().is_royal() {
+                if game.starting_squares.contains(&Coordinate::new(x, y)) {
+                    piece_score -= match piece.piece_type() {
+                        PieceType::Knight | PieceType::Bishop => MIN_DEVELOPMENT_PENALTY + 3,
+                        PieceType::Archbishop => MIN_DEVELOPMENT_PENALTY,
+                        _ => 0,
+                    };
+                }
+            }
+
+            let own_king = if piece.color() == PlayerColor::White {
+                &white_king
             } else {
-                black_attack_scale
+                &black_king
             };
-            piece_score = piece_score * attack_scale / 100;
-        }
+            if let Some(ok) = own_king {
+                if !piece.piece_type().is_royal() && piece.piece_type() != PieceType::Pawn {
+                    let dist = (x - ok.x).abs().max((y - ok.y).abs());
+                    if dist <= 3 {
+                        if get_piece_value(piece.piece_type()) < KING_DEFENDER_VALUE_THRESHOLD {
+                            piece_score += KING_DEFENDER_BONUS;
+                        } else {
+                            piece_score -= KING_ATTACKER_NEAR_OWN_KING_PENALTY;
+                        }
+                    }
+                }
+            }
 
-        if piece.color() == PlayerColor::White {
-            score += piece_score;
-        } else {
-            score -= piece_score;
+            let is_attacking_piece = matches!(
+                piece.piece_type(),
+                PieceType::Rook
+                    | PieceType::Queen
+                    | PieceType::RoyalQueen
+                    | PieceType::Bishop
+                    | PieceType::Chancellor
+                    | PieceType::Archbishop
+                    | PieceType::Amazon
+            );
+            if is_attacking_piece && piece_score > 0 {
+                let attack_scale = if piece.color() == PlayerColor::White {
+                    white_attack_scale
+                } else {
+                    black_attack_scale
+                };
+                piece_score = piece_score * attack_scale / 100;
+            }
+
+            if piece.color() == PlayerColor::White {
+                score += piece_score;
+            } else {
+                score -= piece_score;
+            }
         }
     }
 
-    // Bishop pair bonus - even stronger if opposite colors
     if white_bishops >= 2 {
         score += BISHOP_PAIR_BONUS;
         bump_feat!(bishop_pair_bonus, 1);
         if white_bishop_colors.0 && white_bishop_colors.1 {
-            score += 20; // Extra bonus for opposite colored bishops
+            score += 20;
         }
     }
     if black_bishops >= 2 {
@@ -1058,7 +1150,7 @@ pub fn evaluate_pawn_position(
                 bonus += ((PAWN_FULL_VALUE_THRESHOLD - dist) as i32) * 4;
             }
         }
-        PlayerColor::Neutral => {}
+        PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
     }
 
     // Central pawns are valuable
@@ -1155,7 +1247,7 @@ fn evaluate_knightrider(
         let mut steps = 0;
         // Count empty squares along the knight-ray (max 5 steps for efficiency)
         while steps < 5 {
-            if board.get_piece(&nx, &ny).is_some() {
+            if board.get_piece(nx, ny).is_some() {
                 break;
             }
             steps += 1;
@@ -1229,7 +1321,7 @@ fn evaluate_king_shelter(game: &GameState, king: &Coordinate, color: PlayerColor
             }
             let cx = king.x + dx;
             let cy = king.y + dy;
-            if let Some(piece) = game.board.get_piece(&cx, &cy) {
+            if let Some(piece) = game.board.get_piece(cx, cy) {
                 if piece.color() == color {
                     if piece.piece_type() == PieceType::Pawn
                         || piece.piece_type() == PieceType::Guard
@@ -1250,32 +1342,49 @@ fn evaluate_king_shelter(game: &GameState, king: &Coordinate, color: PlayerColor
     // We look for pawns roughly on the same files as the king (+/- 2 files) to keep it local.
     let mut has_pawn_ahead = false;
     let mut has_pawn_behind = false;
-    for ((px, py), piece) in &game.board.pieces {
-        if piece.color() != color || piece.piece_type() != PieceType::Pawn {
+
+    // BITBOARD: Use tile-based pawn iteration
+    let is_white = color == PlayerColor::White;
+    for (cx, cy, tile) in game.board.tiles.iter() {
+        let color_pawns = tile.occ_pawns
+            & if is_white {
+                tile.occ_white
+            } else {
+                tile.occ_black
+            };
+        if color_pawns == 0 {
             continue;
         }
 
-        // Only consider pawns near the king in file-space
-        if (px - king.x).abs() > 2 {
-            continue;
-        }
+        let mut bits = color_pawns;
+        while bits != 0 {
+            let idx = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let px = cx * 8 + (idx % 8) as i64;
+            let py = cy * 8 + (idx / 8) as i64;
 
-        match color {
-            PlayerColor::White => {
-                if *py > king.y {
-                    has_pawn_ahead = true;
-                } else if *py < king.y {
-                    has_pawn_behind = true;
-                }
+            // Only consider pawns near the king in file-space
+            if (px - king.x).abs() > 2 {
+                continue;
             }
-            PlayerColor::Black => {
-                if *py < king.y {
-                    has_pawn_ahead = true;
-                } else if *py > king.y {
-                    has_pawn_behind = true;
+
+            match color {
+                PlayerColor::White => {
+                    if py > king.y {
+                        has_pawn_ahead = true;
+                    } else if py < king.y {
+                        has_pawn_behind = true;
+                    }
                 }
+                PlayerColor::Black => {
+                    if py < king.y {
+                        has_pawn_ahead = true;
+                    } else if py > king.y {
+                        has_pawn_behind = true;
+                    }
+                }
+                PlayerColor::Neutral => {}
             }
-            PlayerColor::Neutral => {}
         }
     }
 
@@ -1308,7 +1417,7 @@ fn evaluate_king_shelter(game: &GameState, king: &Coordinate, color: PlayerColor
         for _step in 0..8 {
             cx += dx;
             cy += dy;
-            if let Some(piece) = game.board.get_piece(&cx, &cy) {
+            if let Some(piece) = game.board.get_piece(cx, cy) {
                 // Friendly piece stops the ray and provides some cover
                 if piece.color() == color {
                     ray_open = false;
@@ -1332,39 +1441,48 @@ fn evaluate_king_shelter(game: &GameState, king: &Coordinate, color: PlayerColor
 
     // 3. Enemy sliders attacking king zone
     let mut enemy_slider_threats = 0;
-    for ((x, y), piece) in &game.board.pieces {
-        if piece.color() == color {
+    for (cx, cy, tile) in game.board.tiles.iter() {
+        let occ = if color == PlayerColor::White {
+            tile.occ_black
+        } else {
+            tile.occ_white
+        };
+        let sliders = occ & (tile.occ_ortho_sliders | tile.occ_diag_sliders);
+        if sliders == 0 {
             continue;
         }
 
-        match piece.piece_type() {
-            PieceType::Rook | PieceType::Bishop | PieceType::Queen | PieceType::Amazon => {
-                // First check: is the slider even roughly in line with the king?
-                let dx = x - king.x;
-                let dy = y - king.y;
+        let mut bits = sliders;
+        while bits != 0 {
+            let idx = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
 
-                let same_file = dx == 0;
-                let same_rank = dy == 0;
-                let same_diag = dx.abs() == dy.abs();
+            let x = cx * 8 + (idx % 8) as i64;
+            let y = cy * 8 + (idx / 8) as i64;
 
-                if !(same_file || same_rank || same_diag) {
-                    continue;
-                }
+            // First check: is the slider even roughly in line with the king?
+            let dx = x - king.x;
+            let dy = y - king.y;
 
-                // In infinite chess, ignore ridiculously far sliders for safety.
-                // King safety is local; cap at some reasonable radius (e.g. 32).
-                let chebyshev = dx.abs().max(dy.abs());
-                if chebyshev > 32 {
-                    continue;
-                }
+            let same_file = dx == 0;
+            let same_rank = dy == 0;
+            let same_diag = dx.abs() == dy.abs();
 
-                // Now use the O(#pieces) line-of-sight check instead of stepping square-by-square.
-                let from = Coordinate { x: *x, y: *y };
-                if is_clear_line_between(&game.board, &from, king) {
-                    enemy_slider_threats += 1;
-                }
+            if !(same_file || same_rank || same_diag) {
+                continue;
             }
-            _ => {}
+
+            // In infinite chess, ignore ridiculously far sliders for safety.
+            let chebyshev = dx.abs().max(dy.abs());
+            if chebyshev > 32 {
+                continue;
+            }
+
+            // Now use the O(#pieces) line-of-sight check
+            let from = Coordinate { x, y };
+            if is_clear_line_between(&game.board, &from, king) {
+                enemy_slider_threats += 1;
+            }
         }
     }
     safety -= enemy_slider_threats * KING_ENEMY_SLIDER_PENALTY;
@@ -1376,22 +1494,96 @@ fn evaluate_king_shelter(game: &GameState, king: &Coordinate, color: PlayerColor
 // ==================== Pawn Structure ====================
 
 pub fn evaluate_pawn_structure(game: &GameState) -> i32 {
+    // Check cache first using game's pawn_hash
+    let pawn_hash = game.pawn_hash;
+
+    let cached = PAWN_CACHE.with(|cache| cache.borrow().get(&pawn_hash).copied());
+
+    if let Some(score) = cached {
+        return score;
+    }
+
+    // Cache miss - compute pawn structure
+    let score = compute_pawn_structure(game);
+
+    // Store in cache (limit cache size to avoid unbounded growth)
+    PAWN_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        // Clear cache if it grows too large (simple LRU alternative)
+        if cache.len() > 16384 {
+            cache.clear();
+        }
+        cache.insert(pawn_hash, score);
+    });
+
+    score
+}
+
+/// Core pawn structure computation. Called on cache miss.
+fn compute_pawn_structure(game: &GameState) -> i32 {
     let mut score: i32 = 0;
 
     // Track pawns per file for each color
-    let mut white_pawn_files: Vec<i64> = Vec::new();
+    let mut white_pawn_files: Vec<i64> = Vec::new(); // For inter-tile doubled pawn check
     let mut black_pawn_files: Vec<i64> = Vec::new();
     let mut white_pawns: Vec<(i64, i64)> = Vec::new();
     let mut black_pawns: Vec<(i64, i64)> = Vec::new();
 
-    for ((x, y), piece) in &game.board.pieces {
-        if piece.piece_type() == PieceType::Pawn {
-            if piece.color() == PlayerColor::White {
-                white_pawn_files.push(*x);
-                white_pawns.push((*x, *y));
-            } else {
-                black_pawn_files.push(*x);
-                black_pawns.push((*x, *y));
+    // Column masks for bitwise doubled pawn check
+    const COL_MASKS: [u64; 8] = [
+        0x0101010101010101,
+        0x0202020202020202,
+        0x0404040404040404,
+        0x0808080808080808,
+        0x1010101010101010,
+        0x2020202020202020,
+        0x4040404040404040,
+        0x8080808080808080,
+    ];
+
+    // BITBOARD: Use per-tile occ_pawns for faster collection and intra-tile doubled checks
+    for (cx, cy, tile) in game.board.tiles.iter() {
+        let w_pawns = tile.occ_pawns & tile.occ_white;
+        let b_pawns = tile.occ_pawns & tile.occ_black;
+
+        if w_pawns != 0 {
+            // Intra-tile doubled pawn check
+            for mask in COL_MASKS {
+                let count = (w_pawns & mask).count_ones();
+                if count > 1 {
+                    score -= (count - 1) as i32 * DOUBLED_PAWN_PENALTY;
+                }
+                if count > 0 {
+                    white_pawn_files.push(cx * 8 + (mask.trailing_zeros() % 8) as i64);
+                }
+            }
+
+            // Collect for passed pawn check
+            let mut bits = w_pawns;
+            while bits != 0 {
+                let idx = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                white_pawns.push((cx * 8 + (idx % 8) as i64, cy * 8 + (idx / 8) as i64));
+            }
+        }
+
+        if b_pawns != 0 {
+            // Same for black
+            for mask in COL_MASKS {
+                let count = (b_pawns & mask).count_ones();
+                if count > 1 {
+                    score += (count - 1) as i32 * DOUBLED_PAWN_PENALTY;
+                }
+                if count > 0 {
+                    black_pawn_files.push(cx * 8 + (mask.trailing_zeros() % 8) as i64);
+                }
+            }
+
+            let mut bits = b_pawns;
+            while bits != 0 {
+                let idx = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                black_pawns.push((cx * 8 + (idx % 8) as i64, cy * 8 + (idx / 8) as i64));
             }
         }
     }
@@ -1458,53 +1650,51 @@ pub fn evaluate_pawn_structure(game: &GameState) -> i32 {
     score
 }
 
-pub fn find_kings(board: &Board) -> (Option<Coordinate>, Option<Coordinate>) {
-    let mut white_king: Option<Coordinate> = None;
-    let mut black_king: Option<Coordinate> = None;
-
-    for ((x, y), piece) in &board.pieces {
-        if piece.piece_type() == PieceType::King {
-            if piece.color() == PlayerColor::White {
-                white_king = Some(Coordinate { x: *x, y: *y });
-            } else {
-                black_king = Some(Coordinate { x: *x, y: *y });
-            }
-        }
-    }
-
-    (white_king, black_king)
-}
-
 /// Check if a side only has a king (no other pieces)
-pub fn is_lone_king(board: &Board, color: PlayerColor) -> bool {
-    for (_, piece) in &board.pieces {
-        if piece.color() == color && piece.piece_type() != PieceType::King {
-            return false;
-        }
+pub fn is_lone_king(game: &GameState, color: PlayerColor) -> bool {
+    if color == PlayerColor::White {
+        game.white_pawn_count == 0 && !game.white_non_pawn_material
+    } else if color == PlayerColor::Black {
+        game.black_pawn_count == 0 && !game.black_non_pawn_material
+    } else {
+        false
     }
-    true
 }
 
 /// Check if a side has any pawn that can still promote (not past the promotion rank)
 fn has_promotable_pawn(board: &Board, color: PlayerColor, promo_rank: i64) -> bool {
-    for ((_, y), piece) in &board.pieces {
-        if piece.color() != color || piece.piece_type() != PieceType::Pawn {
+    // BITBOARD: Use occ_pawns for fast pawn detection
+    let is_white = color == PlayerColor::White;
+    for (_cx, cy, tile) in board.tiles.iter() {
+        let color_pawns = tile.occ_pawns
+            & if is_white {
+                tile.occ_white
+            } else {
+                tile.occ_black
+            };
+        if color_pawns == 0 {
             continue;
         }
 
-        // Check if pawn is on the correct side of promotion rank
-        match color {
-            PlayerColor::White => {
-                if *y < promo_rank {
-                    return true; // Can still advance toward promotion
+        let mut bits = color_pawns;
+        while bits != 0 {
+            let idx = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let y = cy * 8 + (idx / 8) as i64;
+
+            match color {
+                PlayerColor::White => {
+                    if y < promo_rank {
+                        return true;
+                    }
                 }
-            }
-            PlayerColor::Black => {
-                if *y > promo_rank {
-                    return true;
+                PlayerColor::Black => {
+                    if y > promo_rank {
+                        return true;
+                    }
                 }
+                PlayerColor::Neutral => {}
             }
-            PlayerColor::Neutral => {}
         }
     }
     false
@@ -1516,12 +1706,32 @@ pub fn count_pawns_on_file(game: &GameState, file: i64, color: PlayerColor) -> (
     let mut own_pawns = 0;
     let mut enemy_pawns = 0;
 
-    for ((x, _), piece) in &game.board.pieces {
-        if *x == file && piece.piece_type() == PieceType::Pawn {
-            if piece.color() == color {
-                own_pawns += 1;
-            } else {
-                enemy_pawns += 1;
+    // BITBOARD: Only check the tile(s) that contain this file
+    let file_tile_x = file >> 3; // Which tile column contains this file
+    let local_x = (file & 7) as usize;
+
+    for (cx, _, tile) in game.board.tiles.iter() {
+        if cx != file_tile_x {
+            continue; // Skip tiles not on this file
+        }
+
+        // Check each row in the tile for pawns in the target column
+        for row in 0..8 {
+            let idx = row * 8 + local_x;
+            if (tile.occ_pawns >> idx) & 1 != 0 {
+                if (tile.occ_white >> idx) & 1 != 0 {
+                    if color == PlayerColor::White {
+                        own_pawns += 1;
+                    } else {
+                        enemy_pawns += 1;
+                    }
+                } else if (tile.occ_black >> idx) & 1 != 0 {
+                    if color == PlayerColor::Black {
+                        own_pawns += 1;
+                    } else {
+                        enemy_pawns += 1;
+                    }
+                }
             }
         }
     }
@@ -1549,7 +1759,7 @@ pub fn slider_mobility(
         for _ in 0..max_steps {
             cx += dx;
             cy += dy;
-            if board.get_piece(&cx, &cy).is_some() {
+            if board.get_piece(cx, cy).is_some() {
                 break;
             }
             count += 1;
@@ -1570,7 +1780,7 @@ pub fn is_clear_line_between(board: &Board, from: &Coordinate, to: &Coordinate) 
         return false;
     }
 
-    for ((px, py), _) in &board.pieces {
+    for ((px, py), _) in board.iter() {
         // Skip the endpoints themselves
         if *px == from.x && *py == from.y {
             continue;
@@ -1627,7 +1837,7 @@ pub fn evaluate_lone_king_endgame(
     }
     let mut sliders: Vec<SliderInfo> = Vec::new();
 
-    for ((x, y), piece) in &game.board.pieces {
+    for ((x, y), piece) in game.board.iter() {
         if piece.color() != winning_color || piece.piece_type().is_royal() {
             continue;
         }
@@ -1925,7 +2135,7 @@ pub fn evaluate_lone_king_endgame(
     // the evaluation really wants the short-range pieces to participate.
     let short_base_scale: i32 = if few_sliders { 6 } else { 3 };
 
-    for ((px, py), piece) in &game.board.pieces {
+    for ((px, py), piece) in game.board.iter() {
         if piece.color() != winning_color {
             continue;
         }
@@ -1988,7 +2198,7 @@ fn needs_king_for_mate(board: &Board, color: PlayerColor) -> bool {
     let mut hawks = 0;
     let mut guards = 0;
 
-    for (_, piece) in &board.pieces {
+    for (_, piece) in board.iter() {
         if piece.color() != color {
             continue;
         }
@@ -2066,443 +2276,44 @@ fn needs_king_for_mate(board: &Board, color: PlayerColor) -> bool {
     true
 }
 
-/// Check if a side has sufficient material to force checkmate in infinite chess.
-/// Based on the official insufficientmaterial.ts from infinitechess.org
-///
-/// Logic: This lists INSUFFICIENT scenarios. Anything not matching
-/// those scenarios is sufficient. We check if the current material fits within
-/// any insufficient scenario.
-pub fn has_sufficient_mating_material(
-    board: &Board,
-    color: PlayerColor,
-    has_our_king: bool,
-) -> bool {
-    let mut queens = 0;
-    let mut rooks = 0;
-    let mut bishops = 0;
-    let mut knights = 0;
-    let mut chancellors = 0;
-    let mut archbishops = 0;
-    let mut hawks = 0;
-    let mut guards = 0;
-    let mut pawns = 0;
-    let mut amazons = 0;
-    let mut knightriders = 0;
-    let mut huygens = 0;
-    let mut light_bishops = 0;
-    let mut dark_bishops = 0;
+pub fn calculate_initial_material(board: &Board) -> i32 {
+    let mut score: i32 = 0;
 
-    for ((x, y), piece) in &board.pieces {
-        if piece.color() != color {
+    // BITBOARD: Use tile-based CTZ iteration for O(popcount) scan
+    for (cx, cy, tile) in board.tiles.iter() {
+        // SIMD: Fast skip empty tiles
+        if crate::simd::both_zero(tile.occ_white, tile.occ_black) {
             continue;
         }
-        match piece.piece_type() {
-            PieceType::Queen | PieceType::RoyalQueen => queens += 1,
-            PieceType::Rook => rooks += 1,
-            PieceType::Bishop => {
-                bishops += 1;
-                if (x + y) % 2 == 0 {
-                    light_bishops += 1;
-                } else {
-                    dark_bishops += 1;
-                }
+
+        // Process white pieces
+        let mut white_bits = tile.occ_white;
+        while white_bits != 0 {
+            let idx = white_bits.trailing_zeros() as usize;
+            white_bits &= white_bits - 1;
+
+            let packed = tile.piece[idx];
+            if packed != 0 {
+                let piece = crate::board::Piece::from_packed(packed);
+                score += get_piece_value(piece.piece_type());
             }
-            PieceType::Knight => knights += 1,
-            PieceType::Chancellor => chancellors += 1,
-            PieceType::Archbishop => archbishops += 1,
-            PieceType::Hawk => hawks += 1,
-            PieceType::Guard => guards += 1,
-            PieceType::Pawn => pawns += 1,
-            PieceType::Amazon => amazons += 1,
-            PieceType::Knightrider => knightriders += 1,
-            PieceType::Huygen => huygens += 1,
-            _ => {}
-        }
-    }
-
-    // Amazon can always mate
-    if amazons >= 1 {
-        return true;
-    }
-
-    // Helper: check if we have "only" certain pieces (nothing else)
-    let has_only = |q: i32,
-                    r: i32,
-                    b: i32,
-                    n: i32,
-                    c: i32,
-                    a: i32,
-                    h: i32,
-                    g: i32,
-                    p: i32,
-                    s: i32,
-                    hu: i32|
-     -> bool {
-        queens <= q
-            && rooks <= r
-            && bishops <= b
-            && knights <= n
-            && chancellors <= c
-            && archbishops <= a
-            && hawks <= h
-            && guards <= g
-            && pawns <= p
-            && knightriders <= s
-            && huygens <= hu
-    };
-
-    // =====================================================================
-    // 1K vs 1k scenarios (with our king helping)
-    // These are INSUFFICIENT scenarios from insuffmatScenarios_1K1k
-    // =====================================================================
-    if has_our_king {
-        // {queensW: 1} - single queen insufficient
-        if queens == 1 && has_only(1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0) {
-            return false;
         }
 
-        // {bishopsW: [Inf, 1]} - any number of same-color bishops insufficient
-        if bishops > 0
-            && (light_bishops == 0 || dark_bishops == 0)
-            && has_only(0, 0, i32::MAX, 0, 0, 0, 0, 0, 0, 0, 0)
-        {
-            return false;
+        // Process black pieces
+        let mut black_bits = tile.occ_black;
+        while black_bits != 0 {
+            let idx = black_bits.trailing_zeros() as usize;
+            black_bits &= black_bits - 1;
+
+            let packed = tile.piece[idx];
+            if packed != 0 {
+                let piece = crate::board::Piece::from_packed(packed);
+                score -= get_piece_value(piece.piece_type());
+            }
         }
 
-        // {knightsW: 3} - up to 3 knights insufficient
-        if knights <= 3 && has_only(0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0) {
-            return false;
-        }
-
-        // {hawksW: 2} - 2 hawks insufficient
-        if hawks <= 2 && has_only(0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0) {
-            return false;
-        }
-
-        // {hawksW: 1, bishopsW: [1,0]} - hawk + same-color bishop
-        if hawks == 1
-            && bishops == 1
-            && (light_bishops == 0 || dark_bishops == 0)
-            && has_only(0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0)
-        {
-            return false;
-        }
-
-        // {rooksW: 1, knightsW: 1} - rook + knight insufficient
-        if rooks == 1 && knights == 1 && has_only(0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0) {
-            return false;
-        }
-
-        // {rooksW: 1, bishopsW: [1,0]} - rook + same-color bishop
-        if rooks == 1
-            && bishops == 1
-            && (light_bishops == 0 || dark_bishops == 0)
-            && has_only(0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0)
-        {
-            return false;
-        }
-
-        // {rooksW: 1, rooksB: 1} - rook vs rook (but we only count our pieces, so skip)
-
-        // {archbishopsW: 1, bishopsW: [1,0]} - archbishop + same-color bishop
-        if archbishops == 1
-            && bishops == 1
-            && (light_bishops == 0 || dark_bishops == 0)
-            && has_only(0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0)
-        {
-            return false;
-        }
-
-        // {archbishopsW: 1, knightsW: 1} - archbishop + knight
-        if archbishops == 1 && knights == 1 && has_only(0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0) {
-            return false;
-        }
-
-        // {knightsW: 1, bishopsW: [Inf, 0]} - knight + any same-color bishops
-        if knights == 1
-            && bishops > 0
-            && (light_bishops == 0 || dark_bishops == 0)
-            && has_only(0, 0, i32::MAX, 1, 0, 0, 0, 0, 0, 0, 0)
-        {
-            return false;
-        }
-
-        // {knightsW: 1, bishopsW: [1,1]} - knight + one of each bishop color
-        if knights == 1
-            && light_bishops == 1
-            && dark_bishops == 1
-            && has_only(0, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0)
-        {
-            return false;
-        }
-
-        // {knightsW: 2, bishopsW: [1,0]} - 2 knights + same-color bishop
-        if knights == 2
-            && bishops == 1
-            && (light_bishops == 0 || dark_bishops == 0)
-            && has_only(0, 0, 1, 2, 0, 0, 0, 0, 0, 0, 0)
-        {
-            return false;
-        }
-
-        // {guardsW: 1} - single guard insufficient
-        if guards == 1 && has_only(0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0) {
-            return false;
-        }
-
-        // {chancellorsW: 1} - single chancellor insufficient
-        if chancellors == 1 && has_only(0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0) {
-            return false;
-        }
-
-        // {knightridersW: 2} - 2 knightriders insufficient
-        if knightriders <= 2 && has_only(0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0) {
-            return false;
-        }
-
-        // {pawnsW: 3} - up to 3 pawns insufficient
-        if pawns <= 3 && has_only(0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0) {
-            return false;
-        }
-
-        // Everything else with king is sufficient
-        return true;
-    }
-
-    // =====================================================================
-    // 0K vs 1k scenarios (without our king)
-    // These are INSUFFICIENT scenarios from insuffmatScenarios_0K1k
-    // Anything NOT in this list is sufficient
-    // =====================================================================
-
-    // {queensW: 1, rooksW: 1}
-    if queens == 1 && rooks == 1 && has_only(1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0) {
-        return false;
-    }
-
-    // {queensW: 1, knightsW: 1}
-    if queens == 1 && knights == 1 && has_only(1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0) {
-        return false;
-    }
-
-    // {queensW: 1, bishopsW: [1,0]}
-    if queens == 1
-        && bishops == 1
-        && (light_bishops == 0 || dark_bishops == 0)
-        && has_only(1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0)
-    {
-        return false;
-    }
-
-    // {queensW: 1, pawnsW: 1}
-    if queens == 1 && pawns == 1 && has_only(1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0) {
-        return false;
-    }
-
-    // {bishopsW: [2,2]} - 2 light + 2 dark bishops
-    if light_bishops == 2 && dark_bishops == 2 && has_only(0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0) {
-        return false;
-    }
-
-    // {bishopsW: [Inf, 1]} - any number of one color + 1 of other
-    if bishops > 0
-        && (light_bishops == 0
-            || dark_bishops == 0
-            || (light_bishops <= 1 && dark_bishops > 0)
-            || (dark_bishops <= 1 && light_bishops > 0))
-        && has_only(0, 0, i32::MAX, 0, 0, 0, 0, 0, 0, 0, 0)
-    {
-        // Actually: [Inf, 1] means unlimited of one color, at most 1 of the other
-        if (light_bishops == 0 || dark_bishops <= 1) && (dark_bishops == 0 || light_bishops <= 1) {
-            return false;
-        }
-    }
-
-    // {knightsW: 4}
-    if knights <= 4 && has_only(0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0) {
-        return false;
-    }
-
-    // {knightsW: 2, bishopsW: [Inf, 0]}
-    if knights <= 2
-        && bishops > 0
-        && (light_bishops == 0 || dark_bishops == 0)
-        && has_only(0, 0, i32::MAX, 2, 0, 0, 0, 0, 0, 0, 0)
-    {
-        return false;
-    }
-
-    // {knightsW: 2, bishopsW: [1,1]}
-    if knights <= 2
-        && light_bishops == 1
-        && dark_bishops == 1
-        && has_only(0, 0, 2, 2, 0, 0, 0, 0, 0, 0, 0)
-    {
-        return false;
-    }
-
-    // {knightsW: 1, bishopsW: [2,1]}
-    if knights == 1
-        && light_bishops <= 2
-        && dark_bishops <= 1
-        && bishops <= 3
-        && has_only(0, 0, 3, 1, 0, 0, 0, 0, 0, 0, 0)
-    {
-        return false;
-    }
-
-    // {hawksW: 3}
-    if hawks <= 3 && has_only(0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0) {
-        return false;
-    }
-
-    // {rooksW: 1, knightsW: 1, bishopsW: [1,0]}
-    if rooks == 1
-        && knights == 1
-        && bishops == 1
-        && (light_bishops == 0 || dark_bishops == 0)
-        && has_only(0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0)
-    {
-        return false;
-    }
-
-    // {rooksW: 1, knightsW: 1, pawnsW: 1}
-    if rooks == 1 && knights == 1 && pawns == 1 && has_only(0, 1, 0, 1, 0, 0, 0, 0, 1, 0, 0) {
-        return false;
-    }
-
-    // {rooksW: 1, knightsW: 2}
-    if rooks == 1 && knights <= 2 && has_only(0, 1, 0, 2, 0, 0, 0, 0, 0, 0, 0) {
-        return false;
-    }
-
-    // {rooksW: 1, guardsW: 1}
-    if rooks == 1 && guards == 1 && has_only(0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0) {
-        return false;
-    }
-
-    // {rooksW: 2, bishopsW: [1,0]}
-    if rooks == 2
-        && bishops == 1
-        && (light_bishops == 0 || dark_bishops == 0)
-        && has_only(0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0)
-    {
-        return false;
-    }
-
-    // {rooksW: 2, knightsW: 1}
-    if rooks == 2 && knights == 1 && has_only(0, 2, 0, 1, 0, 0, 0, 0, 0, 0, 0) {
-        return false;
-    }
-
-    // {rooksW: 2, pawnsW: 1}
-    if rooks == 2 && pawns == 1 && has_only(0, 2, 0, 0, 0, 0, 0, 0, 1, 0, 0) {
-        return false;
-    }
-
-    // {archbishopsW: 1, bishopsW: [2,0]}
-    if archbishops == 1
-        && bishops <= 2
-        && (light_bishops == 0 || dark_bishops == 0)
-        && has_only(0, 0, 2, 0, 0, 1, 0, 0, 0, 0, 0)
-    {
-        return false;
-    }
-
-    // {archbishopsW: 1, bishopsW: [1,1]}
-    if archbishops == 1
-        && light_bishops == 1
-        && dark_bishops == 1
-        && has_only(0, 0, 2, 0, 0, 1, 0, 0, 0, 0, 0)
-    {
-        return false;
-    }
-
-    // {archbishopsW: 1, knightsW: 2}
-    if archbishops == 1 && knights <= 2 && has_only(0, 0, 0, 2, 0, 1, 0, 0, 0, 0, 0) {
-        return false;
-    }
-
-    // {archbishopsW: 2}
-    if archbishops <= 2 && has_only(0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0) {
-        return false;
-    }
-
-    // {chancellorsW: 1, guardsW: 1}
-    if chancellors == 1 && guards == 1 && has_only(0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0) {
-        return false;
-    }
-
-    // {chancellorsW: 1, knightsW: 1}
-    if chancellors == 1 && knights == 1 && has_only(0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0) {
-        return false;
-    }
-
-    // {chancellorsW: 1, rooksW: 1}
-    if chancellors == 1 && rooks == 1 && has_only(0, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0) {
-        return false;
-    }
-
-    // {guardsW: 2}
-    if guards <= 2 && has_only(0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0) {
-        return false;
-    }
-
-    // {amazonsW: 1} - amazon is always sufficient
-    // (already handled above)
-
-    // {knightridersW: 3}
-    if knightriders <= 3 && has_only(0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0) {
-        return false;
-    }
-
-    // {pawnsW: 6}
-    if pawns <= 6 && has_only(0, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0) {
-        return false;
-    }
-
-    // {huygensW: 4}
-    if huygens <= 4 && has_only(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4) {
-        return false;
-    }
-
-    // Everything else is sufficient (not in any insufficient scenario)
-    true
-}
-
-/// Check if the game is a draw due to insufficient material
-pub fn is_insufficient_material(board: &Board) -> bool {
-    // Count pieces quickly - if too many pieces, definitely not insufficient
-    let total_pieces = board.pieces.len();
-    if total_pieces >= 10 {
-        return false;
-    } // Fast exit for complex positions
-
-    let white_has_king = board
-        .pieces
-        .iter()
-        .any(|(_, p)| p.piece_type().is_royal() && p.color() == PlayerColor::White);
-    let black_has_king = board
-        .pieces
-        .iter()
-        .any(|(_, p)| p.piece_type().is_royal() && p.color() == PlayerColor::Black);
-
-    let white_can_mate = has_sufficient_mating_material(board, PlayerColor::White, white_has_king);
-    let black_can_mate = has_sufficient_mating_material(board, PlayerColor::Black, black_has_king);
-
-    // Draw if neither side can mate
-    !white_can_mate && !black_can_mate
-}
-
-pub fn calculate_initial_material(board: &Board) -> i32 {
-    let mut score = 0;
-    for (_, piece) in &board.pieces {
-        let value = get_piece_value(piece.piece_type());
-        match piece.color() {
-            PlayerColor::White => score += value,
-            PlayerColor::Black => score -= value,
-            PlayerColor::Neutral => {}
-        }
+        // Suppress unused variable warnings
+        let _ = (cx, cy);
     }
     score
 }

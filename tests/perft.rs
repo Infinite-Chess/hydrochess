@@ -262,7 +262,12 @@ fn run_search_only_suite() {
         let d7_nps = (*d7_nodes as u128 * 1_000_000) / (*d7_micros).max(1);
         println!(
             "Run {}: total_nodes={:10} | total_time={:8}µs | NPS={:8} | D7_nodes={:8} | D7_NPS={:8}",
-            i + 1, total_nodes, total_micros, nps, d7_nodes, d7_nps
+            i + 1,
+            total_nodes,
+            total_micros,
+            nps,
+            d7_nodes,
+            d7_nps
         );
         sum_total_nodes += *total_nodes;
         sum_total_micros += *total_micros;
@@ -383,7 +388,7 @@ fn perft_fairy_piece_mix() {
     // run a search-only speed test on the same fairy position,
     // similar to run_search_only_suite but limited to depth 4 and 3 runs.
     const NUM_RUNS: usize = 3;
-    const MAX_SEARCH_DEPTH: usize = 5;
+    const MAX_SEARCH_DEPTH: usize = 6;
 
     println!(
         "\nFairy mix search-only benchmark ({} runs, depth 1..{}):",
@@ -465,5 +470,79 @@ fn perft_fairy_piece_mix() {
         avg_dmax_nps,
     );
 
+    println!("================================================================");
+}
+
+/// Test that Rose check detection works correctly.
+/// This test reproduces the bug where a rose at (3,7) should check a king at (5,8)
+/// but the engine was not detecting it.
+#[test]
+fn test_rose_check_detection() {
+    use hydrochess_wasm::board::Coordinate;
+    use hydrochess_wasm::moves::{SpatialIndices, is_square_attacked};
+
+    println!("\n================================================================");
+    println!("Testing Rose Check Detection");
+    println!("================================================================");
+
+    let mut game = GameState::new();
+    game.board = Board::new();
+    game.special_rights.clear();
+    game.turn = PlayerColor::Black;
+
+    // Set up the position from the bug report:
+    // Rose at (3,7) should be able to check king at (5,8)
+
+    // White rose at (3,7)
+    game.board
+        .set_piece(3, 7, Piece::new(PieceType::Rose, PlayerColor::White));
+
+    // Black king at (5,8)
+    game.board
+        .set_piece(5, 8, Piece::new(PieceType::King, PlayerColor::Black));
+
+    // White king somewhere else
+    game.board
+        .set_piece(5, 1, Piece::new(PieceType::King, PlayerColor::White));
+
+    game.recompute_piece_counts();
+    game.recompute_hash();
+
+    // Build spatial indices
+    let indices = SpatialIndices::new(&game.board);
+
+    // Test: The king at (5,8) should be attacked by the white rose at (3,7)
+    let king_pos = Coordinate::new(5, 8);
+    let is_attacked = is_square_attacked(&game.board, &king_pos, PlayerColor::White, &indices);
+
+    println!("Rose at (3,7), King at (5,8)");
+    println!("King should be in check from Rose: {}", is_attacked);
+    assert!(
+        is_attacked,
+        "Rose at (3,7) should give check to king at (5,8)"
+    );
+
+    // Also test that the game correctly identifies it's in check
+    assert!(game.is_in_check(), "Game should report being in check");
+
+    // And test that non-king moves are illegal (must respond to check)
+    let mut all_moves = Vec::new();
+    game.get_legal_moves_into(&mut all_moves);
+    println!("Legal moves available: {}", all_moves.len());
+
+    // All legal moves should either move the king or block/capture the rose
+    for m in &all_moves {
+        if m.piece.piece_type() != PieceType::King {
+            // If it's not a king move, it must capture the rose
+            assert_eq!(
+                (m.to.x, m.to.y),
+                (3, 7),
+                "Non-king move {:?} should capture the rose at (3,7)",
+                m
+            );
+        }
+    }
+
+    println!("Rose check detection test PASSED!");
     println!("================================================================");
 }

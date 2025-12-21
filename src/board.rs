@@ -1,5 +1,6 @@
+use crate::tiles::{Tile, TileTable, local_index, tile_coords};
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
 
 // ============================================================================
 // Number of piece types (for packed piece encoding)
@@ -176,6 +177,13 @@ impl PieceType {
         matches!(self, PieceType::Void | PieceType::Obstacle)
     }
 
+    /// Check if this piece type is truly uncapturable (only Void - blocks and cannot be taken).
+    /// Obstacles CAN be captured despite being neutral.
+    #[inline]
+    pub fn is_uncapturable(&self) -> bool {
+        matches!(self, PieceType::Void)
+    }
+
     /// Check if this piece type is a royal (king-like) piece
     #[inline]
     pub fn is_royal(&self) -> bool {
@@ -308,15 +316,23 @@ impl Piece {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(from = "BoardRaw", into = "BoardRaw")]
 pub struct Board {
-    pub pieces: HashMap<(i64, i64), Piece>,
+    // HashMap for cold-path access and serialization
+    pieces: FxHashMap<(i64, i64), Piece>,
     #[serde(skip)]
-    pub active_coords: Option<HashSet<(i64, i64)>>,
+    pub active_coords: Option<FxHashSet<(i64, i64)>>,
+    /// Sparse tiled bitboards for HOT PATH operations (attack detection, move gen, eval)
+    /// NOT updated incrementally - call rebuild_tiles() before hot path usage
+    #[serde(skip)]
+    pub tiles: TileTable,
+    /// Flag indicating tiles are in sync with pieces
+    #[serde(skip)]
+    tiles_valid: bool,
 }
 
 /// Raw representation for serialization
 #[derive(Serialize, Deserialize)]
 struct BoardRaw {
-    pieces: HashMap<(i64, i64), Piece>,
+    pieces: FxHashMap<(i64, i64), Piece>,
 }
 
 impl From<BoardRaw> for Board {
@@ -325,8 +341,9 @@ impl From<BoardRaw> for Board {
             .pieces
             .values()
             .any(|p| p.piece_type().is_neutral_type());
+
         let active_coords = if has_neutral {
-            let mut set = HashSet::new();
+            let mut set = FxHashSet::default();
             for (pos, piece) in &raw.pieces {
                 if !piece.piece_type().is_neutral_type() {
                     set.insert(*pos);
@@ -337,9 +354,19 @@ impl From<BoardRaw> for Board {
             None
         };
 
+        // Build tiles immediately for hot path usage
+        let mut tiles = TileTable::new();
+        for (&(x, y), &piece) in &raw.pieces {
+            let (cx, cy) = tile_coords(x, y);
+            let idx = local_index(x, y);
+            tiles.get_or_create(cx, cy).set_piece(idx, piece);
+        }
+
         Board {
             pieces: raw.pieces,
             active_coords,
+            tiles,
+            tiles_valid: true,
         }
     }
 }
@@ -352,21 +379,75 @@ impl From<Board> for BoardRaw {
     }
 }
 
+pub struct BoardIter<'a> {
+    iter: std::collections::hash_map::Iter<'a, (i64, i64), Piece>,
+}
+
+impl<'a> Iterator for BoardIter<'a> {
+    type Item = (&'a (i64, i64), &'a Piece);
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.iter.size_hint()
+    }
+}
+
+impl ExactSizeIterator for BoardIter<'_> {}
+
 impl Board {
     pub fn new() -> Self {
         Board {
-            pieces: HashMap::new(),
+            pieces: FxHashMap::default(),
             active_coords: None,
+            tiles: TileTable::new(),
+            tiles_valid: true,
         }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.pieces.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.pieces.is_empty()
+    }
+
+    pub fn iter(&self) -> BoardIter<'_> {
+        BoardIter {
+            iter: self.pieces.iter(),
+        }
+    }
+
+    /// Fast bitboard-based iteration of pieces by color.
+    #[inline]
+    pub fn iter_pieces_by_color(
+        &self,
+        is_white: bool,
+    ) -> impl Iterator<Item = (i64, i64, Piece)> + '_ {
+        self.tiles.iter_pieces_by_color(is_white)
+    }
+
+    /// Iterate all pieces on the board using bitboards.
+    #[inline]
+    pub fn iter_all_pieces(&self) -> impl Iterator<Item = (i64, i64, Piece)> + '_ {
+        self.tiles.iter_all_pieces()
     }
 
     pub fn set_piece(&mut self, x: i64, y: i64, piece: Piece) {
         let pos = (x, y);
 
-        // If we find a neutral piece and we aren't already tracking active coords, start tracking
+        // Active coords tracking
         if piece.piece_type().is_neutral_type() && self.active_coords.is_none() {
-            let mut set = HashSet::new();
-            for (p_pos, p) in &self.pieces {
+            // Need to initialize active_coords by scanning current pieces
+            let mut set = FxHashSet::default();
+            for (p_pos, p) in self.iter() {
                 if !p.piece_type().is_neutral_type() {
                     set.insert(*p_pos);
                 }
@@ -375,6 +456,19 @@ impl Board {
         }
 
         self.pieces.insert(pos, piece);
+
+        // INLINE TILE SYNC: Single fast update - set_piece handles overwrite
+        let (cx, cy) = tile_coords(x, y);
+        let idx = local_index(x, y);
+        let tile = self.tiles.get_or_create(cx, cy);
+        // Clear old occupancy bits first to handle overwrites correctly
+        let bit = 1u64 << idx;
+        tile.occ_all &= !bit;
+        tile.occ_white &= !bit;
+        tile.occ_black &= !bit;
+        tile.occ_void &= !bit;
+        // Set new piece
+        tile.set_piece(idx, piece);
 
         if let Some(ref mut active) = self.active_coords {
             if !piece.piece_type().is_neutral_type() {
@@ -385,20 +479,123 @@ impl Board {
         }
     }
 
-    pub fn get_piece(&self, x: &i64, y: &i64) -> Option<&Piece> {
-        self.pieces.get(&(*x, *y))
+    #[inline]
+    pub fn get_piece(&self, x: i64, y: i64) -> Option<&Piece> {
+        self.pieces.get(&(x, y))
     }
 
+    /// BITBOARD: O(1) occupancy check using tile bitboards.
+    /// Use this instead of get_piece().is_some() in hot paths.
+    #[inline]
+    pub fn is_occupied(&self, x: i64, y: i64) -> bool {
+        let (cx, cy) = tile_coords(x, y);
+        if let Some(tile) = self.tiles.get_tile(cx, cy) {
+            let idx = local_index(x, y);
+            (tile.occ_all >> idx) & 1 != 0
+        } else {
+            false
+        }
+    }
+
+    /// BITBOARD: O(1) color-specific occupancy check.
+    #[inline]
+    pub fn is_occupied_by_color(&self, x: i64, y: i64, color: PlayerColor) -> bool {
+        let (cx, cy) = tile_coords(x, y);
+        if let Some(tile) = self.tiles.get_tile(cx, cy) {
+            let idx = local_index(x, y);
+            let occ = match color {
+                PlayerColor::White => tile.occ_white,
+                PlayerColor::Black => tile.occ_black,
+                PlayerColor::Neutral => tile.occ_void,
+            };
+            (occ >> idx) & 1 != 0
+        } else {
+            false
+        }
+    }
+
+    /// BITBOARD: O(1) piece retrieval using tile bitboards.
+    /// Returns packed piece directly from tile array (no HashMap lookup).
+    /// Use when you already know the square is occupied.
+    // #[inline]
+    // pub fn get_piece_fast(&self, x: i64, y: i64) -> Option<Piece> {
+    //     let (cx, cy) = tile_coords(x, y);
+    //     if let Some(tile) = self.tiles.get_tile(cx, cy) {
+    //         let idx = local_index(x, y);
+    //         if (tile.occ_all >> idx) & 1 != 0 {
+    //             let packed = tile.piece[idx];
+    //             if packed != 0 {
+    //                 return Some(Piece::from_packed(packed));
+    //             }
+    //         }
+    //     }
+    //     None
+    // }
+
     pub fn remove_piece(&mut self, x: &i64, y: &i64) -> Option<Piece> {
-        let p = self.pieces.remove(&(*x, *y));
-        if let Some(ref piece) = p {
+        let pos = (*x, *y);
+        let removed = self.pieces.remove(&pos);
+
+        // INLINE TILE SYNC: Always keep tiles valid for hot path
+        let (cx, cy) = tile_coords(*x, *y);
+        let idx = local_index(*x, *y);
+        if let Some(tile) = self.tiles.get_tile_mut(cx, cy) {
+            tile.remove_piece(idx);
+        }
+
+        if let Some(ref piece) = removed {
             if let Some(ref mut active) = self.active_coords {
                 if !piece.piece_type().is_neutral_type() {
-                    active.remove(&(*x, *y));
+                    active.remove(&pos);
                 }
             }
         }
-        p
+        removed
+    }
+
+    pub fn clear(&mut self) {
+        self.pieces.clear();
+        self.active_coords = None;
+        self.tiles.clear();
+        self.tiles_valid = true;
+    }
+
+    /// Rebuild tiles from HashMap. Call this ONCE before hot-path operations
+    /// (attack detection, move generation, evaluation).
+    /// This is O(n) where n = number of pieces, but only needs to be called
+    /// once per position, not per operation.
+    #[inline]
+    pub fn rebuild_tiles(&mut self) {
+        if self.tiles_valid {
+            return;
+        }
+        self.tiles.clear();
+        for (&(x, y), &piece) in &self.pieces {
+            let (cx, cy) = tile_coords(x, y);
+            let idx = local_index(x, y);
+            self.tiles.get_or_create(cx, cy).set_piece(idx, piece);
+        }
+        self.tiles_valid = true;
+    }
+
+    /// Force rebuild tiles (for use after make_move/undo_move cycles)
+    #[inline]
+    pub fn ensure_tiles(&mut self) {
+        self.rebuild_tiles();
+    }
+
+    /// Get 3x3 tile neighborhood around world coordinate.
+    /// Caller should ensure tiles are valid via rebuild_tiles() first.
+    #[inline]
+    pub fn get_neighborhood(&self, x: i64, y: i64) -> [Option<&Tile>; 9] {
+        let (cx, cy) = tile_coords(x, y);
+        self.tiles.get_neighborhood(cx, cy)
+    }
+
+    /// Check if tiles are in sync with pieces
+    #[inline]
+    pub fn tiles_valid(&self) -> bool {
+        self.tiles_valid
     }
 }
 
