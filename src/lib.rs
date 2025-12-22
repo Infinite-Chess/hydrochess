@@ -398,6 +398,8 @@ impl Engine {
             };
 
         // Initialize game with starting position; clocks and turn will be fixed below.
+        // crate::tiles::magic::init();
+
         let mut game = GameState {
             board,
             // Seed with the starting side; this ensures that replaying move history
@@ -433,6 +435,12 @@ impl Engine {
             black_promo_rank,
             white_king_pos: None,
             black_king_pos: None,
+            check_squares_white: FxHashSet::default(),
+            check_squares_black: FxHashSet::default(),
+            slider_rays_white: [None; 8],
+            slider_rays_black: [None; 8],
+            discovered_check_squares_white: FxHashSet::default(),
+            discovered_check_squares_black: FxHashSet::default(),
             pawn_hash: 0,
             nonpawn_hash: 0,
             material_hash: 0,
