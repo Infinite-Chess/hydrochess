@@ -817,6 +817,9 @@ pub fn get_pseudo_legal_moves_for_piece(
     out
 }
 
+/// Ultra-fast attack detection using tile bitboards and spatial indices.
+/// O(1) for leapers via precomputed masks, O(log n) for sliders via sorted indices.
+#[inline(always)]
 pub fn is_square_attacked(
     board: &Board,
     target: &Coordinate,
@@ -826,15 +829,14 @@ pub fn is_square_attacked(
     use crate::attacks::*;
     use crate::tiles::{local_index, masks};
 
-    // OPTIMIZATION: Single-pass tile neighborhood check for all leapers+pawns
+    // Early exit for neutral
+    if attacker_color == PlayerColor::Neutral {
+        return false;
+    }
+
+    let is_white = attacker_color == PlayerColor::White;
     let neighborhood = board.get_neighborhood(target.x, target.y);
     let local_idx = local_index(target.x, target.y);
-
-    // Select attacker color bitboard accessor
-    let is_white = attacker_color == PlayerColor::White;
-    if attacker_color == PlayerColor::Neutral {
-        return false; // Neutral can't attack
-    }
 
     // Get pawn masks (depends on attacker color)
     let pawn_masks = masks::pawn_attacker_masks(is_white);
@@ -854,7 +856,7 @@ pub fn is_square_attacked(
         };
         if occ == 0 {
             continue;
-        } // Fast skip empty tiles
+        }
 
         // Check each leaper type mask against occupancy
         let masks_to_check = [
@@ -870,7 +872,6 @@ pub fn is_square_attacked(
         for (attack_mask, type_mask) in masks_to_check {
             let candidates = occ & attack_mask;
             if candidates != 0 {
-                // Found potential attackers - verify piece type
                 let mut bits = candidates;
                 while bits != 0 {
                     let bit_idx = bits.trailing_zeros() as usize;
@@ -888,47 +889,57 @@ pub fn is_square_attacked(
         }
     }
 
-    // 3. Check Sliding Pieces (Orthogonal and Diagonal) using SpatialIndices
-    // Helper to check rays using indices for fast O(log n) nearest-piece lookup
-    let check_ray = |dirs: &[(i64, i64)], type_mask: PieceTypeMask| -> bool {
-        for &(dx, dy) in dirs {
-            let line_vec = if dx == 0 {
-                indices.cols.get(&target.x)
-            } else if dy == 0 {
-                indices.rows.get(&target.y)
-            } else if dx == dy {
-                indices.diag1.get(&(target.x - target.y))
-            } else {
-                indices.diag2.get(&(target.x + target.y))
-            };
+    // Slider check using spatial indices (O(log n) per direction)
+    #[inline(always)]
+    fn check_slider_ray(
+        indices: &SpatialIndices,
+        target: &Coordinate,
+        dx: i64,
+        dy: i64,
+        attacker_color: PlayerColor,
+        type_mask: PieceTypeMask,
+    ) -> bool {
+        let line_vec = if dx == 0 {
+            indices.cols.get(&target.x)
+        } else if dy == 0 {
+            indices.rows.get(&target.y)
+        } else if dx == dy {
+            indices.diag1.get(&(target.x - target.y))
+        } else {
+            indices.diag2.get(&(target.x + target.y))
+        };
 
-            if let Some(vec) = line_vec {
-                let val = if dx == 0 { target.y } else { target.x };
-                let step_dir = if dx == 0 { dy } else { dx };
+        if let Some(vec) = line_vec {
+            let val = if dx == 0 { target.y } else { target.x };
+            let step_dir = if dx == 0 { dy } else { dx };
 
-                if let Some((_, packed)) = SpatialIndices::find_nearest(vec, val, step_dir) {
-                    let piece = Piece::from_packed(packed);
-                    if piece.color() == attacker_color
-                        && matches_mask(piece.piece_type(), type_mask)
-                    {
-                        return true;
-                    }
+            if let Some((_, packed)) = SpatialIndices::find_nearest(vec, val, step_dir) {
+                let piece = Piece::from_packed(packed);
+                if piece.color() == attacker_color && matches_mask(piece.piece_type(), type_mask) {
+                    return true;
                 }
             }
         }
         false
-    };
-
-    if check_ray(&ORTHO_DIRS, ORTHO_MASK) {
-        return true;
-    }
-    if check_ray(&DIAG_DIRS, DIAG_MASK) {
-        return true;
     }
 
-    // 4. Check Knightrider (Sliding Knight)
+    // Orthogonal sliders
+    for &(dx, dy) in &ORTHO_DIRS {
+        if check_slider_ray(indices, target, dx, dy, attacker_color, ORTHO_MASK) {
+            return true;
+        }
+    }
+
+    // Diagonal sliders
+    for &(dx, dy) in &DIAG_DIRS {
+        if check_slider_ray(indices, target, dx, dy, attacker_color, DIAG_MASK) {
+            return true;
+        }
+    }
+
+    // Knightrider check (sliding knight)
     for &(dx, dy) in &KNIGHTRIDER_DIRS {
-        let mut k = 1;
+        let mut k = 1i64;
         loop {
             let x = target.x + dx * k;
             let y = target.y + dy * k;
@@ -936,17 +947,16 @@ pub fn is_square_attacked(
                 if piece.color() == attacker_color && piece.piece_type() == PieceType::Knightrider {
                     return true;
                 }
-                break; // Blocked
+                break;
             }
             k += 1;
-            if k > 25 {
+            if k > 20 {
                 break;
-            } // Safety
+            }
         }
     }
 
-    // 5. Check Huygen (Prime Leaper/Slider)
-    // Orthogonal directions. Check all prime distances.
+    // Huygen check (prime distances)
     for &(dx, dy) in &ORTHO_DIRS {
         let line_vec = if dx == 0 {
             indices.cols.get(&target.x)
@@ -954,7 +964,6 @@ pub fn is_square_attacked(
             indices.rows.get(&target.y)
         };
         if let Some(vec) = line_vec {
-            // Iterate all pieces on this line - now includes piece data
             for &(coord, packed) in vec {
                 let dist = if dx == 0 {
                     coord - target.y
@@ -963,10 +972,8 @@ pub fn is_square_attacked(
                 };
                 let abs_dist = dist.abs();
                 if abs_dist > 0 && is_prime_i64(abs_dist) {
-                    // Check direction
                     let sign = if dist > 0 { 1 } else { -1 };
                     let dir_check = if dx == 0 { dy == sign } else { dx == sign };
-
                     if dir_check {
                         let piece = Piece::from_packed(packed);
                         if piece.color() == attacker_color
@@ -980,12 +987,12 @@ pub fn is_square_attacked(
         }
     }
 
-    // 6. Check Rose (Circular Knight)
-    let defender_color = attacker_color.opponent();
-    let rose_moves =
-        generate_rose_moves(board, target, &Piece::new(PieceType::Rose, defender_color));
-    for m in rose_moves {
-        if let Some(piece) = board.get_piece(m.to.x, m.to.y) {
+    // Rose check - use direct position check instead of generating moves
+    // Rose attacks in circular knight patterns; check if any Rose piece can reach target
+    for &(dx, dy) in &ROSE_OFFSETS {
+        let x = target.x + dx;
+        let y = target.y + dy;
+        if let Some(piece) = board.get_piece(x, y) {
             if piece.color() == attacker_color && piece.piece_type() == PieceType::Rose {
                 return true;
             }
@@ -2606,55 +2613,66 @@ fn generate_rose_moves(board: &Board, from: &Coordinate, piece: &Piece) -> MoveL
     moves
 }
 
-/// Generate rose moves directly into an output buffer
-#[inline]
+/// Rose movement offsets (precomputed):
+/// - 8 knight moves (jumps, no blocking)
+/// - 8 diagonal: skips first 2, lands on positions 3 and 4 in each diagonal direction
+/// - 8 orthogonal: skips first 3, lands on position 4; skips 5, lands on 6
+pub static ROSE_OFFSETS: [(i64, i64); 32] = [
+    // Knight moves (8)
+    (-2, -1),
+    (-1, -2),
+    (1, -2),
+    (2, -1),
+    (2, 1),
+    (1, 2),
+    (-1, 2),
+    (-2, 1),
+    // Diagonal: skip 2, then positions 3 and 4
+    (3, 3),
+    (4, 4),
+    (-3, -3),
+    (-4, -4),
+    (3, -3),
+    (4, -4),
+    (-3, 3),
+    (-4, 4),
+    // Orthogonal: skip 3, position 4; skip 5, position 6
+    (4, 0),
+    (6, 0),
+    (-4, 0),
+    (-6, 0),
+    (0, 4),
+    (0, 6),
+    (0, -4),
+    (0, -6),
+    // Extended knight-like: (5,2) in all 8 directions
+    (5, 2),
+    (5, -2),
+    (-5, 2),
+    (-5, -2),
+    (2, 5),
+    (2, -5),
+    (-2, 5),
+    (-2, -5),
+];
+
+/// Generate rose moves directly into an output buffer using precomputed offsets.
+#[inline(always)]
 fn generate_rose_moves_into(board: &Board, from: &Coordinate, piece: &Piece, out: &mut MoveList) {
-    let knight_moves = [
-        (-2, -1),
-        (-1, -2),
-        (1, -2),
-        (2, -1),
-        (2, 1),
-        (1, 2),
-        (-1, 2),
-        (-2, 1),
-    ];
+    let my_color = piece.color();
 
-    for (start_idx, _) in knight_moves.iter().enumerate() {
-        for direction in [1, -1] {
-            let mut current_x = from.x;
-            let mut current_y = from.y;
-            let mut current_idx = start_idx as i32;
+    for &(dx, dy) in &ROSE_OFFSETS {
+        let tx = from.x + dx;
+        let ty = from.y + dy;
 
-            for _ in 0..7 {
-                let idx = (current_idx as usize) % 8;
-                let (dx, dy) = knight_moves[idx];
-
-                current_x += dx;
-                current_y += dy;
-
-                if let Some(target) = board.get_piece(current_x, current_y) {
-                    if is_enemy_piece(target, piece.color()) {
-                        out.push(Move::new(
-                            *from,
-                            Coordinate::new(current_x, current_y),
-                            *piece,
-                        ));
-                    }
-                    break;
-                } else {
-                    out.push(Move::new(
-                        *from,
-                        Coordinate::new(current_x, current_y),
-                        *piece,
-                    ));
-                }
-
-                current_idx += direction;
-                if current_idx < 0 {
-                    current_idx += 8;
-                }
+        if let Some(target) = board.get_piece(tx, ty) {
+            // Can capture enemy pieces
+            if is_enemy_piece(target, my_color) {
+                out.push(Move::new(*from, Coordinate::new(tx, ty), *piece));
             }
+        } else {
+            // Empty square - can move there
+            out.push(Move::new(*from, Coordinate::new(tx, ty), *piece));
         }
     }
 }

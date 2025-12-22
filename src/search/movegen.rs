@@ -9,18 +9,18 @@
 //! 6. BAD_CAPTURE: Iterate collected bad captures
 //! 7. BAD_QUIET: Select with score <= goodQuietThreshold
 
-use super::params::{
-    DEFAULT_SORT_QUIET, see_winning_threshold, sort_countermove, sort_gives_check, sort_killer1,
-    sort_killer2,
+use super::params::{DEFAULT_SORT_QUIET, sort_countermove, sort_killer1, sort_killer2};
+use super::{
+    LOW_PLY_HISTORY_MASK, LOW_PLY_HISTORY_SIZE, Searcher, hash_coord_32, hash_move_dest,
+    static_exchange_eval,
 };
-use super::{Searcher, hash_coord_32, hash_move_dest, static_exchange_eval};
-use crate::board::{Coordinate, PieceType, PlayerColor};
+use crate::board::{PieceType, PlayerColor};
 use crate::evaluation::get_piece_value;
 use crate::game::GameState;
 use crate::moves::{Move, MoveList, get_quiescence_captures, get_quiet_moves_into};
 
-/// Good quiet threshold (original -4000, not Stockfish's -14000)
-const GOOD_QUIET_THRESHOLD: i32 = -4000;
+/// Good quiet threshold - matches Stockfish exactly
+const GOOD_QUIET_THRESHOLD: i32 = -14000;
 
 /// Stages of move generation (hybrid: Stockfish optimizations + trusted killer stages).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,9 +65,6 @@ pub struct StagedMoveGen {
     prev_from_hash: usize,
     prev_to_hash: usize,
 
-    // Cached enemy king for check detection
-    enemy_king: Option<Coordinate>,
-
     // Killers (checked during quiet iteration)
     killer1: Option<Move>,
     killer2: Option<Move>,
@@ -87,19 +84,12 @@ fn sort_moves_by_score(moves: &mut [ScoredMove]) {
 }
 
 impl StagedMoveGen {
-    pub fn new(tt_move: Option<Move>, ply: usize, searcher: &Searcher, game: &GameState) -> Self {
+    pub fn new(tt_move: Option<Move>, ply: usize, searcher: &Searcher, _game: &GameState) -> Self {
         // Get previous move info for countermove lookup
         let (prev_from_hash, prev_to_hash) = if ply > 0 {
             searcher.prev_move_stack[ply - 1]
         } else {
             (0, 0)
-        };
-
-        // Find enemy king for check detection
-        let enemy_king = match game.turn {
-            PlayerColor::White => game.black_king_pos,
-            PlayerColor::Black => game.white_king_pos,
-            PlayerColor::Neutral => None,
         };
 
         // Get killers
@@ -117,7 +107,7 @@ impl StagedMoveGen {
             ply,
             prev_from_hash,
             prev_to_hash,
-            enemy_king,
+
             killer1,
             killer2,
             skip_quiets: false,
@@ -209,12 +199,13 @@ impl StagedMoveGen {
         }
     }
 
-    /// Score capture move (BITBOARD: uses fast piece retrieval)
+    /// Score capture move (Stockfish formula: captureHistory + 7 * PieceValue)
     fn score_capture(game: &GameState, searcher: &Searcher, m: &Move) -> i32 {
         if let Some(target) = game.board.get_piece(m.to.x, m.to.y) {
             let victim_val = get_piece_value(target.piece_type());
             let cap_hist = searcher.capture_history[m.piece.piece_type() as usize]
                 [target.piece_type() as usize];
+            // Stockfish: (*captureHistory)[pc][to][type_of(capturedPiece)] + 7 * int(PieceValue[capturedPiece])
             cap_hist + 7 * victim_val
         } else {
             0
@@ -222,23 +213,20 @@ impl StagedMoveGen {
     }
 
     /// Score quiet move (Stockfish formula with histories)
+    /// Stockfish scoring:
+    /// - 2 * mainHistory
+    /// - continuationHistory at indices 0, 1, 2, 3, 5
+    /// - check bonus: 16384 if move gives check and SEE >= -75
     fn score_quiet(&self, game: &GameState, searcher: &Searcher, m: &Move) -> i32 {
         let mut score: i32 = DEFAULT_SORT_QUIET;
         let ply = self.ply;
 
-        // Killer bonus
+        // Killer bonus - handled separately with special scores
         if Self::moves_match(m, &self.killer1) {
             return sort_killer1();
         }
         if Self::moves_match(m, &self.killer2) {
             return sort_killer2();
-        }
-
-        // Check bonus
-        if let Some(ref ek) = self.enemy_king {
-            if Self::move_gives_check_simple(game, m, ek) {
-                score += sort_gives_check();
-            }
         }
 
         // Countermove bonus
@@ -254,15 +242,16 @@ impl StagedMoveGen {
             }
         }
 
-        // Main history (2x weight like Stockfish)
+        // Main history (2x weight - Stockfish: 2 * (*mainHistory)[us][m.raw()])
         let idx = hash_move_dest(m);
         score += 2 * searcher.history[m.piece.piece_type() as usize][idx];
 
-        // Continuation history
+        // Continuation history - Stockfish uses indices 0, 1, 2, 3, 5
+        // These correspond to plies_ago: 0 (ply-1), 1 (ply-2), 2 (ply-3), 3 (ply-4), 5 (ply-6)
         let cur_from_hash = hash_coord_32(m.from.x, m.from.y);
         let cur_to_hash = hash_coord_32(m.to.x, m.to.y);
 
-        for &plies_ago in &[0usize, 1, 3] {
+        for &plies_ago in &[0usize, 1, 2, 3, 5] {
             if ply >= plies_ago + 1 {
                 if let Some(ref prev_move) = searcher.move_history[ply - plies_ago - 1] {
                     let prev_piece = searcher.moved_piece_history[ply - plies_ago - 1] as usize;
@@ -275,31 +264,92 @@ impl StagedMoveGen {
             }
         }
 
+        // Check bonus: Stockfish gives 16384 for moves that give check
+        // if SEE >= -75 (to avoid giving bonus to bad checks)
+        // Use O(1) hash lookup for knights/pawns, inline check for sliders
+        let gives_check = Self::move_gives_check_fast(game, m);
+        if gives_check {
+            // Verify the check isn't losing material with SEE
+            if super::see_ge(game, m, -75) {
+                score += 16384;
+            }
+        }
+
+        // Low Ply History: Stockfish:
+        // if (ply < LOW_PLY_HISTORY_SIZE)
+        //     m.value += 8 * (*lowPlyHistory)[ply][m.raw()] / (1 + ply);
+        if ply < LOW_PLY_HISTORY_SIZE {
+            let move_hash = hash_move_dest(m) & LOW_PLY_HISTORY_MASK;
+            score += 8 * searcher.low_ply_history[ply][move_hash] / (1 + ply as i32);
+        }
+
         score
     }
 
-    /// Simple check detection
-    #[inline]
-    pub fn move_gives_check_simple(_game: &GameState, m: &Move, enemy_king: &Coordinate) -> bool {
-        let to = &m.to;
-        let dx = (enemy_king.x - to.x).abs();
-        let dy = (enemy_king.y - to.y).abs();
+    /// Ultra-fast check detection using precomputed data and bit operations.
+    /// Ultra-fast check detection using precomputed data and bit operations.
+    /// Handles core piece types: Knights, Pawns, and Sliders/Compounds.
+    #[inline(always)]
+    pub fn move_gives_check_fast(game: &GameState, m: &Move) -> bool {
+        let pt = m.piece.piece_type();
+        let color = m.piece.color();
+        let tx = m.to.x;
+        let ty = m.to.y;
 
-        match m.piece.piece_type() {
-            PieceType::Queen => dx == 0 || dy == 0 || dx == dy,
-            PieceType::Rook => dx == 0 || dy == 0,
-            PieceType::Bishop => dx == dy,
-            PieceType::Knight => (dx == 1 && dy == 2) || (dx == 2 && dy == 1),
-            PieceType::Pawn => {
-                let direction = if m.piece.color() == PlayerColor::White {
-                    1
-                } else {
-                    -1
-                };
-                dy == 1 && (to.y - enemy_king.y) == -direction && dx == 1
-            }
-            _ => false,
+        // Fast path: Knights and Pawns use O(1) precomputed hash lookup
+        if pt == PieceType::Knight || pt == PieceType::Pawn {
+            let check_squares = if color == PlayerColor::White {
+                &game.check_squares_black
+            } else {
+                &game.check_squares_white
+            };
+            return check_squares.contains(&(tx, ty, pt as u8));
         }
+
+        // Get enemy king position
+        let king_pos = if color == PlayerColor::White {
+            match &game.black_king_pos {
+                Some(k) => k,
+                None => return false,
+            }
+        } else {
+            match &game.white_king_pos {
+                Some(k) => k,
+                None => return false,
+            }
+        };
+
+        let dx = tx - king_pos.x;
+        let dy = ty - king_pos.y;
+        let adx = dx.abs();
+        let ady = dy.abs();
+
+        // Compute piece type bit for O(1) mask checks
+        use crate::attacks::{DIAG_MASK, KNIGHT_MASK, ORTHO_MASK};
+        let pt_bit = 1u32 << (pt as u8);
+
+        // 1. Knight-like check (including compounds like Amazon, Chancellor, etc.)
+        if (pt_bit & KNIGHT_MASK) != 0 {
+            if (adx == 1 && ady == 2) || (adx == 2 && ady == 1) {
+                return true;
+            }
+        }
+
+        // 2. Orthogonal slider check (including Queen, Rook, Chancellor, etc.)
+        if (pt_bit & ORTHO_MASK) != 0 {
+            if dx == 0 || dy == 0 {
+                return true;
+            }
+        }
+
+        // 3. Diagonal slider check (including Queen, Bishop, Archbishop, etc.)
+        if (pt_bit & DIAG_MASK) != 0 {
+            if adx == ady && adx > 0 {
+                return true;
+            }
+        }
+
+        false
     }
 
     /// Get next move (Stockfish-style next_move())
@@ -351,16 +401,18 @@ impl StagedMoveGen {
 
                 MoveStage::GoodCapture => {
                     // Select captures with SEE filter
+                    // Stockfish: pos.see_ge(*cur, -cur->value / 18)
+                    // Bad captures are swapped to endBadCaptures region at the front
                     while self.cur < self.end_captures {
-                        let sm = &self.moves[self.cur];
-                        // Use original fixed threshold, not Stockfish's -score/18
-                        if static_exchange_eval(game, &sm.m) >= see_winning_threshold() {
+                        let see_threshold = -self.moves[self.cur].score / 18;
+                        if static_exchange_eval(game, &self.moves[self.cur].m) >= see_threshold {
                             let m = self.moves[self.cur].m.clone();
                             self.cur += 1;
                             return Some(m);
                         } else {
-                            // Move bad capture to end_bad_captures section
-                            // We'll iterate them later
+                            // Stockfish: std::swap(*endBadCaptures++, *cur)
+                            // Swap this bad capture to the endBadCaptures position
+                            self.moves.swap(self.end_bad_captures, self.cur);
                             self.end_bad_captures += 1;
                         }
                         self.cur += 1;
@@ -466,18 +518,12 @@ impl StagedMoveGen {
                 }
 
                 MoveStage::BadCapture => {
-                    // Iterate through captures that failed SEE
-                    while self.cur < self.end_captures {
-                        let sm = &self.moves[self.cur];
-                        let see_threshold = -sm.score / 18;
-
-                        // This capture failed SEE earlier, return it now
-                        if static_exchange_eval(game, &sm.m) < see_threshold {
-                            let m = self.moves[self.cur].m.clone();
-                            self.cur += 1;
-                            return Some(m);
-                        }
+                    // Stockfish: iterate bad captures (swapped to front during GOOD_CAPTURE)
+                    // cur starts at 0, iterate to end_bad_captures
+                    while self.cur < self.end_bad_captures {
+                        let m = self.moves[self.cur].m.clone();
                         self.cur += 1;
+                        return Some(m);
                     }
 
                     // Setup for bad quiets

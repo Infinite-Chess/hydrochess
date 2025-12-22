@@ -59,6 +59,12 @@ pub const CORRHIST_GRAIN: i32 = 256; // Scaling factor for correction values
 pub const CORRHIST_LIMIT: i32 = 1024 * 32; // Max absolute correction value
 pub const CORRHIST_WEIGHT_SCALE: i32 = 256; // Weight scaling for updates
 
+// Low Ply History constants (Stockfish-style)
+// Tracks which moves were successful at low plies (near root)
+pub const LOW_PLY_HISTORY_SIZE: usize = 4; // Only track first 4 plies
+pub const LOW_PLY_HISTORY_ENTRIES: usize = 4096; // Move hash entries per ply
+pub const LOW_PLY_HISTORY_MASK: usize = LOW_PLY_HISTORY_ENTRIES - 1;
+
 /// Determines which correction history tables to use.
 /// Set once at search start for zero runtime overhead.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -533,6 +539,11 @@ pub struct Searcher {
 
     /// Dynamic move rule limit (e.g. 100 for 50-move rule)
     pub move_rule_limit: i32,
+
+    /// Low Ply History (Stockfish-style): [ply][move_hash] -> score
+    /// Tracks which moves were successful at low plies (first 4 from root).
+    /// Used to boost ordering for moves that worked well near root.
+    pub low_ply_history: Box<[[i32; LOW_PLY_HISTORY_ENTRIES]; LOW_PLY_HISTORY_SIZE]>,
 }
 
 impl Searcher {
@@ -585,6 +596,7 @@ impl Searcher {
             tt_move_history: 0,
             reduction_stack: vec![0; MAX_PLY],
             move_rule_limit: 100, // Default, will be updated from GameState
+            low_ply_history: Box::new([[0i32; LOW_PLY_HISTORY_ENTRIES]; LOW_PLY_HISTORY_SIZE]),
         }
     }
 
@@ -641,6 +653,19 @@ impl Searcher {
 
         let entry = &mut self.history[piece as usize][idx];
         *entry += clamped - *entry * clamped.abs() / max_h;
+    }
+
+    /// Update low ply history (Stockfish-style) for moves that caused beta cutoff at low plies.
+    /// Only updates for ply < LOW_PLY_HISTORY_SIZE (first 4 plies from root).
+    #[inline]
+    pub fn update_low_ply_history(&mut self, ply: usize, move_hash: usize, bonus: i32) {
+        if ply < LOW_PLY_HISTORY_SIZE {
+            let max_h = max_history();
+            let clamped = bonus.clamp(-max_h, max_h);
+            let idx = move_hash & LOW_PLY_HISTORY_MASK;
+            let entry = &mut self.low_ply_history[ply][idx];
+            *entry += clamped - *entry * clamped.abs() / max_h;
+        }
     }
 
     #[inline]
@@ -1881,13 +1906,6 @@ fn negamax(
         None
     };
 
-    // Find enemy king position for check detection (cached lookup)
-    let enemy_king_pos = match game.turn {
-        crate::board::PlayerColor::White => game.black_king_pos,
-        crate::board::PlayerColor::Black => game.white_king_pos,
-        crate::board::PlayerColor::Neutral => None,
-    };
-
     // New depth for child nodes
     let new_depth = depth.saturating_sub(1);
 
@@ -1900,10 +1918,8 @@ fn negamax(
         let is_promotion = m.promotion.is_some();
         let p_type = m.piece.piece_type();
 
-        // Check if this move gives check to enemy king
-        let gives_check = enemy_king_pos.as_ref().map_or(false, |ek| {
-            StagedMoveGen::move_gives_check_simple(game, &m, ek)
-        });
+        // Check if this move gives check to enemy king (O(1) for knights/pawns)
+        let gives_check = StagedMoveGen::move_gives_check_fast(game, &m);
 
         // In-move pruning at shallow depths (not in PV, have material, not losing)
         if !is_pv && game.has_non_pawn_material(game.turn) && best_score > -MATE_SCORE {
@@ -2360,12 +2376,17 @@ fn negamax(
 
                 searcher.update_history(m.piece.piece_type(), idx, bonus);
 
+                // Low Ply History update (Stockfish-style)
+                searcher.update_low_ply_history(ply, idx, bonus);
+
                 for quiet in &quiets_searched {
                     let qidx = hash_move_dest(quiet);
                     if quiet.piece.piece_type() == m.piece.piece_type() && qidx == idx {
                         continue;
                     }
                     searcher.update_history(quiet.piece.piece_type(), qidx, -bonus);
+                    // Penalize other quiets in low ply history too
+                    searcher.update_low_ply_history(ply, qidx, -bonus);
                 }
 
                 // Killer move heuristic (for non-captures)
@@ -2382,9 +2403,8 @@ fn negamax(
                     }
                 }
 
-                // Continuation history update (1-ply, 2-ply, 4-ply back)
-
-                for &plies_ago in &[0usize, 1, 3] {
+                // Continuation history update (Stockfish indices: 0, 1, 2, 3, 5)
+                for &plies_ago in &[0usize, 1, 2, 3, 5] {
                     if ply >= plies_ago + 1 {
                         if let Some(ref prev_move) = searcher.move_history[ply - plies_ago - 1] {
                             let prev_piece =

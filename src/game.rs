@@ -130,6 +130,28 @@ pub struct GameState {
     pub white_king_pos: Option<Coordinate>,
     #[serde(skip)]
     pub black_king_pos: Option<Coordinate>,
+    /// Precomputed check squares for white king (squares from which enemy pieces give check)
+    /// Uses hash for O(1) lookup. Stores (x, y, piece_type) as key.
+    #[serde(skip)]
+    pub check_squares_white: rustc_hash::FxHashSet<(i64, i64, u8)>,
+    /// Precomputed check squares for black king
+    #[serde(skip)]
+    pub check_squares_black: rustc_hash::FxHashSet<(i64, i64, u8)>,
+    /// Slider rays from white king: [direction_index] -> Option<(blocker_x, blocker_y)>
+    /// Direction indices: 0=N, 1=S, 2=E, 3=W, 4=NE, 5=NW, 6=SE, 7=SW
+    /// None = infinite ray (no blocker), Some = first blocker position
+    #[serde(skip)]
+    pub slider_rays_white: [Option<(i64, i64)>; 8],
+    /// Slider rays from black king
+    #[serde(skip)]
+    pub slider_rays_black: [Option<(i64, i64)>; 8],
+
+    /// Squares from which a piece move discovers a check on the enemy king.
+    /// Stores (x, y) coordinates of the potentially blocking piece.
+    #[serde(skip)]
+    pub discovered_check_squares_white: FxHashSet<(i64, i64)>,
+    #[serde(skip)]
+    pub discovered_check_squares_black: FxHashSet<(i64, i64)>,
     /// Pawn structure hash for correction history (helps CoaIP variants).
     #[serde(skip)]
     pub pawn_hash: u64,
@@ -180,6 +202,8 @@ impl GameState {
 
 impl GameState {
     pub fn new() -> Self {
+        // crate::tiles::magic::init();
+
         GameState {
             board: Board::new(),
             turn: PlayerColor::White,
@@ -209,6 +233,12 @@ impl GameState {
             black_promo_rank: 1,
             white_king_pos: None,
             black_king_pos: None,
+            check_squares_white: FxHashSet::default(),
+            check_squares_black: FxHashSet::default(),
+            slider_rays_white: [None; 8],
+            slider_rays_black: [None; 8],
+            discovered_check_squares_white: FxHashSet::default(),
+            discovered_check_squares_black: FxHashSet::default(),
             pawn_hash: 0,
             nonpawn_hash: 0,
             material_hash: 0,
@@ -219,6 +249,8 @@ impl GameState {
     }
 
     pub fn new_with_rules(game_rules: GameRules) -> Self {
+        // crate::tiles::magic::init();
+
         GameState {
             board: Board::new(),
             turn: PlayerColor::White,
@@ -248,6 +280,12 @@ impl GameState {
             black_promo_rank: 1,
             white_king_pos: None,
             black_king_pos: None,
+            check_squares_white: FxHashSet::default(),
+            check_squares_black: FxHashSet::default(),
+            slider_rays_white: [None; 8],
+            slider_rays_black: [None; 8],
+            discovered_check_squares_white: FxHashSet::default(),
+            discovered_check_squares_black: FxHashSet::default(),
             pawn_hash: 0,
             nonpawn_hash: 0,
             material_hash: 0,
@@ -352,6 +390,192 @@ impl GameState {
         self.black_non_pawn_material = black_npm;
         // Rebuild spatial indices from current board
         self.spatial_indices = SpatialIndices::new(&self.board);
+        // Recompute check squares for O(1) check detection
+        self.recompute_check_squares();
+    }
+
+    /// Precompute check squares for both kings.
+    /// For each king, stores the (x, y, piece_type) tuples for squares from which
+    /// knights and pawns can give check. Also computes slider rays for O(1) slider check.
+    #[inline]
+    pub fn recompute_check_squares(&mut self) {
+        // Knight offsets
+        const KNIGHT_OFFSETS: [(i64, i64); 8] = [
+            (-2, -1),
+            (-2, 1),
+            (-1, -2),
+            (-1, 2),
+            (1, -2),
+            (1, 2),
+            (2, -1),
+            (2, 1),
+        ];
+
+        // 8 directions for slider rays: N, S, E, W, NE, NW, SE, SW
+        const DIRECTIONS: [(i64, i64); 8] = [
+            (0, 1),   // N (index 0)
+            (0, -1),  // S (index 1)
+            (1, 0),   // E (index 2)
+            (-1, 0),  // W (index 3)
+            (1, 1),   // NE (index 4)
+            (-1, 1),  // NW (index 5)
+            (1, -1),  // SE (index 6)
+            (-1, -1), // SW (index 7)
+        ];
+
+        self.check_squares_white.clear();
+        self.check_squares_black.clear();
+        self.slider_rays_white = [None; 8];
+        self.slider_rays_black = [None; 8];
+        self.discovered_check_squares_white.clear();
+        self.discovered_check_squares_black.clear();
+
+        // White King Rays (squares from which Black can check White)
+        if let Some(ref wk) = self.white_king_pos {
+            for (dx, dy) in KNIGHT_OFFSETS {
+                self.check_squares_white
+                    .insert((wk.x + dx, wk.y + dy, PieceType::Knight as u8));
+            }
+            // Black pawns attack downward
+            self.check_squares_white
+                .insert((wk.x - 1, wk.y + 1, PieceType::Pawn as u8));
+            self.check_squares_white
+                .insert((wk.x + 1, wk.y + 1, PieceType::Pawn as u8));
+
+            for (dir_idx, (dx, dy)) in DIRECTIONS.iter().enumerate() {
+                if let Some((bx, by)) = self.find_first_blocker_on_ray(wk.x, wk.y, *dx, *dy) {
+                    self.slider_rays_white[dir_idx] = Some((bx, by));
+                    // Discovered check: if bx,by is a BLACK piece, does it block a BLACK slider?
+                    if let Some(p1) = self.board.get_piece(bx, by) {
+                        if p1.color() == PlayerColor::Black {
+                            if let Some((bx2, by2)) =
+                                self.find_first_blocker_on_ray(bx, by, *dx, *dy)
+                            {
+                                if let Some(p2) = self.board.get_piece(bx2, by2) {
+                                    if p2.color() == PlayerColor::Black {
+                                        let is_ortho = dir_idx < 4;
+                                        let pt2 = p2.piece_type();
+                                        use crate::attacks::{is_diag_slider, is_ortho_slider};
+                                        if (is_ortho && is_ortho_slider(pt2))
+                                            || (!is_ortho && is_diag_slider(pt2))
+                                        {
+                                            self.discovered_check_squares_black.insert((bx, by));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Black King Rays (squares from which White can check Black)
+        if let Some(ref bk) = self.black_king_pos {
+            for (dx, dy) in KNIGHT_OFFSETS {
+                self.check_squares_black
+                    .insert((bk.x + dx, bk.y + dy, PieceType::Knight as u8));
+            }
+            // White pawns attack upward
+            self.check_squares_black
+                .insert((bk.x - 1, bk.y - 1, PieceType::Pawn as u8));
+            self.check_squares_black
+                .insert((bk.x + 1, bk.y - 1, PieceType::Pawn as u8));
+
+            for (dir_idx, (dx, dy)) in DIRECTIONS.iter().enumerate() {
+                if let Some((bx, by)) = self.find_first_blocker_on_ray(bk.x, bk.y, *dx, *dy) {
+                    self.slider_rays_black[dir_idx] = Some((bx, by));
+                    // Discovered check: if bx,by is a WHITE piece, does it block a WHITE slider?
+                    if let Some(p1) = self.board.get_piece(bx, by) {
+                        if p1.color() == PlayerColor::White {
+                            if let Some((bx2, by2)) =
+                                self.find_first_blocker_on_ray(bx, by, *dx, *dy)
+                            {
+                                if let Some(p2) = self.board.get_piece(bx2, by2) {
+                                    if p2.color() == PlayerColor::White {
+                                        let is_ortho = dir_idx < 4;
+                                        let pt2 = p2.piece_type();
+                                        use crate::attacks::{is_diag_slider, is_ortho_slider};
+                                        if (is_ortho && is_ortho_slider(pt2))
+                                            || (!is_ortho && is_diag_slider(pt2))
+                                        {
+                                            self.discovered_check_squares_white.insert((bx, by));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Find the first blocker on a ray from (start_x, start_y) in direction (dx, dy).
+    /// Uses spatial indices for O(1) lookup per direction.
+    /// Returns Some((x, y)) if a blocker exists, None if ray is infinite.
+    #[inline]
+    fn find_first_blocker_on_ray(
+        &self,
+        start_x: i64,
+        start_y: i64,
+        dx: i64,
+        dy: i64,
+    ) -> Option<(i64, i64)> {
+        // Use spatial indices to find nearest piece in direction
+        // SpatialIndices stores (coord, packed_piece) tuples sorted by coord
+        // Field names: cols (x -> list of y), rows (y -> list of x),
+        //              diag1 (x-y -> list of x), diag2 (x+y -> list of x)
+
+        if dx == 0 {
+            // Vertical ray (N or S) - use cols[start_x] to get all y coords
+            if let Some(col_vec) = self.spatial_indices.cols.get(&start_x) {
+                // Use find_nearest with direction (+1 or -1)
+                if let Some((found_y, _packed)) = SpatialIndices::find_nearest(col_vec, start_y, dy)
+                {
+                    return Some((start_x, found_y));
+                }
+            }
+        } else if dy == 0 {
+            // Horizontal ray (E or W) - use rows[start_y] to get all x coords
+            if let Some(row_vec) = self.spatial_indices.rows.get(&start_y) {
+                if let Some((found_x, _packed)) = SpatialIndices::find_nearest(row_vec, start_x, dx)
+                {
+                    return Some((found_x, start_y));
+                }
+            }
+        } else {
+            // Diagonal rays
+            let diag_key = start_x - start_y;
+            let anti_key = start_x + start_y;
+
+            if dx == dy {
+                // Main diagonal (NE or SW: dx == dy) - use diag1
+                if let Some(diag_vec) = self.spatial_indices.diag1.get(&diag_key) {
+                    // diag1 is indexed by x, so search for x in direction dx
+                    if let Some((found_x, _packed)) =
+                        SpatialIndices::find_nearest(diag_vec, start_x, dx)
+                    {
+                        // Reconstruct y from x: on main diagonal, x - y = diag_key
+                        let found_y = found_x - diag_key;
+                        return Some((found_x, found_y));
+                    }
+                }
+            } else {
+                // Anti-diagonal (NW or SE: dx != dy) - use diag2
+                if let Some(anti_vec) = self.spatial_indices.diag2.get(&anti_key) {
+                    // diag2 is indexed by x, search in direction dx
+                    if let Some((found_x, _packed)) =
+                        SpatialIndices::find_nearest(anti_vec, start_x, dx)
+                    {
+                        // Reconstruct y from x: on anti-diagonal, x + y = anti_key
+                        let found_y = anti_key - found_x;
+                        return Some((found_x, found_y));
+                    }
+                }
+            }
+        }
+        None // Infinite ray
     }
 
     /// Initialize starting_squares from the current board: all non-pawn,

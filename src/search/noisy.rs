@@ -566,13 +566,6 @@ fn negamax_noisy(
     let mut legal_moves = 0;
     let mut quiets_searched: MoveList = MoveList::new();
 
-    // Find enemy king position for check detection
-    let enemy_king_pos = match game.turn {
-        crate::board::PlayerColor::White => game.black_king_pos,
-        crate::board::PlayerColor::Black => game.white_king_pos,
-        crate::board::PlayerColor::Neutral => None,
-    };
-
     // New depth for child nodes
     let new_depth = depth.saturating_sub(1);
 
@@ -582,10 +575,8 @@ fn negamax_noisy(
         let captured_type = captured_piece.map(|p| p.piece_type());
         let is_promotion = m.promotion.is_some();
 
-        // Check if this move gives check
-        let gives_check = enemy_king_pos.as_ref().map_or(false, |ek| {
-            super::movegen::StagedMoveGen::move_gives_check_simple(game, m, ek)
-        });
+        // Check if this move gives check (O(1) for knights/pawns)
+        let gives_check = super::movegen::StagedMoveGen::move_gives_check_fast(game, m);
 
         // In-move pruning at shallow depths
         if !is_pv && game.has_non_pawn_material(game.turn) && best_score > -MATE_SCORE {
@@ -809,12 +800,17 @@ fn negamax_noisy(
 
                 searcher.update_history(m.piece.piece_type(), idx, bonus);
 
+                // Low Ply History update (Stockfish-style)
+                searcher.update_low_ply_history(ply, idx, bonus);
+
                 for quiet in &quiets_searched {
                     let qidx = hash_move_dest(quiet);
                     if quiet.piece.piece_type() == m.piece.piece_type() && qidx == idx {
                         continue;
                     }
                     searcher.update_history(quiet.piece.piece_type(), qidx, -bonus);
+                    // Penalize other quiets in low ply history too
+                    searcher.update_low_ply_history(ply, qidx, -bonus);
                 }
 
                 searcher.killers[ply][1] = searcher.killers[ply][0].clone();
@@ -828,7 +824,8 @@ fn negamax_noisy(
                     }
                 }
 
-                for &plies_ago in &[0usize, 1, 3] {
+                // Continuation history update (Stockfish indices: 0, 1, 2, 3, 5)
+                for &plies_ago in &[0usize, 1, 2, 3, 5] {
                     if ply >= plies_ago + 1 {
                         if let Some(ref prev_move) = searcher.move_history[ply - plies_ago - 1] {
                             let prev_piece =
