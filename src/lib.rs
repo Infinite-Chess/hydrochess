@@ -407,7 +407,7 @@ impl Engine {
             special_rights,
             en_passant: None,
             halfmove_clock: js_game.halfmove_clock,
-            fullmove_number: 1, // Final value set from JS after history replay
+            fullmove_number: 1,
             material_score: 0,
             game_rules,
             variant: js_game
@@ -476,13 +476,6 @@ impl Engine {
                 }
             }
         }
-
-        // Apply target fullmove number from JS (the "end" value)
-        game.fullmove_number = if js_game.fullmove_number == 0 {
-            1
-        } else {
-            js_game.fullmove_number
-        };
 
         // Optional clock information (similar to UCI wtime/btime/winc/binc).
         let clock = js_game.clock;
@@ -664,8 +657,8 @@ impl Engine {
             amp.max(0)
         } else {
             match strength {
-                1 => 50,
-                2 => 25,
+                1 => 200,
+                2 => 100,
                 _ => 0, // strength 3 = no noise
             }
         };

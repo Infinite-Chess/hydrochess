@@ -382,15 +382,13 @@ impl TranspositionTable {
     /// On x86_64: uses _mm_prefetch with _MM_HINT_T0 (L1 cache)
     /// On other: no-op
     #[inline]
+    #[cfg(all(target_arch = "x86_64", not(target_arch = "wasm32")))]
     pub fn prefetch_entry(&self, hash: u64) {
-        #[cfg(all(target_arch = "x86_64", not(target_arch = "wasm32")))]
-        {
-            use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-            let idx = self.bucket_index(hash);
-            let ptr = self.buckets.as_ptr().wrapping_add(idx) as *const i8;
-            // SAFETY: ptr points into a valid, allocated slice
-            unsafe { _mm_prefetch(ptr, _MM_HINT_T0) };
-        }
+        use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+        let idx = self.bucket_index(hash);
+        let ptr = self.buckets.as_ptr().wrapping_add(idx) as *const i8;
+        // SAFETY: ptr points into a valid, allocated slice
+        unsafe { _mm_prefetch(ptr, _MM_HINT_T0) };
     }
 
     /// Probe the TT for a position.

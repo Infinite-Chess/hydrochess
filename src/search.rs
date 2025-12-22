@@ -650,14 +650,7 @@ impl Searcher {
             return false;
         }
 
-        // Check time only every N nodes to keep the hot path cheap, especially
-        // on wasm where elapsed_ms() crosses the JS boundary.
-        #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
-        const TIME_CHECK_MASK: u64 = 8191; // every 8192 nodes
-        #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
-        const TIME_CHECK_MASK: u64 = 2047; // every 2048 nodes
-
-        if self.hot.nodes & TIME_CHECK_MASK == 0 {
+        if self.hot.nodes & 8191 == 0 {
             if self.hot.timer.elapsed_ms() >= self.hot.time_limit_ms {
                 self.hot.stopped = true;
             }
@@ -1997,6 +1990,7 @@ fn negamax(
         // Prefetch TT entry for child position BEFORE making the move.
         // This warms the cache so the TT probe in the recursive call is faster.
         // Compute approximate child hash: toggle side + move piece from->to
+        #[cfg(all(target_arch = "x86_64", not(target_arch = "wasm32")))]
         {
             let p_type = m.piece.piece_type();
             let p_color = m.piece.color();
@@ -2004,8 +1998,6 @@ fn negamax(
                 ^ SIDE_KEY
                 ^ piece_key(p_type, p_color, m.from.x, m.from.y)
                 ^ piece_key(p_type, p_color, m.to.x, m.to.y);
-
-            #[cfg(all(target_arch = "x86_64", not(target_arch = "wasm32")))]
             searcher.tt.prefetch_entry(child_hash);
         }
 
