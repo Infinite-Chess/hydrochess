@@ -3,7 +3,7 @@ name: Build & Release WASM Engine
 # Run this when code is pushed to the main branch
 on:
   push:
-    branches: [ "main" ]
+    branches: ['main']
   # Also allow clicking a button to run manually
   workflow_dispatch:
 
@@ -27,23 +27,15 @@ jobs:
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
       - name: Build WASM (Web Target)
-        # Use identical flags in the hydrochess code
+        # Use identical flags as in the hydrochess code
         run: wasm-pack build --target web
 
-      # Force the 'nightly' tag to point to this commit, otherwise the release might be attached to an old version of the code.
-      - name: Update Nightly Tag
-        run: |
-          git config user.name "GitHub Actions"
-          git config user.email "actions@github.com"
-          git tag -f nightly
-          git push origin nightly --force
-
-      - name: Update Nightly Release
+      - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          # Update the same "nightly" tag every time so the URL stays constant
-          tag_name: nightly
-          name: Nightly Build (Latest)
+          # Increment the v.0.1.X version based on the run number
+          tag_name: v0.1.${{ github.run_number }}
+          name: v0.1.${{ github.run_number }}
           draft: false
           prerelease: false
           files: |
