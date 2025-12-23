@@ -370,27 +370,39 @@ fn evaluate_inner(game: &GameState) -> i32 {
     // Try scaled mop-up evaluation based on material imbalance
     // This runs when one side has < 40% of starting material
     // NOTE: One side might not have a king (checkmate practice positions)
+    // Mop-up and pawn advancement (one side has very few pieces)
+    let white_pieces = game.white_piece_count.saturating_sub(game.white_pawn_count);
+    let black_pieces = game.black_piece_count.saturating_sub(game.black_pawn_count);
+
+    // Call optimized single-pass advancement check
+    let (pawn_adv_score, white_has_promo, black_has_promo) = evaluate_all_pawn_advancements(game);
+    score += pawn_adv_score;
+
     let mut mop_up_applied = false;
 
     // Check if black is losing (white has material advantage or black has few pieces)
-    if let Some(_scale) =
-        crate::evaluation::mop_up::calculate_mop_up_scale(game, PlayerColor::Black)
-    {
-        // Need enemy king as target
-        if let Some(bk) = &black_king {
-            score += crate::evaluation::mop_up::evaluate_mop_up_scaled(
-                game,
-                white_king.as_ref(),
-                bk,
-                PlayerColor::White,
-                PlayerColor::Black,
-            );
-            mop_up_applied = true;
+    // SKIP mop-up if white has a promotable pawn to prioritize promotion
+    if black_pieces < 3 && white_pieces > 1 && !white_has_promo {
+        if let Some(_scale) =
+            crate::evaluation::mop_up::calculate_mop_up_scale(game, PlayerColor::Black)
+        {
+            // Need enemy king as target
+            if let Some(bk) = &black_king {
+                score += crate::evaluation::mop_up::evaluate_mop_up_scaled(
+                    game,
+                    white_king.as_ref(),
+                    bk,
+                    PlayerColor::White,
+                    PlayerColor::Black,
+                );
+                mop_up_applied = true;
+            }
         }
     }
 
     // Check if white is losing (black has material advantage or white has few pieces)
-    if !mop_up_applied {
+    // SKIP if black has a promotable pawn
+    if !mop_up_applied && white_pieces < 3 && black_pieces > 1 && !black_has_promo {
         if let Some(_scale) =
             crate::evaluation::mop_up::calculate_mop_up_scale(game, PlayerColor::White)
         {
@@ -413,20 +425,6 @@ fn evaluate_inner(game: &GameState) -> i32 {
         score += evaluate_pieces(game, &white_king, &black_king);
         score += evaluate_king_safety(game, &white_king, &black_king);
         score += evaluate_pawn_structure(game);
-    }
-
-    // Pawn advancement bonus for endgame (opponent has under 3 pieces)
-    // Helps prioritize pawn promotion when mop-up doesn't apply
-    let white_pieces = game.white_piece_count.saturating_sub(game.white_pawn_count);
-    let black_pieces = game.black_piece_count.saturating_sub(game.black_pawn_count);
-
-    // White's pawn advancement bonus (when black has few pieces)
-    if black_pieces < 3 && game.white_pawn_count > 0 {
-        score += evaluate_pawn_advancement_endgame(game, PlayerColor::White);
-    }
-    // Black's pawn advancement bonus (when white has few pieces)
-    if white_pieces < 3 && game.black_pawn_count > 0 {
-        score -= evaluate_pawn_advancement_endgame(game, PlayerColor::Black);
     }
 
     // Return from current player's perspective
@@ -1183,47 +1181,125 @@ pub fn evaluate_pawn_position(
 }
 
 /// Evaluate pawn advancement bonus for endgame positions
-/// Called when opponent has under 3 pieces to prioritize promotion
-fn evaluate_pawn_advancement_endgame(game: &GameState, color: PlayerColor) -> i32 {
-    let mut bonus: i32 = 0;
-    let is_white = color == PlayerColor::White;
-    let promo_rank = if is_white {
-        game.white_promo_rank
-    } else {
-        game.black_promo_rank
-    };
+/// One-pass version that handles both colors and returns (score, w_has_promo, b_has_promo)
+/// Only applies bonus to the SINGLE most advanced promotable pawn per color
+#[inline(always)]
+fn evaluate_all_pawn_advancements(game: &GameState) -> (i32, bool, bool) {
+    let white_pieces = game.white_piece_count.saturating_sub(game.white_pawn_count);
+    let black_pieces = game.black_piece_count.saturating_sub(game.black_pawn_count);
 
-    for (_x, y, piece) in game.board.iter_pieces_by_color(is_white) {
-        if piece.piece_type() != PieceType::Pawn {
-            continue;
-        }
+    let w_active = black_pieces < 3 && game.white_pawn_count > 0;
+    let b_active = white_pieces < 3 && game.black_pawn_count > 0;
 
-        let dist = if is_white {
-            (promo_rank - y).max(0)
-        } else {
-            (y - promo_rank).max(0)
-        };
-
-        // Skip pawns past promotion rank
-        if dist < 0 {
-            continue;
-        }
-
-        // MASSIVE bonus that scales with advancement
-        // Each step closer = +200 bonus, so pushing is always best
-        // Dist 7 = 600, Dist 6 = 800, Dist 5 = 1000, etc.
-        let pawn_bonus = if dist <= 1 {
-            2500 // About to promote - HUGE
-        } else if dist <= 2 {
-            2000 // Two away
-        } else {
-            // Linear: 200 per step closer, base of (10-dist)*200
-            ((10 - dist.min(10)) as i32) * 200
-        };
-        bonus += pawn_bonus;
+    if !w_active && !b_active {
+        return (0, false, false);
     }
 
-    bonus
+    let mut white_max_y = i64::MIN;
+    let mut black_min_y = i64::MAX;
+    let w_promo = game.white_promo_rank;
+    let b_promo = game.black_promo_rank;
+
+    let mut w_to_find = game.white_pawn_count as i32;
+    let mut b_to_find = game.black_pawn_count as i32;
+    let mut w_done = !w_active;
+    let mut b_done = !b_active;
+
+    for (_cx, cy, tile) in game.board.tiles.iter() {
+        let occ_pawns = tile.occ_pawns;
+        if occ_pawns == 0 {
+            continue;
+        }
+
+        let base_y = cy * 8;
+
+        // Process White pawns
+        let bits_w = occ_pawns & tile.occ_white;
+        if bits_w != 0 {
+            let count = bits_w.count_ones() as i32;
+            w_to_find -= count;
+
+            if !w_done && base_y + 7 > white_max_y {
+                let mut active_bits = bits_w;
+                if base_y >= w_promo {
+                    active_bits = 0;
+                } else if base_y + 7 >= w_promo {
+                    let local_row_limit = (w_promo - base_y) as usize;
+                    active_bits &= (1u64 << (local_row_limit * 8)).wrapping_sub(1);
+                }
+
+                if active_bits != 0 {
+                    let idx = 63 - active_bits.leading_zeros() as usize;
+                    let y = base_y + (idx / 8) as i64;
+                    if y > white_max_y {
+                        white_max_y = y;
+                        if white_max_y == w_promo - 1 {
+                            w_done = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Process Black pawns
+        let bits_b = occ_pawns & tile.occ_black;
+        if bits_b != 0 {
+            let count = bits_b.count_ones() as i32;
+            b_to_find -= count;
+
+            if !b_done && base_y < black_min_y {
+                let mut active_bits = bits_b;
+                if base_y + 7 <= b_promo {
+                    active_bits = 0;
+                } else if base_y <= b_promo {
+                    let local_row_start = (b_promo - base_y + 1) as usize;
+                    active_bits &= !((1u64 << (local_row_start * 8)).wrapping_sub(1));
+                }
+
+                if active_bits != 0 {
+                    let idx = active_bits.trailing_zeros() as usize;
+                    let y = base_y + (idx / 8) as i64;
+                    if y < black_min_y {
+                        black_min_y = y;
+                        if black_min_y == b_promo + 1 {
+                            b_done = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if w_to_find <= 0 && b_to_find <= 0 {
+            break;
+        }
+    }
+
+    let mut score = 0;
+    let white_has_promo = white_max_y != i64::MIN;
+    let black_has_promo = black_min_y != i64::MAX;
+
+    if white_has_promo {
+        let dist = w_promo - white_max_y;
+        score += if dist <= 1 {
+            500
+        } else if dist <= 2 {
+            350
+        } else {
+            ((10 - dist.min(10)) as i32) * 40
+        };
+    }
+    if black_has_promo {
+        let dist = black_min_y - b_promo;
+        score -= if dist <= 1 {
+            500
+        } else if dist <= 2 {
+            350
+        } else {
+            ((10 - dist.min(10)) as i32) * 40
+        };
+    }
+
+    (score, white_has_promo, black_has_promo)
 }
 
 // ==================== Fairy Piece Evaluation ====================

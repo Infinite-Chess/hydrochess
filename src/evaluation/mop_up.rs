@@ -133,42 +133,6 @@ pub fn is_lone_king(game: &GameState, color: PlayerColor) -> bool {
     }
 }
 
-/// Check if a side has any pawn that can still promote
-/// Uses bitboard for fast pawn-only iteration
-#[inline(always)]
-pub fn has_promotable_pawn(board: &Board, color: PlayerColor, promo_rank: i64) -> bool {
-    let is_white = color == PlayerColor::White;
-    for (_cx, cy, tile) in board.tiles.iter() {
-        // Fast bitboard check: only look at pawns of this color
-        let color_pawns = tile.occ_pawns
-            & if is_white {
-                tile.occ_white
-            } else {
-                tile.occ_black
-            };
-        if color_pawns == 0 {
-            continue;
-        }
-        // Check if ANY pawn in this tile can promote
-        let mut bits = color_pawns;
-        while bits != 0 {
-            let idx = bits.trailing_zeros() as usize;
-            bits &= bits - 1;
-            let y = cy * 8 + (idx / 8) as i64;
-            if is_white {
-                if y < promo_rank {
-                    return true;
-                }
-            } else {
-                if y > promo_rank {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
 /// Calculate mop-up scaling factor (0-100). Returns None if:
 /// - Opponent has >= 20% of starting non-pawn pieces
 /// - Winning side has no non-pawn pieces (only king/pawns)
@@ -200,25 +164,7 @@ pub fn calculate_mop_up_scale(game: &GameState, losing_color: PlayerColor) -> Op
         return None; // Don't mop-up with just king+pawns
     }
 
-    // Check if winning side has promotable pawns - reduce scale to prioritize pawn advancement
-    let winning_color = if losing_color == PlayerColor::White {
-        PlayerColor::Black
-    } else {
-        PlayerColor::White
-    };
-    let (pawn_count, promo_rank) = if winning_color == PlayerColor::White {
-        (game.white_pawn_count, game.white_promo_rank)
-    } else {
-        (game.black_pawn_count, game.black_promo_rank)
-    };
-    let has_promo_pawn =
-        pawn_count > 0 && has_promotable_pawn(&game.board, winning_color, promo_rank);
-
     if losing_pieces == 0 {
-        // Lone king - but reduce scale if winning side has promotable pawns
-        if has_promo_pawn {
-            return None;
-        }
         return Some(100); // Full mop-up
     }
 
