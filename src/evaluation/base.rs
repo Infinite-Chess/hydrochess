@@ -369,29 +369,23 @@ fn evaluate_inner(game: &GameState) -> i32 {
 
     // Try scaled mop-up evaluation based on material imbalance
     // This runs when one side has < 40% of starting material
+    // NOTE: One side might not have a king (checkmate practice positions)
     let mut mop_up_applied = false;
 
     // Check if black is losing (white has material advantage or black has few pieces)
     if let Some(_scale) =
         crate::evaluation::mop_up::calculate_mop_up_scale(game, PlayerColor::Black)
     {
-        if let (Some(wk), Some(bk)) = (&white_king, &black_king) {
-            // Don't prioritize mop-up if we have promotable pawns
-            let white_has_promo = crate::evaluation::mop_up::has_promotable_pawn(
-                &game.board,
+        // Need enemy king as target
+        if let Some(bk) = &black_king {
+            score += crate::evaluation::mop_up::evaluate_mop_up_scaled(
+                game,
+                white_king.as_ref(),
+                bk,
                 PlayerColor::White,
-                game.white_promo_rank,
+                PlayerColor::Black,
             );
-            if !white_has_promo {
-                score += crate::evaluation::mop_up::evaluate_mop_up_scaled(
-                    game,
-                    wk,
-                    bk,
-                    PlayerColor::White,
-                    PlayerColor::Black,
-                );
-                mop_up_applied = true;
-            }
+            mop_up_applied = true;
         }
     }
 
@@ -400,22 +394,16 @@ fn evaluate_inner(game: &GameState) -> i32 {
         if let Some(_scale) =
             crate::evaluation::mop_up::calculate_mop_up_scale(game, PlayerColor::White)
         {
-            if let (Some(wk), Some(bk)) = (&white_king, &black_king) {
-                let black_has_promo = crate::evaluation::mop_up::has_promotable_pawn(
-                    &game.board,
+            // Need enemy king as target
+            if let Some(wk) = &white_king {
+                score -= crate::evaluation::mop_up::evaluate_mop_up_scaled(
+                    game,
+                    black_king.as_ref(),
+                    wk,
                     PlayerColor::Black,
-                    game.black_promo_rank,
+                    PlayerColor::White,
                 );
-                if !black_has_promo {
-                    score -= crate::evaluation::mop_up::evaluate_mop_up_scaled(
-                        game,
-                        bk,
-                        wk,
-                        PlayerColor::Black,
-                        PlayerColor::White,
-                    );
-                    mop_up_applied = true;
-                }
+                mop_up_applied = true;
             }
         }
     }
@@ -425,6 +413,20 @@ fn evaluate_inner(game: &GameState) -> i32 {
         score += evaluate_pieces(game, &white_king, &black_king);
         score += evaluate_king_safety(game, &white_king, &black_king);
         score += evaluate_pawn_structure(game);
+    }
+
+    // Pawn advancement bonus for endgame (opponent has under 3 pieces)
+    // Helps prioritize pawn promotion when mop-up doesn't apply
+    let white_pieces = game.white_piece_count.saturating_sub(game.white_pawn_count);
+    let black_pieces = game.black_piece_count.saturating_sub(game.black_pawn_count);
+
+    // White's pawn advancement bonus (when black has few pieces)
+    if black_pieces < 3 && game.white_pawn_count > 0 {
+        score += evaluate_pawn_advancement_endgame(game, PlayerColor::White);
+    }
+    // Black's pawn advancement bonus (when white has few pieces)
+    if white_pieces < 3 && game.black_pawn_count > 0 {
+        score -= evaluate_pawn_advancement_endgame(game, PlayerColor::Black);
     }
 
     // Return from current player's perspective
@@ -1175,6 +1177,50 @@ pub fn evaluate_pawn_position(
     // Central pawns are valuable
     if x >= 3 && x <= 5 {
         bonus += 5;
+    }
+
+    bonus
+}
+
+/// Evaluate pawn advancement bonus for endgame positions
+/// Called when opponent has under 3 pieces to prioritize promotion
+fn evaluate_pawn_advancement_endgame(game: &GameState, color: PlayerColor) -> i32 {
+    let mut bonus: i32 = 0;
+    let is_white = color == PlayerColor::White;
+    let promo_rank = if is_white {
+        game.white_promo_rank
+    } else {
+        game.black_promo_rank
+    };
+
+    for (_x, y, piece) in game.board.iter_pieces_by_color(is_white) {
+        if piece.piece_type() != PieceType::Pawn {
+            continue;
+        }
+
+        let dist = if is_white {
+            (promo_rank - y).max(0)
+        } else {
+            (y - promo_rank).max(0)
+        };
+
+        // Skip pawns past promotion rank
+        if dist < 0 {
+            continue;
+        }
+
+        // MASSIVE bonus that scales with advancement
+        // Each step closer = +200 bonus, so pushing is always best
+        // Dist 7 = 600, Dist 6 = 800, Dist 5 = 1000, etc.
+        let pawn_bonus = if dist <= 1 {
+            2500 // About to promote - HUGE
+        } else if dist <= 2 {
+            2000 // Two away
+        } else {
+            // Linear: 200 per step closer, base of (10-dist)*200
+            ((10 - dist.min(10)) as i32) * 200
+        };
+        bonus += pawn_bonus;
     }
 
     bonus
