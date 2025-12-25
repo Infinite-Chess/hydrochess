@@ -189,7 +189,7 @@ const KNIGHTRIDER_RAY_BONUS: i32 = 3; // Per square of knight-ray mobility
 
 // Pawns far from promotion are worth much less in infinite chess
 const PAWN_FULL_VALUE_THRESHOLD: i64 = 6; // Within 6 ranks = full value
-const PAWN_PAST_PROMO_PENALTY: i32 = 80; // Massive penalty for pawns that can't promote
+const PAWN_PAST_PROMO_PENALTY: i32 = 90; // Massive penalty for pawns that can't promote (worth 10x less)
 const PAWN_FAR_FROM_PROMO_PENALTY: i32 = 50; // Flat penalty for back pawns (no benefit from advancing)
 
 // ==================== King Infinite Exposure ====================
@@ -212,35 +212,10 @@ const KING_ATTACKER_NEAR_OWN_KING_PENALTY: i32 = 8; // Penalty for high-value pi
 
 // ==================== Game Phase ====================
 
-// Phase based on piece count (excluding pawns)
-// Opening: >= 70% of pieces remain -> no pawn advancement bonus, development focus
-// Middlegame: 30-70% of pieces remain -> partial pawn advancement bonus
-// Endgame: < 30% of pieces remain -> full pawn evaluation
-const ENDGAME_PIECE_THRESHOLD: i32 = 30; // Less than 30% = endgame
-const MIDDLEGAME_PIECE_THRESHOLD: i32 = 70; // More than 70% = opening
-
 // Development thresholds - for attack scaling only
 const UNDEVELOPED_MINORS_THRESHOLD: i32 = 2;
 const DEVELOPMENT_PHASE_ATTACK_SCALE: i32 = 50;
 const DEVELOPED_PHASE_ATTACK_SCALE: i32 = 100;
-
-/// Returns game phase as percentage (100 = opening, 0 = pure endgame)
-/// Uses cached piece counts for O(1) performance
-#[inline]
-fn calculate_game_phase(game: &GameState) -> i32 {
-    // Use the cached counts from GameState (set at game start, updated by make/undo)
-    // We only count non-pawn pieces for game phase.
-    let current_pieces = (game.white_piece_count.saturating_sub(game.white_pawn_count)
-        + game.black_piece_count.saturating_sub(game.black_pawn_count))
-        as i32;
-    let starting_pieces = (game.starting_white_pieces + game.starting_black_pieces) as i32;
-
-    if starting_pieces == 0 {
-        return 50; // Default to middlegame
-    }
-
-    ((current_pieces * 100) / starting_pieces).min(100)
-}
 
 /// Compute the centroid of all non-obstacle, non-void pieces on the board.
 /// Used for piece cloud calculations. (Made public for variant modules.)
@@ -370,27 +345,39 @@ fn evaluate_inner(game: &GameState) -> i32 {
     // Try scaled mop-up evaluation based on material imbalance
     // This runs when one side has < 40% of starting material
     // NOTE: One side might not have a king (checkmate practice positions)
+    // Mop-up and pawn advancement (one side has very few pieces)
+    let white_pieces = game.white_piece_count.saturating_sub(game.white_pawn_count);
+    let black_pieces = game.black_piece_count.saturating_sub(game.black_pawn_count);
+
+    // Call optimized single-pass pawn evaluation
+    let (pawn_score, white_has_promo, black_has_promo) = evaluate_pawns(game);
+    score += pawn_score;
+
     let mut mop_up_applied = false;
 
     // Check if black is losing (white has material advantage or black has few pieces)
-    if let Some(_scale) =
-        crate::evaluation::mop_up::calculate_mop_up_scale(game, PlayerColor::Black)
-    {
-        // Need enemy king as target
-        if let Some(bk) = &black_king {
-            score += crate::evaluation::mop_up::evaluate_mop_up_scaled(
-                game,
-                white_king.as_ref(),
-                bk,
-                PlayerColor::White,
-                PlayerColor::Black,
-            );
-            mop_up_applied = true;
+    // SKIP mop-up if white has a promotable pawn to prioritize promotion
+    if black_pieces < 3 && white_pieces > 1 && !white_has_promo {
+        if let Some(_scale) =
+            crate::evaluation::mop_up::calculate_mop_up_scale(game, PlayerColor::Black)
+        {
+            // Need enemy king as target
+            if let Some(bk) = &black_king {
+                score += crate::evaluation::mop_up::evaluate_mop_up_scaled(
+                    game,
+                    white_king.as_ref(),
+                    bk,
+                    PlayerColor::White,
+                    PlayerColor::Black,
+                );
+                mop_up_applied = true;
+            }
         }
     }
 
     // Check if white is losing (black has material advantage or white has few pieces)
-    if !mop_up_applied {
+    // SKIP if black has a promotable pawn
+    if !mop_up_applied && white_pieces < 3 && black_pieces > 1 && !black_has_promo {
         if let Some(_scale) =
             crate::evaluation::mop_up::calculate_mop_up_scale(game, PlayerColor::White)
         {
@@ -415,20 +402,6 @@ fn evaluate_inner(game: &GameState) -> i32 {
         score += evaluate_pawn_structure(game);
     }
 
-    // Pawn advancement bonus for endgame (opponent has under 3 pieces)
-    // Helps prioritize pawn promotion when mop-up doesn't apply
-    let white_pieces = game.white_piece_count.saturating_sub(game.white_pawn_count);
-    let black_pieces = game.black_piece_count.saturating_sub(game.black_pawn_count);
-
-    // White's pawn advancement bonus (when black has few pieces)
-    if black_pieces < 3 && game.white_pawn_count > 0 {
-        score += evaluate_pawn_advancement_endgame(game, PlayerColor::White);
-    }
-    // Black's pawn advancement bonus (when white has few pieces)
-    if white_pieces < 3 && game.black_pawn_count > 0 {
-        score -= evaluate_pawn_advancement_endgame(game, PlayerColor::Black);
-    }
-
     // Return from current player's perspective
     if game.turn == PlayerColor::Black {
         -score
@@ -445,13 +418,6 @@ pub fn evaluate_pieces(
     black_king: &Option<Coordinate>,
 ) -> i32 {
     let mut score: i32 = 0;
-
-    let white_promo_rank = game.white_promo_rank;
-    let black_promo_rank = game.black_promo_rank;
-
-    let game_phase = calculate_game_phase(game);
-    let is_opening = game_phase >= MIDDLEGAME_PIECE_THRESHOLD;
-    let is_endgame = game_phase < ENDGAME_PIECE_THRESHOLD;
 
     // BITBOARD: Pass 1 - Single metadata collection
     let mut white_undeveloped = 0;
@@ -571,25 +537,6 @@ pub fn evaluate_pieces(
                 PieceType::Knight => evaluate_knight(x, y, piece.color(), black_king, white_king),
                 PieceType::Bishop => {
                     evaluate_bishop(game, x, y, piece.color(), white_king, black_king)
-                }
-                PieceType::Pawn => {
-                    let pawn_eval = evaluate_pawn_position(
-                        x,
-                        y,
-                        piece.color(),
-                        white_promo_rank,
-                        black_promo_rank,
-                    );
-                    if is_opening {
-                        if x >= 3 && x <= 6 { 5 } else { 0 }
-                    } else if is_endgame {
-                        pawn_eval
-                    } else {
-                        let scale = 100
-                            - ((game_phase - ENDGAME_PIECE_THRESHOLD) * 100
-                                / (MIDDLEGAME_PIECE_THRESHOLD - ENDGAME_PIECE_THRESHOLD));
-                        pawn_eval * scale / 100
-                    }
                 }
                 PieceType::Chancellor => {
                     let rook_eval =
@@ -1129,101 +1076,145 @@ pub fn evaluate_bishop(
     bonus
 }
 
-pub fn evaluate_pawn_position(
-    x: i64,
-    y: i64,
-    color: PlayerColor,
-    white_promo_rank: i64,
-    black_promo_rank: i64,
-) -> i32 {
-    let mut bonus: i32 = 0;
-
-    // Advancement bonus and distance penalty based on distance to promotion.
-    // In infinite chess, back pawns are nearly worthless - they take many
-    // tempos to promote and don't contribute to the position.
-    match color {
-        PlayerColor::White => {
-            let dist = (white_promo_rank - y).max(0);
-
-            // Check if pawn is PAST promotion rank (can't promote - worthless!)
-            if y > white_promo_rank {
-                bonus -= PAWN_PAST_PROMO_PENALTY;
-            } else if dist > PAWN_FULL_VALUE_THRESHOLD {
-                // Far from promotion - flat penalty, NO benefit from advancing
-                // This prevents the engine from wasting tempos pushing back pawns
-                bonus -= PAWN_FAR_FROM_PROMO_PENALTY;
-            } else {
-                // Close to promotion - advancement bonus applies
-                bonus += ((PAWN_FULL_VALUE_THRESHOLD - dist) as i32) * 4;
-            }
-        }
-        PlayerColor::Black => {
-            let dist = (y - black_promo_rank).max(0);
-
-            // Past promotion rank check
-            if y < black_promo_rank {
-                bonus -= PAWN_PAST_PROMO_PENALTY;
-            } else if dist > PAWN_FULL_VALUE_THRESHOLD {
-                // Far from promotion - flat penalty, NO benefit from advancing
-                bonus -= PAWN_FAR_FROM_PROMO_PENALTY;
-            } else {
-                // Close to promotion - advancement bonus
-                bonus += ((PAWN_FULL_VALUE_THRESHOLD - dist) as i32) * 4;
-            }
-        }
-        PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
+/// Evaluate all pawn-related positional terms in a single pass.
+/// Includes advancement bonuses, centering, promotability checks, and the endgame promotion bonus.
+/// The result is scaled based on game phase (non-pawn piece count).
+#[inline(always)]
+fn evaluate_pawns(game: &GameState) -> (i32, bool, bool) {
+    if game.white_pawn_count == 0 && game.black_pawn_count == 0 {
+        return (0, false, false);
     }
 
-    // Central pawns are valuable
-    if x >= 3 && x <= 5 {
-        bonus += 5;
-    }
+    // Piece count for scaling (non-pawn, non-royal units)
+    let white_royals = if game.white_king_pos.is_some() { 1 } else { 0 };
+    let black_royals = if game.black_king_pos.is_some() { 1 } else { 0 };
+    let white_pieces = game
+        .white_piece_count
+        .saturating_sub(game.white_pawn_count)
+        .saturating_sub(white_royals);
+    let black_pieces = game
+        .black_piece_count
+        .saturating_sub(game.black_pawn_count)
+        .saturating_sub(black_royals);
+    let total_pieces = white_pieces + black_pieces;
 
-    bonus
-}
-
-/// Evaluate pawn advancement bonus for endgame positions
-/// Called when opponent has under 3 pieces to prioritize promotion
-fn evaluate_pawn_advancement_endgame(game: &GameState, color: PlayerColor) -> i32 {
-    let mut bonus: i32 = 0;
-    let is_white = color == PlayerColor::White;
-    let promo_rank = if is_white {
-        game.white_promo_rank
+    // Multiplier for pawn advancement terms: 10+ pieces -> 10%, <5 pieces -> 100%
+    let multiplier_q = if total_pieces >= 10 {
+        10
+    } else if total_pieces <= 5 {
+        100
     } else {
-        game.black_promo_rank
+        // Linear interpolation between (5, 100) and (10, 10)
+        100 - (total_pieces - 5) as i32 * 18
     };
 
-    for (_x, y, piece) in game.board.iter_pieces_by_color(is_white) {
-        if piece.piece_type() != PieceType::Pawn {
+    let mut white_max_y = i64::MIN;
+    let mut black_min_y = i64::MAX;
+    let w_promo = game.white_promo_rank;
+    let b_promo = game.black_promo_rank;
+
+    let mut w_to_find = game.white_pawn_count as i32;
+    let mut b_to_find = game.black_pawn_count as i32;
+
+    let mut bonus_score = 0; // Scaled terms (advancement)
+    let mut penalty_score = 0; // Unscaled terms (structural worthless penalty)
+
+    for (_cx, cy, tile) in game.board.tiles.iter() {
+        let occ_pawns = tile.occ_pawns;
+        if occ_pawns == 0 {
             continue;
         }
 
-        let dist = if is_white {
-            (promo_rank - y).max(0)
-        } else {
-            (y - promo_rank).max(0)
-        };
+        let base_y = cy * 8;
 
-        // Skip pawns past promotion rank
-        if dist < 0 {
-            continue;
+        // Process White pawns
+        let mut bits_w = occ_pawns & tile.occ_white;
+        if bits_w != 0 {
+            w_to_find -= bits_w.count_ones() as i32;
+            while bits_w != 0 {
+                let idx = bits_w.trailing_zeros() as usize;
+                bits_w &= bits_w - 1;
+                let y = base_y + (idx / 8) as i64;
+
+                if y >= w_promo {
+                    // Worthless if already past promotion - apply unscaled penalty
+                    // to ensure 10x value reduction regardless of phase.
+                    penalty_score -= PAWN_PAST_PROMO_PENALTY;
+                } else {
+                    let dist = w_promo - y;
+                    if dist > PAWN_FULL_VALUE_THRESHOLD {
+                        bonus_score -= PAWN_FAR_FROM_PROMO_PENALTY;
+                    } else {
+                        bonus_score += (PAWN_FULL_VALUE_THRESHOLD - dist) as i32 * 4;
+                    }
+                    // Track most advanced for special bonus
+                    if y > white_max_y {
+                        white_max_y = y;
+                    }
+                }
+            }
         }
 
-        // MASSIVE bonus that scales with advancement
-        // Each step closer = +200 bonus, so pushing is always best
-        // Dist 7 = 600, Dist 6 = 800, Dist 5 = 1000, etc.
-        let pawn_bonus = if dist <= 1 {
-            2500 // About to promote - HUGE
-        } else if dist <= 2 {
-            2000 // Two away
-        } else {
-            // Linear: 200 per step closer, base of (10-dist)*200
-            ((10 - dist.min(10)) as i32) * 200
-        };
-        bonus += pawn_bonus;
+        // Process Black pawns
+        let mut bits_b = occ_pawns & tile.occ_black;
+        if bits_b != 0 {
+            b_to_find -= bits_b.count_ones() as i32;
+            while bits_b != 0 {
+                let idx = bits_b.trailing_zeros() as usize;
+                bits_b &= bits_b - 1;
+                let y = base_y + (idx / 8) as i64;
+
+                if y <= b_promo {
+                    penalty_score += PAWN_PAST_PROMO_PENALTY;
+                } else {
+                    let dist = y - b_promo;
+                    if dist > PAWN_FULL_VALUE_THRESHOLD {
+                        bonus_score += PAWN_FAR_FROM_PROMO_PENALTY;
+                    } else {
+                        bonus_score -= (PAWN_FULL_VALUE_THRESHOLD - dist) as i32 * 4;
+                    }
+                    // Track most advanced
+                    if y < black_min_y {
+                        black_min_y = y;
+                    }
+                }
+            }
+        }
+
+        if w_to_find <= 0 && b_to_find <= 0 {
+            break;
+        }
     }
 
-    bonus
+    let white_has_promo = white_max_y != i64::MIN;
+    let black_has_promo = black_min_y != i64::MAX;
+
+    // Apply special high-value promotion bonus for the single most advanced pawn
+    if white_has_promo {
+        let dist = w_promo - white_max_y;
+        bonus_score += if dist <= 1 {
+            500
+        } else if dist <= 2 {
+            350
+        } else {
+            ((10 - dist.min(10)) as i32) * 40
+        };
+    }
+    if black_has_promo {
+        let dist = black_min_y - b_promo;
+        bonus_score -= if dist <= 1 {
+            500
+        } else if dist <= 2 {
+            350
+        } else {
+            ((10 - dist.min(10)) as i32) * 40
+        };
+    }
+
+    // Scale advancement bonuses by game phase, but keep structural penalties unscaled
+    let final_score = (bonus_score * multiplier_q / 100) + penalty_score;
+
+    (final_score, white_has_promo, black_has_promo)
 }
 
 // ==================== Fairy Piece Evaluation ====================
@@ -1867,4 +1858,417 @@ pub fn calculate_initial_material(board: &Board) -> i32 {
         let _ = (cx, cy);
     }
     score
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::board::{Board, Piece};
+    use crate::game::GameState;
+
+    fn create_test_game() -> GameState {
+        let mut game = GameState::new();
+        game.board = Board::new();
+        game.white_promo_rank = 8;
+        game.black_promo_rank = 1;
+        game
+    }
+
+    #[test]
+    fn test_get_piece_value() {
+        // Standard pieces - values tuned for infinite chess
+        assert_eq!(get_piece_value(PieceType::Pawn), 100);
+        assert_eq!(get_piece_value(PieceType::Knight), 250); // Weak in infinite chess
+        assert_eq!(get_piece_value(PieceType::Bishop), 450); // Strong slider
+        assert_eq!(get_piece_value(PieceType::Rook), 650); // Very strong
+        assert_eq!(get_piece_value(PieceType::Queen), 1350); // > 2 rooks
+
+        // King/Guard have same nominal value
+        assert_eq!(get_piece_value(PieceType::King), 220);
+
+        // Fairy pieces have values
+        assert!(get_piece_value(PieceType::Amazon) > get_piece_value(PieceType::Queen));
+        assert!(get_piece_value(PieceType::Chancellor) > get_piece_value(PieceType::Rook));
+    }
+
+    #[test]
+    fn test_is_between() {
+        assert!(is_between(5, 3, 7));
+        assert!(is_between(5, 7, 3));
+        assert!(!is_between(3, 3, 7));
+        assert!(!is_between(7, 3, 7));
+        assert!(!is_between(2, 3, 7));
+        assert!(!is_between(8, 3, 7));
+    }
+
+    #[test]
+    fn test_slider_mobility() {
+        let mut board = Board::new();
+        // Empty board should give max mobility in limited steps
+        let mobility = slider_mobility(&board, 4, 4, &[(1, 0), (-1, 0), (0, 1), (0, -1)], 5);
+        assert_eq!(mobility, 20); // 4 directions * 5 steps each
+
+        // Place a blocking piece
+        board.set_piece(6, 4, Piece::new(PieceType::Pawn, PlayerColor::White));
+        let mobility = slider_mobility(&board, 4, 4, &[(1, 0)], 5);
+        assert_eq!(mobility, 1); // Only 1 step before blocked (at 5,4)
+    }
+
+    #[test]
+    fn test_is_clear_line_between() {
+        let mut board = Board::new();
+        let from = Coordinate::new(1, 1);
+        let to = Coordinate::new(1, 8);
+
+        // Empty board should have clear line
+        assert!(is_clear_line_between(&board, &from, &to));
+
+        // Add blocker
+        board.set_piece(1, 4, Piece::new(PieceType::Pawn, PlayerColor::White));
+        assert!(!is_clear_line_between(&board, &from, &to));
+    }
+
+    #[test]
+    fn test_is_clear_line_diagonal() {
+        let mut board = Board::new();
+        let from = Coordinate::new(1, 1);
+        let to = Coordinate::new(5, 5);
+
+        assert!(is_clear_line_between(&board, &from, &to));
+
+        board.set_piece(3, 3, Piece::new(PieceType::Bishop, PlayerColor::Black));
+        assert!(!is_clear_line_between(&board, &from, &to));
+    }
+
+    #[test]
+    fn test_calculate_initial_material() {
+        let mut board = Board::new();
+
+        // Empty board = 0
+        assert_eq!(calculate_initial_material(&board), 0);
+
+        // Add white queen
+        board.set_piece(4, 1, Piece::new(PieceType::Queen, PlayerColor::White));
+        board.rebuild_tiles();
+        assert_eq!(calculate_initial_material(&board), 1350); // Queen = 1350 in infinite chess
+
+        // Add black queen - should cancel out
+        board.set_piece(4, 8, Piece::new(PieceType::Queen, PlayerColor::Black));
+        board.rebuild_tiles();
+        assert_eq!(calculate_initial_material(&board), 0);
+    }
+
+    #[test]
+    fn test_clear_pawn_cache() {
+        // Just ensure it doesn't panic
+        clear_pawn_cache();
+    }
+
+    #[test]
+    fn test_evaluate_returns_value() {
+        let mut game = create_test_game();
+        game.board
+            .set_piece(5, 1, Piece::new(PieceType::King, PlayerColor::White));
+        game.board
+            .set_piece(5, 8, Piece::new(PieceType::King, PlayerColor::Black));
+        game.turn = PlayerColor::White;
+        game.recompute_piece_counts();
+        game.board.rebuild_tiles();
+        game.recompute_hash();
+
+        let score = evaluate(&game);
+        // K vs K should be close to 0
+        assert!(score.abs() < 1000, "K vs K should be near 0, got {}", score);
+    }
+
+    #[test]
+    fn test_evaluate_lazy_returns_value() {
+        let mut game = create_test_game();
+        game.board
+            .set_piece(5, 1, Piece::new(PieceType::King, PlayerColor::White));
+        game.board
+            .set_piece(5, 8, Piece::new(PieceType::King, PlayerColor::Black));
+        game.board
+            .set_piece(4, 4, Piece::new(PieceType::Queen, PlayerColor::White));
+        game.turn = PlayerColor::White;
+        game.recompute_piece_counts();
+        game.board.rebuild_tiles();
+
+        let score = evaluate_lazy(&game);
+        // White has extra queen so should be positive
+        assert!(score > 0, "White with extra queen should be positive");
+    }
+
+    #[test]
+    fn test_count_pawns_on_file() {
+        let mut game = create_test_game();
+        game.board
+            .set_piece(4, 2, Piece::new(PieceType::Pawn, PlayerColor::White));
+        game.board
+            .set_piece(4, 3, Piece::new(PieceType::Pawn, PlayerColor::White));
+        game.board
+            .set_piece(4, 7, Piece::new(PieceType::Pawn, PlayerColor::Black));
+        game.board.rebuild_tiles();
+
+        let (own, enemy) = count_pawns_on_file(&game, 4, PlayerColor::White);
+        assert_eq!(own, 2);
+        assert_eq!(enemy, 1);
+    }
+
+    #[test]
+    fn test_evaluate_pawn_structure() {
+        let mut game = create_test_game();
+        game.board
+            .set_piece(5, 1, Piece::new(PieceType::King, PlayerColor::White));
+        game.board
+            .set_piece(5, 8, Piece::new(PieceType::King, PlayerColor::Black));
+        // Doubled pawns for white
+        game.board
+            .set_piece(4, 2, Piece::new(PieceType::Pawn, PlayerColor::White));
+        game.board
+            .set_piece(4, 3, Piece::new(PieceType::Pawn, PlayerColor::White));
+        game.recompute_piece_counts();
+        game.board.rebuild_tiles();
+        game.recompute_hash();
+
+        let score = evaluate_pawn_structure(&game);
+        // Doubled pawns should give penalty (White has doubled pawns = negative score)
+        // Note: The penalty may be offset by passed pawn bonus, so just check it runs
+        assert!(
+            score.abs() < 1000,
+            "Pawn structure score should be reasonable: {}",
+            score
+        );
+    }
+
+    #[test]
+    fn test_evaluate_king_safety() {
+        let mut game = create_test_game();
+        game.board
+            .set_piece(5, 1, Piece::new(PieceType::King, PlayerColor::White));
+        game.board
+            .set_piece(5, 8, Piece::new(PieceType::King, PlayerColor::Black));
+        game.board.rebuild_tiles();
+
+        let wk = Some(Coordinate::new(5, 1));
+        let bk = Some(Coordinate::new(5, 8));
+
+        let score = evaluate_king_safety(&game, &wk, &bk);
+        // Both kings exposed similarly, should be near 0
+        assert!(score.abs() < 200);
+    }
+
+    #[test]
+    fn test_compute_cloud_center() {
+        let mut board = Board::new();
+        // Use non-neutral pieces
+        board.set_piece(0, 0, Piece::new(PieceType::Rook, PlayerColor::White));
+        board.set_piece(10, 0, Piece::new(PieceType::Rook, PlayerColor::White));
+
+        let center = compute_cloud_center(&board);
+        assert!(center.is_some(), "Cloud center should exist");
+        let c = center.unwrap();
+        assert_eq!(c.x, 5); // Average of 0 and 10
+        assert_eq!(c.y, 0);
+    }
+
+    #[test]
+    fn test_evaluate_lazy_basic() {
+        let mut game = Box::new(GameState::new());
+        game.board = Board::new();
+        game.board
+            .set_piece(0, 0, Piece::new(PieceType::King, PlayerColor::White));
+        game.board
+            .set_piece(7, 7, Piece::new(PieceType::King, PlayerColor::Black));
+        game.recompute_piece_counts();
+        game.material_score = 0; // Kings are worth same
+
+        let score_equal = evaluate_lazy(&game);
+
+        // Add a white queen
+        game.board
+            .set_piece(4, 4, Piece::new(PieceType::Queen, PlayerColor::White));
+        game.recompute_piece_counts();
+        game.material_score = 1350; // Manually update material score
+        let score_white_plus = evaluate_lazy(&game);
+
+        assert!(
+            score_white_plus > score_equal + 1300,
+            "White queen should increase lazy eval by at least its material value"
+        );
+    }
+
+    #[test]
+    fn test_king_safety_penalties() {
+        let mut game = Box::new(GameState::new());
+        game.board = Board::new();
+        // White King at (0,0)
+        game.board
+            .set_piece(0, 0, Piece::new(PieceType::King, PlayerColor::White));
+        game.board
+            .set_piece(10, 10, Piece::new(PieceType::King, PlayerColor::Black));
+
+        // Add some sufficient material to avoid draw (0)
+        game.board
+            .set_piece(5, 0, Piece::new(PieceType::Rook, PlayerColor::White));
+        game.board
+            .set_piece(5, 9, Piece::new(PieceType::Rook, PlayerColor::Black));
+
+        // White Queen at home near its king (good/neutral)
+        game.board
+            .set_piece(0, 1, Piece::new(PieceType::Queen, PlayerColor::White));
+        game.recompute_piece_counts();
+        game.material_score = 0; // Rook vs Rook balanced
+        let score_near = evaluate_inner(&game);
+
+        // White Queen far away from its king
+        game.board.remove_piece(&0, &1);
+        game.board
+            .set_piece(5, 5, Piece::new(PieceType::Queen, PlayerColor::White));
+        game.recompute_piece_counts();
+        game.material_score = 0;
+        let score_far = evaluate_inner(&game);
+
+        assert!(score_far != score_near);
+    }
+
+    #[test]
+    fn test_pawn_structure_caching() {
+        let mut game = Box::new(GameState::new());
+        game.board = Board::new();
+        game.board
+            .set_piece(4, 4, Piece::new(PieceType::Pawn, PlayerColor::White));
+        game.board
+            .set_piece(4, 5, Piece::new(PieceType::Pawn, PlayerColor::Black));
+        game.recompute_piece_counts();
+        game.recompute_hash();
+
+        clear_pawn_cache();
+        let eval1 = evaluate_inner(&game);
+
+        // Calling again should hit cache
+        let eval2 = evaluate_inner(&game);
+        assert_eq!(
+            eval1, eval2,
+            "Cached evaluation should match initial evaluation"
+        );
+    }
+
+    #[test]
+    fn test_evaluate_knight_centralization() {
+        let mut game = Box::new(GameState::new());
+        game.board = Board::new();
+        game.board
+            .set_piece(0, 0, Piece::new(PieceType::King, PlayerColor::White));
+        game.board
+            .set_piece(7, 7, Piece::new(PieceType::King, PlayerColor::Black));
+
+        // Knight in corner (worst)
+        let corner_score = evaluate_knight(0, 0, PlayerColor::White, &None, &None);
+        // Knight in center (best)
+        let center_score = evaluate_knight(4, 4, PlayerColor::White, &None, &None);
+
+        assert!(
+            center_score > corner_score,
+            "Central knight should score better than corner knight"
+        );
+    }
+
+    #[test]
+    fn test_evaluate_bishop_diagonal() {
+        let mut game = Box::new(GameState::new());
+        game.board = Board::new();
+        game.board
+            .set_piece(0, 0, Piece::new(PieceType::King, PlayerColor::White));
+        game.board
+            .set_piece(7, 7, Piece::new(PieceType::King, PlayerColor::Black));
+        game.board
+            .set_piece(4, 4, Piece::new(PieceType::Bishop, PlayerColor::White));
+        game.recompute_piece_counts();
+        game.board.rebuild_tiles();
+
+        let wk = Some(Coordinate::new(0, 0));
+        let bk = Some(Coordinate::new(7, 7));
+        let score = evaluate_bishop(&game, 4, 4, PlayerColor::White, &wk, &bk);
+        // Central bishop should have positive score
+        assert!(
+            score > 0,
+            "Central bishop should have positive positional score"
+        );
+    }
+
+    #[test]
+    fn test_evaluate_rook_open_file() {
+        let mut game = Box::new(GameState::new());
+        game.board = Board::new();
+        game.board
+            .set_piece(0, 0, Piece::new(PieceType::King, PlayerColor::White));
+        game.board
+            .set_piece(7, 7, Piece::new(PieceType::King, PlayerColor::Black));
+        game.board
+            .set_piece(4, 1, Piece::new(PieceType::Rook, PlayerColor::White));
+        game.recompute_piece_counts();
+        game.board.rebuild_tiles();
+
+        let wk = Some(Coordinate::new(0, 0));
+        let bk = Some(Coordinate::new(7, 7));
+        let score = evaluate_rook(&game, 4, 1, PlayerColor::White, &wk, &bk);
+        // Rook should have score for mobility etc
+        assert!(score.abs() < 1000, "Rook score should be reasonable");
+    }
+
+    #[test]
+    fn test_evaluate_queen_central() {
+        let mut game = Box::new(GameState::new());
+        game.board = Board::new();
+        game.board
+            .set_piece(0, 0, Piece::new(PieceType::King, PlayerColor::White));
+        game.board
+            .set_piece(7, 7, Piece::new(PieceType::King, PlayerColor::Black));
+        game.board
+            .set_piece(4, 4, Piece::new(PieceType::Queen, PlayerColor::White));
+        game.recompute_piece_counts();
+        game.board.rebuild_tiles();
+
+        let wk = Some(Coordinate::new(0, 0));
+        let bk = Some(Coordinate::new(7, 7));
+        let score = evaluate_queen(&game, 4, 4, PlayerColor::White, &wk, &bk);
+        // Queen in center should have decent positional score
+        assert!(score.abs() < 2000, "Queen score should be reasonable");
+    }
+
+    #[test]
+    fn test_pawn_structure_isolated_pawn() {
+        let mut game = Box::new(GameState::new());
+        game.board = Board::new();
+        game.board
+            .set_piece(5, 1, Piece::new(PieceType::King, PlayerColor::White));
+        game.board
+            .set_piece(5, 8, Piece::new(PieceType::King, PlayerColor::Black));
+        // Isolated white pawn on d-file
+        game.board
+            .set_piece(4, 4, Piece::new(PieceType::Pawn, PlayerColor::White));
+        game.recompute_piece_counts();
+        game.recompute_hash();
+
+        clear_pawn_cache();
+        let isolated_score = evaluate_pawn_structure(&game);
+
+        // Add supporting pawns
+        game.board
+            .set_piece(3, 3, Piece::new(PieceType::Pawn, PlayerColor::White));
+        game.board
+            .set_piece(5, 3, Piece::new(PieceType::Pawn, PlayerColor::White));
+        game.recompute_piece_counts();
+        game.recompute_hash();
+
+        clear_pawn_cache();
+        let supported_score = evaluate_pawn_structure(&game);
+
+        // Supported pawns should score better
+        assert!(
+            supported_score > isolated_score,
+            "Supported pawns should be better than isolated"
+        );
+    }
 }

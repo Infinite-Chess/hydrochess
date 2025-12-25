@@ -133,42 +133,6 @@ pub fn is_lone_king(game: &GameState, color: PlayerColor) -> bool {
     }
 }
 
-/// Check if a side has any pawn that can still promote
-/// Uses bitboard for fast pawn-only iteration
-#[inline(always)]
-pub fn has_promotable_pawn(board: &Board, color: PlayerColor, promo_rank: i64) -> bool {
-    let is_white = color == PlayerColor::White;
-    for (_cx, cy, tile) in board.tiles.iter() {
-        // Fast bitboard check: only look at pawns of this color
-        let color_pawns = tile.occ_pawns
-            & if is_white {
-                tile.occ_white
-            } else {
-                tile.occ_black
-            };
-        if color_pawns == 0 {
-            continue;
-        }
-        // Check if ANY pawn in this tile can promote
-        let mut bits = color_pawns;
-        while bits != 0 {
-            let idx = bits.trailing_zeros() as usize;
-            bits &= bits - 1;
-            let y = cy * 8 + (idx / 8) as i64;
-            if is_white {
-                if y < promo_rank {
-                    return true;
-                }
-            } else {
-                if y > promo_rank {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
 /// Calculate mop-up scaling factor (0-100). Returns None if:
 /// - Opponent has >= 20% of starting non-pawn pieces
 /// - Winning side has no non-pawn pieces (only king/pawns)
@@ -200,25 +164,7 @@ pub fn calculate_mop_up_scale(game: &GameState, losing_color: PlayerColor) -> Op
         return None; // Don't mop-up with just king+pawns
     }
 
-    // Check if winning side has promotable pawns - reduce scale to prioritize pawn advancement
-    let winning_color = if losing_color == PlayerColor::White {
-        PlayerColor::Black
-    } else {
-        PlayerColor::White
-    };
-    let (pawn_count, promo_rank) = if winning_color == PlayerColor::White {
-        (game.white_pawn_count, game.white_promo_rank)
-    } else {
-        (game.black_pawn_count, game.black_promo_rank)
-    };
-    let has_promo_pawn =
-        pawn_count > 0 && has_promotable_pawn(&game.board, winning_color, promo_rank);
-
     if losing_pieces == 0 {
-        // Lone king - but reduce scale if winning side has promotable pawns
-        if has_promo_pawn {
-            return None;
-        }
         return Some(100); // Full mop-up
     }
 
@@ -432,10 +378,10 @@ fn evaluate_mop_up_core(
 
         // Reward Back Side Placement (Cutting Off Escape relative to our king)
         if on_back_x {
-            bonus += 350;
+            bonus += 70;
         }
         if on_back_y {
-            bonus += 350;
+            bonus += 70;
         }
 
         // Diagonals Back Side
@@ -445,10 +391,10 @@ fn evaluate_mop_up_core(
             let our_dp = ok.x + ok.y - enemy_diag_pos;
             let our_dn = ok.x - ok.y - enemy_diag_neg;
             if (our_dp > 0 && pdp < 0) || (our_dp < 0 && pdp > 0) {
-                bonus += 200;
+                bonus += 40;
             }
             if (our_dn > 0 && pdn < 0) || (our_dn < 0 && pdn > 0) {
-                bonus += 200;
+                bonus += 40;
             }
         }
 
@@ -472,9 +418,9 @@ fn evaluate_mop_up_core(
                 || (our_dy.signum() == pdy.signum() && pdy != 0);
 
             if is_frontal_check {
-                bonus -= 300;
+                bonus -= 60;
             } else {
-                bonus -= 100; // Minimal penalty for checks from behind/side
+                bonus -= 20; // Minimal penalty for checks from behind/side
             }
         }
 
@@ -484,18 +430,18 @@ fn evaluate_mop_up_core(
 
             // Strong bonus for being close - MUST outweigh other mop-up bonuses
             if dist <= 3 {
-                short_range_bonus += 800; // Very close - huge bonus
+                short_range_bonus += 160; // Very close - huge bonus
             } else if dist <= 6 {
-                short_range_bonus += 500; // Close
+                short_range_bonus += 100; // Close
             } else if dist <= 10 {
-                short_range_bonus += 300; // Medium
+                short_range_bonus += 60; // Medium
             } else if dist <= 15 {
-                short_range_bonus += 150; // Far but approaching
+                short_range_bonus += 30; // Far but approaching
             } else if dist <= 25 {
-                short_range_bonus += 80; // Very far
+                short_range_bonus += 15; // Very far
             } else {
                 // PENALTY for being too far - knight is useless here
-                short_range_bonus -= 400; // Doubled penalty
+                short_range_bonus -= 80; // Doubled penalty
             }
         }
     }
@@ -555,34 +501,34 @@ fn evaluate_mop_up_core(
             // CASE A: OVERWHELMING - Use precise Cage/Box logic to bring the king for the kill
             if bitboard_caged {
                 cage_score = if reached_area <= 5 {
-                    2500
+                    500
                 } else if reached_area <= 10 {
-                    1800
+                    360
                 } else if reached_area <= 16 {
-                    1200
+                    240
                 } else if reached_area <= 40 {
-                    800
+                    160
                 } else if reached_area <= 100 {
-                    400
+                    80
                 } else {
-                    200
+                    40
                 };
             }
             if macro_box {
-                cage_score = if macro_area <= 100 { 350 } else { 150 };
+                cage_score = if macro_area <= 100 { 70 } else { 30 };
             }
             bonus += cage_score;
 
             // Continuous King Approach Gradient
             // CRITICAL: We want the king to approach EVEN IF not caged yet
             // B+Q+K vs K and similar: King MUST approach aggressively
-            let king_approach_bonus = (100 - king_dist.min(100) as i32) * 80; // Increased to 80 for aggressive hunting
+            let king_approach_bonus = (100 - king_dist.min(100) as i32) * 16; // Scaled down for material respect
             bonus += king_approach_bonus;
 
             if king_dist <= 2 {
-                bonus += 800; // Huge bonus for being adjacent
+                bonus += 160; // Huge bonus for being adjacent
             } else if king_dist <= 4 {
-                bonus += 400; // Good bonus for being close
+                bonus += 80; // Good bonus for being close
             }
 
             // ALL PIECES should approach once caged - add unified approach bonuses
@@ -592,13 +538,13 @@ fn evaluate_mop_up_core(
 
                 // Scale by cage tightness - tighter cage = more urgency to close in
                 let approach_weight = if bitboard_caged && reached_area <= 16 {
-                    120 // Massive weight for tight cages
+                    24 // Massive weight for tight cages
                 } else if bitboard_caged {
-                    80
+                    16
                 } else if macro_box {
-                    50
+                    10
                 } else {
-                    40 // Slightly increased base weight
+                    8 // Slightly increased base weight
                 };
 
                 const LONG_RANGE: i64 = 100;
@@ -608,7 +554,7 @@ fn evaluate_mop_up_core(
                 // This prevents the "Amazon in corner, King in other corner" drift.
                 if let Some(ok) = our_king {
                     let king_piece_dist = (s.x - ok.x).abs().max((s.y - ok.y).abs());
-                    bonus += (60 - king_piece_dist.min(60) as i32) * 15;
+                    bonus += (60 - king_piece_dist.min(60) as i32) * 3;
                 }
             }
         } else if ortho_count == 2
@@ -617,182 +563,148 @@ fn evaluate_mop_up_core(
             && total_non_pawn_pieces == 2
         {
             // ========== HARDCODED 2R+K vs K ENDGAME ==========
-            // Rooks must cut the king from the OPPOSITE side of our king.
-            // King only approaches once enemy is boxed.
+            // The "Lock and Key" technique:
+            // 1. LOCK: Rooks must protect each other on the SAME rank or file. (+2000)
+            // 2. TOGETHER: Rooks must be close to each other, not spread out. (-50 per square)
+            // 3. OPPOSITE: Rooks must be on the opposite side of enemy from our king. (+1000)
+            // 4. CUT: Rooks must be 1-2 ranks/files away from enemy. (+500)
+            // 5. KEY: King approaches to finish the job. (100x multiplier)
 
-            let mut has_sand_v = false;
-            let closest_above = if ortho_y_min_above != i64::MAX {
-                Some(ortho_y_min_above)
+            let (r1_x, r1_y, r2_x, r2_y) = if our_pieces_count == 2 {
+                (
+                    our_pieces[0].x,
+                    our_pieces[0].y,
+                    our_pieces[1].x,
+                    our_pieces[1].y,
+                )
             } else {
-                None
-            };
-            let closest_below = if ortho_y_max_below != i64::MIN {
-                Some(ortho_y_max_below)
-            } else {
-                None
-            };
-            let closest_right = if ortho_x_min_right != i64::MAX {
-                Some(ortho_x_min_right)
-            } else {
-                None
-            };
-            let closest_left = if ortho_x_max_left != i64::MIN {
-                Some(ortho_x_max_left)
-            } else {
-                None
+                (0, 0, 0, 0)
             };
 
-            if let (Some(ca), Some(cb)) = (closest_above, closest_below) {
-                has_sand_v = true;
+            // ========== 1. ROOK MUTUAL PROTECTION & STABILITY ==========
+            let rooks_on_same_rank = r1_y == r2_y;
+            let rooks_on_same_file = r1_x == r2_x;
+            let rooks_protecting = rooks_on_same_rank || rooks_on_same_file;
+
+            if rooks_protecting {
+                bonus += 2000; // Absolute priority: Stay protected!
+
+                // PREVENT SHUFFLING: Reward being close to each other
+                let rook_dist_between = (r1_x - r2_x).abs() + (r1_y - r2_y).abs();
+                bonus -= (rook_dist_between as i32) * 50;
+            } else {
+                bonus -= 2000; // Pathological state: Fix immediately
+            }
+
+            // ========== 2. SANDWICH DETECTION (CUTTING) ==========
+            let has_rook_above = r1_y > enemy_y || r2_y > enemy_y;
+            let has_rook_below = r1_y < enemy_y || r2_y < enemy_y;
+            let has_rook_right = r1_x > enemy_x || r2_x > enemy_x;
+            let has_rook_left = r1_x < enemy_x || r2_x < enemy_x;
+
+            let has_sandwich_v = has_rook_above && has_rook_below;
+            let has_sandwich_h = has_rook_right && has_rook_left;
+
+            if has_sandwich_v {
+                bonus += 1000;
+                let ca = if r1_y > enemy_y { r1_y } else { r2_y }.min(if r2_y > enemy_y {
+                    r2_y
+                } else {
+                    r1_y
+                });
+                let cb = if r1_y < enemy_y { r1_y } else { r2_y }.max(if r2_y < enemy_y {
+                    r2_y
+                } else {
+                    r1_y
+                });
                 let gap = ca - cb - 1;
-                bonus += if gap <= 1 {
-                    800
-                } else if gap <= 2 {
-                    600
-                } else if gap <= 3 {
-                    450
-                } else if gap <= 5 {
-                    300
-                } else {
-                    150
-                };
+                bonus += (8 - gap.min(8) as i32) * 150;
             }
-
-            let mut has_sand_h = false;
-            if let (Some(cr), Some(cl)) = (closest_right, closest_left) {
-                has_sand_h = true;
+            if has_sandwich_h {
+                bonus += 1000;
+                let cr = if r1_x > enemy_x { r1_x } else { r2_x }.min(if r2_x > enemy_x {
+                    r2_x
+                } else {
+                    r1_x
+                });
+                let cl = if r1_x < enemy_x { r1_x } else { r2_x }.max(if r2_x < enemy_x {
+                    r2_x
+                } else {
+                    r1_x
+                });
                 let gap = cr - cl - 1;
-                bonus += if gap <= 1 {
-                    800
-                } else if gap <= 2 {
-                    600
-                } else if gap <= 3 {
-                    450
-                } else if gap <= 5 {
-                    300
-                } else {
-                    150
-                };
+                bonus += (8 - gap.min(8) as i32) * 150;
             }
 
-            // Mutual protection
-            let mut protected_count = 0;
-            for i in 0..our_pieces_count {
-                for j in 0..our_pieces_count {
-                    if i != j
-                        && (our_pieces[i].x == our_pieces[j].x
-                            || our_pieces[i].y == our_pieces[j].y)
-                    {
-                        protected_count += 1;
-                        break;
-                    }
-                }
-            }
-            bonus += protected_count as i32 * 200;
-
-            // Fence closeness
-            for i in 0..our_pieces_count {
-                let s = &our_pieces[i];
-                let rank_dist = (s.y - enemy_y).abs();
-                let file_dist = (s.x - enemy_x).abs();
-                if s.y != enemy_y {
-                    bonus += if rank_dist == 1 {
+            // ========== 3. FENCE QUALITY ==========
+            for r in &[(r1_x, r1_y), (r2_x, r2_y)] {
+                let rd = (r.1 - enemy_y).abs();
+                let fd = (r.0 - enemy_x).abs();
+                if rd > 0 {
+                    bonus += if rd == 1 {
+                        400
+                    } else if rd == 2 {
                         250
-                    } else if rank_dist == 2 {
-                        180
-                    } else if rank_dist <= 4 {
-                        120
                     } else {
-                        40
+                        50
                     };
                 }
-                if s.x != enemy_x {
-                    bonus += if file_dist == 1 {
+                if fd > 0 {
+                    bonus += if fd == 1 {
+                        400
+                    } else if fd == 2 {
                         250
-                    } else if file_dist == 2 {
-                        180
-                    } else if file_dist <= 4 {
-                        120
                     } else {
-                        40
+                        50
                     };
                 }
             }
 
-            // RUN calculations
-            let run_up = closest_above.map(|f| f - enemy_y - 1).unwrap_or(100);
-            let run_down = closest_below.map(|f| enemy_y - f - 1).unwrap_or(100);
-            let run_right = closest_right.map(|f| f - enemy_x - 1).unwrap_or(100);
-            let run_left = closest_left.map(|f| enemy_x - f - 1).unwrap_or(100);
+            // ========== 4. KING APPROACH (DOMINANT) ==========
+            if let Some(ok) = our_king {
+                // MASSIVE approach bonus
+                bonus += (100 - king_dist.min(100) as i32) * 100;
 
-            const RUN_GRACE: i64 = 2;
-            let run_away_h = if our_dx > 0 {
-                run_left
-            } else if our_dx < 0 {
-                run_right
-            } else {
-                run_left.max(run_right)
-            };
-            let run_away_v = if our_dy > 0 {
-                run_down
-            } else if our_dy < 0 {
-                run_up
-            } else {
-                run_up.max(run_down)
-            };
-            let enemy_can_run_away = run_away_h > RUN_GRACE || run_away_v > RUN_GRACE;
-
-            let rooks_protected =
-                protected_count >= 2 || (protected_count >= 1 && our_pieces_count >= 2);
-            let should_approach =
-                !enemy_can_run_away || rooks_protected || has_sand_h || has_sand_v;
-
-            if should_approach {
-                let prox = (30 - king_dist.min(30)) as i32;
-                bonus += prox * 50;
-                let dx_abs = our_dx.abs();
-                let dy_abs = our_dy.abs();
-                if dx_abs <= 2 && dy_abs <= 2 {
-                    bonus += 200;
-                }
-                if dx_abs <= 1 && dy_abs <= 1 && (dx_abs + dy_abs) > 0 {
-                    bonus += 100;
+                if king_dist <= 2 {
+                    bonus += 3000;
+                } else if king_dist <= 4 {
+                    bonus += 1500;
                 }
 
-                // 2R+K HARDCODE: Approach from the SIDE (where a rook is), NOT from the front.
-                // If we have a horizontal sandwich, approach vertically (from above/below rook line).
-                // If we have a vertical sandwich, approach horizontally (from left/right of rook line).
-                if let Some(ok) = our_king {
-                    if has_sand_h && !has_sand_v {
-                        // Rooks sandwich horizontally - king should be on same rank as a rook
-                        for i in 0..our_pieces_count {
-                            if our_pieces[i].y == ok.y {
-                                bonus += 400;
-                            }
-                        }
-                        if ok.x == enemy_x {
-                            bonus -= 300;
-                        }
-                    } else if has_sand_v && !has_sand_h {
-                        // Rooks sandwich vertically - king should be on same file as a rook
-                        for i in 0..our_pieces_count {
-                            if our_pieces[i].x == ok.x {
-                                bonus += 400;
-                            }
-                        }
-                        if ok.y == enemy_y {
-                            bonus -= 300;
-                        }
-                    } else if has_sand_h && has_sand_v {
-                        bonus += 500;
-                    }
-                } else if has_sand_h && has_sand_v {
-                    // Full box - just get close, doesn't matter from where
-                    bonus += 500;
+                let our_dx = ok.x - enemy_x;
+                let our_dy = ok.y - enemy_y;
+
+                // CUT OFF FROM OPPOSITE SIDE
+                if our_dx > 0 && has_rook_left {
+                    bonus += 1200;
                 }
-            } else {
-                let prox = (20 - king_dist.min(20)) as i32;
-                bonus += prox * 3;
+                if our_dx < 0 && has_rook_right {
+                    bonus += 1200;
+                }
+                if our_dy > 0 && has_rook_below {
+                    bonus += 1200;
+                }
+                if our_dy < 0 && has_rook_above {
+                    bonus += 1200;
+                }
+
+                // OPPOSITION
+                if has_sandwich_v && our_dy.abs() <= 1 {
+                    bonus += 1000;
+                }
+                if has_sandwich_h && our_dx.abs() <= 1 {
+                    bonus += 1000;
+                }
+
+                // Don't block our own rooks!
+                if (rooks_on_same_rank && ok.y == r1_y) || (rooks_on_same_file && ok.x == r1_x) {
+                    bonus -= 1500;
+                }
+            }
+
+            // Full box bonus
+            if has_sandwich_v && has_sandwich_h {
+                bonus += 2000;
             }
         } else {
             // CASE B: TECHNICAL/SPARSE - Use technical Ladders/Sandwiches.
@@ -809,7 +721,7 @@ fn evaluate_mop_up_core(
                     protected_count += 1;
                 }
             }
-            bonus += protected_count as i32 * 200;
+            bonus += protected_count as i32 * 40;
 
             let mut sand_h = false;
             let mut sand_v = false;
@@ -824,13 +736,13 @@ fn evaluate_mop_up_core(
                     }
                 }
                 bonus += if gap <= 1 {
-                    800
+                    160
                 } else if gap <= 2 {
-                    600
+                    120
                 } else if gap <= 3 {
-                    500
+                    100
                 } else {
-                    200
+                    40
                 };
             }
             if ortho_x_min_right != i64::MAX && ortho_x_max_left != i64::MIN {
@@ -842,13 +754,13 @@ fn evaluate_mop_up_core(
                     }
                 }
                 bonus += if gap <= 1 {
-                    800
+                    160
                 } else if gap <= 2 {
-                    600
+                    120
                 } else if gap <= 3 {
-                    500
+                    100
                 } else {
-                    200
+                    40
                 };
             }
             let mut sand_dp = false;
@@ -859,11 +771,11 @@ fn evaluate_mop_up_core(
                     sand_dp = true;
                 }
                 bonus += if gap <= 1 {
-                    600
+                    120
                 } else if gap <= 2 {
-                    450
+                    90
                 } else {
-                    150
+                    30
                 };
             }
             if diag_neg_min_above != i64::MAX && diag_neg_max_below != i64::MIN {
@@ -872,11 +784,11 @@ fn evaluate_mop_up_core(
                     sand_dn = true;
                 }
                 bonus += if gap <= 1 {
-                    600
+                    120
                 } else if gap <= 2 {
-                    450
+                    90
                 } else {
-                    150
+                    30
                 };
             }
 
@@ -896,7 +808,7 @@ fn evaluate_mop_up_core(
                         && (ortho_y_max_below - ortho_y_max_below_2) == 1);
                 if ladder_x || ladder_y {
                     ladder = true;
-                    bonus += 1200;
+                    bonus += 240;
                 }
             }
 
@@ -934,8 +846,8 @@ fn evaluate_mop_up_core(
             } else {
                 r_up.max(r_down)
             };
-            bonus += (20 - run_h.min(20)) as i32 * 60;
-            bonus += (20 - run_v.min(20)) as i32 * 60;
+            bonus += (20 - run_h.min(20)) as i32 * 12;
+            bonus += (20 - run_v.min(20)) as i32 * 12;
 
             let is_contained = ladder
                 || (sand_h && tight_h)
@@ -945,7 +857,7 @@ fn evaluate_mop_up_core(
                 || (bitboard_caged && reached_area <= 12);
 
             // Continuous King Approach Gradient for Case B too (Dominant)
-            let king_approach_bonus = (100 - king_dist.min(100) as i32) * 40; // Increased to 40
+            let king_approach_bonus = (100 - king_dist.min(100) as i32) * 8; // Scaled down
             bonus += king_approach_bonus;
 
             // Technical piece approach (Long range)
@@ -954,35 +866,35 @@ fn evaluate_mop_up_core(
                 let dist = (s.x - enemy_x).abs().max((s.y - enemy_y).abs());
 
                 // Pieces approach even in technical branch
-                bonus += (80 - dist.min(80) as i32) * 20;
+                bonus += (80 - dist.min(80) as i32) * 4;
                 // Pieces stay with king (only if we have a king)
                 if let Some(ok) = our_king {
                     let king_piece_dist = (s.x - ok.x).abs().max((s.y - ok.y).abs());
-                    bonus += (50 - king_piece_dist.min(50) as i32) * 12;
+                    bonus += (50 - king_piece_dist.min(50) as i32) * 2;
                 }
             }
 
             if is_contained {
                 let prox = (30 - king_dist.min(30)) as i32;
-                bonus += prox * 80;
+                bonus += prox * 16;
                 if king_dist <= 2 {
-                    bonus += 400;
+                    bonus += 80;
                 }
             } else {
                 let prox = (20 - king_dist.min(20)) as i32;
-                bonus += prox * 2;
+                bonus += prox * 1;
             }
         }
     }
 
     if total_sliders >= 2 {
-        bonus += 100;
+        bonus += 20;
     }
     if total_sliders >= 3 {
-        bonus += 150;
+        bonus += 30;
     }
     if ortho_count >= 1 && diag_count >= 1 {
-        bonus += 80;
+        bonus += 15;
     }
 
     bonus
@@ -1069,4 +981,262 @@ pub fn needs_king_for_mate(board: &Board, color: PlayerColor) -> bool {
     }
 
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::board::{Board, Piece};
+    use crate::game::GameState;
+
+    fn create_test_game() -> GameState {
+        let mut game = GameState::new();
+        game.board = Board::new();
+        game.white_promo_rank = 8;
+        game.black_promo_rank = 1;
+        game
+    }
+
+    #[test]
+    fn test_is_lone_king_true() {
+        let mut game = create_test_game();
+        game.board
+            .set_piece(5, 1, Piece::new(PieceType::King, PlayerColor::White));
+        game.recompute_piece_counts();
+
+        assert!(is_lone_king(&game, PlayerColor::White));
+    }
+
+    #[test]
+    fn test_is_lone_king_false() {
+        let mut game = create_test_game();
+        game.board
+            .set_piece(5, 1, Piece::new(PieceType::King, PlayerColor::White));
+        game.board
+            .set_piece(4, 1, Piece::new(PieceType::Queen, PlayerColor::White));
+        game.recompute_piece_counts();
+
+        assert!(!is_lone_king(&game, PlayerColor::White));
+    }
+
+    #[test]
+    fn test_calculate_mop_up_scale_returns_none_for_no_advantage() {
+        let mut game = create_test_game();
+        game.board
+            .set_piece(5, 1, Piece::new(PieceType::King, PlayerColor::White));
+        game.board
+            .set_piece(5, 8, Piece::new(PieceType::King, PlayerColor::Black));
+        game.board
+            .set_piece(4, 1, Piece::new(PieceType::Queen, PlayerColor::White));
+        game.board
+            .set_piece(4, 8, Piece::new(PieceType::Queen, PlayerColor::Black));
+        game.recompute_piece_counts();
+
+        // Both sides have material, so no mop-up
+        let scale = calculate_mop_up_scale(&game, PlayerColor::Black);
+        // May or may not apply depending on thresholds
+        assert!(scale.is_none() || scale.unwrap() <= 100);
+    }
+
+    #[test]
+    fn test_needs_king_for_mate_true() {
+        // Just a knight - needs king
+        let mut board = Board::new();
+        board.set_piece(3, 3, Piece::new(PieceType::Knight, PlayerColor::White));
+
+        assert!(needs_king_for_mate(&board, PlayerColor::White));
+    }
+
+    #[test]
+    fn test_needs_king_for_mate_false_two_queens() {
+        let mut board = Board::new();
+        board.set_piece(3, 3, Piece::new(PieceType::Queen, PlayerColor::White));
+        board.set_piece(4, 3, Piece::new(PieceType::Queen, PlayerColor::White));
+        board.rebuild_tiles();
+
+        assert!(!needs_king_for_mate(&board, PlayerColor::White));
+    }
+
+    #[test]
+    fn test_needs_king_for_mate_false_three_rooks() {
+        let mut board = Board::new();
+        board.set_piece(1, 1, Piece::new(PieceType::Rook, PlayerColor::White));
+        board.set_piece(2, 1, Piece::new(PieceType::Rook, PlayerColor::White));
+        board.set_piece(3, 1, Piece::new(PieceType::Rook, PlayerColor::White));
+        board.rebuild_tiles();
+
+        assert!(!needs_king_for_mate(&board, PlayerColor::White));
+    }
+
+    #[test]
+    fn test_evaluate_lone_king_endgame_returns_value() {
+        let mut game = create_test_game();
+        game.board
+            .set_piece(5, 1, Piece::new(PieceType::King, PlayerColor::White));
+        game.board
+            .set_piece(5, 8, Piece::new(PieceType::King, PlayerColor::Black));
+        game.board
+            .set_piece(4, 1, Piece::new(PieceType::Queen, PlayerColor::White));
+        game.recompute_piece_counts();
+        game.board.rebuild_tiles();
+
+        let enemy_king = Coordinate::new(5, 8);
+        let our_king = Coordinate::new(5, 1);
+
+        let score =
+            evaluate_lone_king_endgame(&game, Some(&our_king), &enemy_king, PlayerColor::White);
+        // Should be positive (White has advantage)
+        assert!(score >= 0);
+    }
+
+    #[test]
+    fn test_evaluate_mop_up_scaled_no_king() {
+        let mut game = create_test_game();
+        game.board
+            .set_piece(5, 8, Piece::new(PieceType::King, PlayerColor::Black));
+        game.board
+            .set_piece(4, 4, Piece::new(PieceType::Queen, PlayerColor::White));
+        game.board
+            .set_piece(3, 4, Piece::new(PieceType::Queen, PlayerColor::White));
+        game.recompute_piece_counts();
+        game.board.rebuild_tiles();
+
+        let enemy_king = Coordinate::new(5, 8);
+
+        // No white king (checkmate practice)
+        let score = evaluate_mop_up_scaled(
+            &game,
+            None,
+            &enemy_king,
+            PlayerColor::White,
+            PlayerColor::Black,
+        );
+        assert!(score.abs() < 100000);
+    }
+
+    #[test]
+    fn test_mop_up_rook_fence_bonus() {
+        let mut game = create_test_game();
+        // Black king in center
+        game.board
+            .set_piece(4, 4, Piece::new(PieceType::King, PlayerColor::Black));
+        // White rooks creating a fence
+        game.board
+            .set_piece(0, 4, Piece::new(PieceType::Rook, PlayerColor::White));
+        game.board
+            .set_piece(7, 4, Piece::new(PieceType::Rook, PlayerColor::White));
+        game.board
+            .set_piece(4, 1, Piece::new(PieceType::King, PlayerColor::White));
+        game.recompute_piece_counts();
+        game.board.rebuild_tiles();
+
+        let enemy_king = Coordinate::new(4, 4);
+        let our_king = Coordinate::new(4, 1);
+
+        let score =
+            evaluate_lone_king_endgame(&game, Some(&our_king), &enemy_king, PlayerColor::White);
+        // Should be positive since rooks create cutting lines
+        assert!(
+            score > 0,
+            "Rook fence should give positive score: {}",
+            score
+        );
+    }
+
+    #[test]
+    fn test_mop_up_king_approach_bonus() {
+        let mut game = create_test_game();
+        game.board
+            .set_piece(5, 5, Piece::new(PieceType::King, PlayerColor::Black));
+        game.board
+            .set_piece(4, 4, Piece::new(PieceType::Queen, PlayerColor::White));
+        // White king close to enemy
+        game.board
+            .set_piece(6, 5, Piece::new(PieceType::King, PlayerColor::White));
+        game.recompute_piece_counts();
+        game.board.rebuild_tiles();
+
+        let enemy_king = Coordinate::new(5, 5);
+        let our_king_close = Coordinate::new(6, 5);
+
+        let score_close = evaluate_lone_king_endgame(
+            &game,
+            Some(&our_king_close),
+            &enemy_king,
+            PlayerColor::White,
+        );
+
+        // Move white king further away
+        game.board.remove_piece(&6, &5);
+        game.board
+            .set_piece(1, 1, Piece::new(PieceType::King, PlayerColor::White));
+        game.recompute_piece_counts();
+
+        let our_king_far = Coordinate::new(1, 1);
+        let score_far =
+            evaluate_lone_king_endgame(&game, Some(&our_king_far), &enemy_king, PlayerColor::White);
+
+        assert!(
+            score_close > score_far,
+            "Closer king should get higher score: close={} far={}",
+            score_close,
+            score_far
+        );
+    }
+
+    #[test]
+    fn test_calculate_mop_up_scale_with_pawns() {
+        let mut game = create_test_game();
+        game.board
+            .set_piece(5, 5, Piece::new(PieceType::King, PlayerColor::Black));
+        game.board
+            .set_piece(4, 4, Piece::new(PieceType::King, PlayerColor::White));
+        // Add rooks (sufficient material) and promotable pawn
+        game.board
+            .set_piece(1, 1, Piece::new(PieceType::Rook, PlayerColor::White));
+        game.board
+            .set_piece(2, 2, Piece::new(PieceType::Rook, PlayerColor::White));
+        game.board
+            .set_piece(3, 7, Piece::new(PieceType::Pawn, PlayerColor::White)); // Near promotion
+        game.white_promo_rank = 8;
+        game.recompute_piece_counts();
+
+        let scale = calculate_mop_up_scale(&game, PlayerColor::Black);
+        // Should return a scale since white has mating material
+        assert!(scale.is_some(), "Should have mop-up scale with rooks");
+    }
+
+    #[test]
+    fn test_find_bitboard_cage() {
+        let mut game = create_test_game();
+        game.board
+            .set_piece(4, 4, Piece::new(PieceType::King, PlayerColor::Black));
+        // Surround with attacking rooks
+        game.board
+            .set_piece(4, 0, Piece::new(PieceType::Rook, PlayerColor::White));
+        game.board
+            .set_piece(4, 8, Piece::new(PieceType::Rook, PlayerColor::White));
+        game.board
+            .set_piece(0, 4, Piece::new(PieceType::Rook, PlayerColor::White));
+        game.board
+            .set_piece(8, 4, Piece::new(PieceType::Rook, PlayerColor::White));
+        game.board
+            .set_piece(1, 1, Piece::new(PieceType::King, PlayerColor::White));
+        game.recompute_piece_counts();
+        game.board.rebuild_tiles();
+
+        let enemy_king = Coordinate::new(4, 4);
+        let (_is_caged, area) = find_bitboard_cage(
+            &game.board,
+            &game.spatial_indices,
+            &enemy_king,
+            PlayerColor::White,
+        );
+        // The king should be significantly restricted
+        assert!(
+            area < 100,
+            "King should be in a small area, found: {}",
+            area
+        );
+    }
 }

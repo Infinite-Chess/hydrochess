@@ -16,7 +16,6 @@ static mut COORD_MIN_Y: i64 = -1_000_000_000_000_000; // default -1e15
 static mut COORD_MAX_Y: i64 = 1_000_000_000_000_000; // default  1e15
 
 /// Update world borders from JS playableRegion (left, right, bottom, top).
-/// Rounding errors from BigInt -> i64 conversion on the JS side are acceptable.
 pub fn set_world_bounds(left: i64, right: i64, bottom: i64, top: i64) {
     unsafe {
         COORD_MIN_X = left.min(right);
@@ -118,17 +117,26 @@ fn generate_knightrider_moves(board: &Board, from: &Coordinate, piece: &Piece) -
         }
 
         // 2. Generate moves along this ray.
-        // If we have a blocker, generate *all* intermediate steps up to it.
-        // If we have no blocker, only generate the first two consecutive steps.
+        // Cap at 10 for performance - captures at distance handled separately
+        const KR_STEP_LIMIT: i64 = 10;
         let max_steps: i64 = if closest_k < i64::MAX {
             if closest_is_enemy {
-                closest_k
+                closest_k.min(KR_STEP_LIMIT)
             } else {
-                closest_k.saturating_sub(1)
+                closest_k.saturating_sub(1).min(KR_STEP_LIMIT)
             }
         } else {
             2
         };
+
+        // CRITICAL: If enemy is beyond step limit, still add the direct capture
+        if closest_k < i64::MAX && closest_is_enemy && closest_k > KR_STEP_LIMIT {
+            let x = from.x + dx * closest_k;
+            let y = from.y + dy * closest_k;
+            if in_bounds(x, y) {
+                moves.push(Move::new(*from, Coordinate::new(x, y), *piece));
+            }
+        }
 
         if max_steps <= 0 {
             continue;
@@ -183,6 +191,15 @@ pub struct SpatialIndices {
     /// Value: Sorted list of valid interception distances for that slider position/direction.
     #[serde(skip)]
     pub slider_cache: std::cell::RefCell<FxHashMap<(i64, i64, u8), Vec<i64>>>,
+
+    // Fairy piece existence flags per color for O(1) early-exit in attack detection
+    // [0] = white, [1] = black
+    #[serde(skip)]
+    pub has_huygen: [bool; 2],
+    #[serde(skip)]
+    pub has_rose: [bool; 2],
+    #[serde(skip)]
+    pub has_knightrider: [bool; 2],
 }
 
 impl SpatialIndices {
@@ -192,6 +209,11 @@ impl SpatialIndices {
         let mut diag1: FxHashMap<i64, Vec<(i64, u8)>> = FxHashMap::default();
         let mut diag2: FxHashMap<i64, Vec<(i64, u8)>> = FxHashMap::default();
 
+        // Fairy piece flags: [0] = white, [1] = black
+        let mut has_huygen = [false, false];
+        let mut has_rose = [false, false];
+        let mut has_knightrider = [false, false];
+
         // BITBOARD: Use tile-based CTZ iteration for O(popcount) enumeration
         for (cx, cy, tile) in board.tiles.iter() {
             let mut bits = tile.occ_all;
@@ -199,9 +221,8 @@ impl SpatialIndices {
                 let idx = bits.trailing_zeros() as usize;
                 bits &= bits - 1;
                 let packed = tile.piece[idx];
-                if packed == 0 {
-                    continue;
-                }
+                // Note: packed==0 is valid for Void pieces (Neutral*22+Void=0)
+                // occ_all bitboard guarantees this is an occupied square
                 let lx = (idx % 8) as i64;
                 let ly = (idx / 8) as i64;
                 let x = cx * 8 + lx;
@@ -210,6 +231,20 @@ impl SpatialIndices {
                 cols.entry(x).or_default().push((y, packed));
                 diag1.entry(x - y).or_default().push((x, packed));
                 diag2.entry(x + y).or_default().push((x, packed));
+
+                // Track fairy piece existence for O(1) early-exit in attack detection
+                let piece = Piece::from_packed(packed);
+                let color_idx = if piece.color() == PlayerColor::White {
+                    0
+                } else {
+                    1
+                };
+                match piece.piece_type() {
+                    PieceType::Huygen => has_huygen[color_idx] = true,
+                    PieceType::Rose => has_rose[color_idx] = true,
+                    PieceType::Knightrider => has_knightrider[color_idx] = true,
+                    _ => {}
+                }
             }
         }
 
@@ -233,6 +268,9 @@ impl SpatialIndices {
             diag1,
             diag2,
             slider_cache: std::cell::RefCell::new(FxHashMap::default()),
+            has_huygen,
+            has_rose,
+            has_knightrider,
         }
     }
 
@@ -330,13 +368,16 @@ impl Default for SpatialIndices {
             diag1: FxHashMap::default(),
             diag2: FxHashMap::default(),
             slider_cache: std::cell::RefCell::new(FxHashMap::default()),
+            has_huygen: [false, false],
+            has_rose: [false, false],
+            has_knightrider: [false, false],
         }
     }
 }
 
 /// Compact move representation - Copy-able for zero-allocation cloning in hot loops.
 /// Uses Option<PieceType> instead of Option<String> for promotion.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Move {
     pub from: Coordinate,
     pub to: Coordinate,
@@ -944,49 +985,66 @@ pub fn is_square_attacked(
         }
     }
 
-    // Knightrider check (sliding knight)
-    for &(dx, dy) in &KNIGHTRIDER_DIRS {
-        let mut k = 1i64;
-        loop {
-            let x = target.x + dx * k;
-            let y = target.y + dy * k;
-            if let Some(piece) = board.get_piece(x, y) {
-                if piece.color() == attacker_color && piece.piece_type() == PieceType::Knightrider {
-                    return true;
+    // Knightrider check (sliding knight) - O(1) early exit if no Knightriders exist
+    let attacker_idx = if attacker_color == PlayerColor::White {
+        0
+    } else {
+        1
+    };
+    if indices.has_knightrider[attacker_idx] {
+        for &(dx, dy) in &KNIGHTRIDER_DIRS {
+            let mut k = 1i64;
+            loop {
+                let x = target.x + dx * k;
+                let y = target.y + dy * k;
+                if let Some(piece) = board.get_piece(x, y) {
+                    if piece.color() == attacker_color
+                        && piece.piece_type() == PieceType::Knightrider
+                    {
+                        return true;
+                    }
+                    break;
                 }
-                break;
-            }
-            k += 1;
-            if k > 20 {
-                break;
+                k += 1;
+                if k > 20 {
+                    break;
+                }
             }
         }
     }
 
-    // Huygen check (prime distances)
-    for &(dx, dy) in &ORTHO_DIRS {
-        let line_vec = if dx == 0 {
-            indices.cols.get(&target.x)
-        } else {
-            indices.rows.get(&target.y)
-        };
-        if let Some(vec) = line_vec {
-            for &(coord, packed) in vec {
-                let dist = if dx == 0 {
-                    coord - target.y
-                } else {
-                    coord - target.x
-                };
-                let abs_dist = dist.abs();
-                if abs_dist > 0 && is_prime_i64(abs_dist) {
-                    let sign = if dist > 0 { 1 } else { -1 };
-                    let dir_check = if dx == 0 { dy == sign } else { dx == sign };
-                    if dir_check {
-                        let piece = Piece::from_packed(packed);
-                        if piece.color() == attacker_color
-                            && piece.piece_type() == PieceType::Huygen
-                        {
-                            return true;
+    // Huygen check (prime distances) - O(1) early exit if no Huygens exist
+    // CRITICAL: is_prime_i64 is O(sqrt(n)) - skip huge distances to avoid 31M+ iterations
+    if indices.has_huygen[attacker_idx] {
+        const HUYGEN_ATTACK_LIMIT: i64 = 100; // Huygen pieces realistically attack within this range
+        for &(dx, dy) in &ORTHO_DIRS {
+            let line_vec = if dx == 0 {
+                indices.cols.get(&target.x)
+            } else {
+                indices.rows.get(&target.y)
+            };
+            if let Some(vec) = line_vec {
+                for &(coord, packed) in vec {
+                    let dist = if dx == 0 {
+                        coord - target.y
+                    } else {
+                        coord - target.x
+                    };
+                    let abs_dist = dist.abs();
+                    // Skip huge distances - is_prime_i64 is O(sqrt(n))!
+                    if abs_dist > HUYGEN_ATTACK_LIMIT {
+                        continue;
+                    }
+                    if abs_dist > 0 && is_prime_i64(abs_dist) {
+                        let sign = if dist > 0 { 1 } else { -1 };
+                        let dir_check = if dx == 0 { dy == sign } else { dx == sign };
+                        if dir_check {
+                            let piece = Piece::from_packed(packed);
+                            if piece.color() == attacker_color
+                                && piece.piece_type() == PieceType::Huygen
+                            {
+                                return true;
+                            }
                         }
                     }
                 }
@@ -994,14 +1052,16 @@ pub fn is_square_attacked(
         }
     }
 
-    // Rose check - use direct position check instead of generating moves
+    // Rose check - O(1) early exit if no Roses exist
     // Rose attacks in circular knight patterns; check if any Rose piece can reach target
-    for &(dx, dy) in &ROSE_OFFSETS {
-        let x = target.x + dx;
-        let y = target.y + dy;
-        if let Some(piece) = board.get_piece(x, y) {
-            if piece.color() == attacker_color && piece.piece_type() == PieceType::Rose {
-                return true;
+    if indices.has_rose[attacker_idx] {
+        for &(dx, dy) in &ROSE_OFFSETS {
+            let x = target.x + dx;
+            let y = target.y + dy;
+            if let Some(piece) = board.get_piece(x, y) {
+                if piece.color() == attacker_color && piece.piece_type() == PieceType::Rose {
+                    return true;
+                }
             }
         }
     }
@@ -1043,8 +1103,8 @@ fn generate_pawn_moves(
     } else {
         // promotions_allowed is set but no ranks = use classical defaults
         match piece.color() {
-            PlayerColor::White => vec![8],
-            PlayerColor::Black => vec![1],
+            PlayerColor::White => vec![],
+            PlayerColor::Black => vec![],
             PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
         }
     };
@@ -1184,8 +1244,8 @@ fn generate_pawn_capture_moves(
     } else {
         // promotions_allowed is set but no ranks = use classical defaults
         match piece.color() {
-            PlayerColor::White => vec![8],
-            PlayerColor::Black => vec![1],
+            PlayerColor::White => vec![],
+            PlayerColor::Black => vec![],
             PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
         }
     };
@@ -1287,16 +1347,22 @@ fn generate_castling_moves(
                 let dy = coord.y - from.y;
 
                 if dy == 0 {
-                    let dir = if dx > 0 { 1 } else { -1 };
+                    let dir = if dx > 0 { 1i64 } else { -1i64 };
 
+                    // Use spatial indices to check path - O(log n) instead of O(distance)
                     let mut clear = true;
-                    let mut current_x = from.x + dir;
-                    while current_x != coord.x {
-                        if board.get_piece(current_x, from.y).is_some() {
-                            clear = false;
-                            break;
+                    if let Some(row_pieces) = indices.rows.get(&from.y) {
+                        // Find nearest piece in direction from king
+                        if let Some((nearest_x, _)) =
+                            SpatialIndices::find_nearest(row_pieces, from.x, dir)
+                        {
+                            // Path is clear only if no piece between king and rook
+                            // nearest_x should equal coord.x (the rook) for clear path
+                            if (dir > 0 && nearest_x < coord.x) || (dir < 0 && nearest_x > coord.x)
+                            {
+                                clear = false; // There's a piece between king and rook
+                            }
                         }
-                        current_x += dir;
                     }
 
                     if clear {
@@ -1703,12 +1769,12 @@ fn generate_pawn_quiet_moves(
             .promotion_ranks
             .as_ref()
             .map(|p| p.white.clone())
-            .unwrap_or_else(|| vec![8]),
+            .unwrap_or_else(|| vec![]),
         PlayerColor::Black => game_rules
             .promotion_ranks
             .as_ref()
             .map(|p| p.black.clone())
-            .unwrap_or_else(|| vec![1]),
+            .unwrap_or_else(|| vec![]),
         PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
     };
 
@@ -1944,6 +2010,180 @@ fn ray_border_distance(from: &Coordinate, dir_x: i64, dir_y: i64) -> Option<i64>
     }
 }
 
+/// Find cross-ray attack targets for sliders (ULTRA-FAST).
+///
+/// Mathematical Intersection Approach:
+/// 1. Iterate over ALL pieces on the board (O(N), usually < 60).
+/// 2. For each piece P, calculate if any of its 8 attack rays intersect our slider's ray.
+/// 3. If an intersection S exists within max_dist, verify reachability.
+#[inline]
+fn find_cross_ray_targets_into(
+    board: &Board,
+    from: &Coordinate,
+    dir_x: i64,
+    dir_y: i64,
+    max_dist: i64,
+    indices: &SpatialIndices,
+    our_color: PlayerColor,
+    piece_type: PieceType,
+    enemy_wiggle: i64,
+    friend_wiggle: i64,
+    out: &mut Vec<i64>,
+) {
+    // Filter by piece type attack capabilities
+    let checks_ortho = matches!(
+        piece_type,
+        PieceType::Queen
+            | PieceType::RoyalQueen
+            | PieceType::Rook
+            | PieceType::Chancellor
+            | PieceType::Amazon
+    );
+    let checks_diag = matches!(
+        piece_type,
+        PieceType::Queen
+            | PieceType::RoyalQueen
+            | PieceType::Bishop
+            | PieceType::Archbishop
+            | PieceType::Amazon
+    );
+
+    if !checks_ortho && !checks_diag {
+        return;
+    }
+
+    // Precompute constant ray properties
+    let ray_diff = dir_x - dir_y;
+    let ray_sum = dir_x + dir_y;
+
+    // Iterate all pieces on the board once
+    for (px, py, p) in board.tiles.iter_all_pieces() {
+        // Skip same position or same color
+        if (px == from.x && py == from.y) || p.color() == our_color {
+            continue;
+        }
+
+        let is_enemy = p.color() != our_color && !p.piece_type().is_uncapturable();
+        let wiggle = if is_enemy {
+            enemy_wiggle
+        } else {
+            friend_wiggle
+        };
+
+        // 1. Orthogonal Cross-Rays (Vertical/Horizontal)
+        if checks_ortho {
+            // Vertical cross: S.x = px
+            if dir_x != 0 {
+                let num = px - from.x;
+                if num.signum() == dir_x.signum() && num % dir_x == 0 {
+                    let d = num / dir_x;
+                    if d > 0 && d <= max_dist {
+                        let sy = from.y + d * dir_y;
+                        if py != sy {
+                            let step = (py - sy).signum();
+                            if let Some(pieces_in_col) = indices.cols.get(&px) {
+                                if let Some((nearest_y, _)) =
+                                    SpatialIndices::find_nearest(pieces_in_col, sy, step)
+                                {
+                                    if nearest_y == py {
+                                        // Wiggle allowed for orthogonal
+                                        for w in -wiggle..=wiggle {
+                                            let wd = d + w;
+                                            if wd > 0 && wd <= max_dist {
+                                                out.push(wd);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Horizontal cross: S.y = py
+            if dir_y != 0 {
+                let num = py - from.y;
+                if num.signum() == dir_y.signum() && num % dir_y == 0 {
+                    let d = num / dir_y;
+                    if d > 0 && d <= max_dist {
+                        let sx = from.x + d * dir_x;
+                        if px != sx {
+                            let step = (px - sx).signum();
+                            if let Some(pieces_in_row) = indices.rows.get(&py) {
+                                if let Some((nearest_x, _)) =
+                                    SpatialIndices::find_nearest(pieces_in_row, sx, step)
+                                {
+                                    if nearest_x == px {
+                                        // Wiggle allowed for orthogonal
+                                        for w in -wiggle..=wiggle {
+                                            let wd = d + w;
+                                            if wd > 0 && wd <= max_dist {
+                                                out.push(wd);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Diagonal Cross-Rays
+        if checks_diag {
+            // Diag1: S.x - S.y = px - py
+            if ray_diff != 0 {
+                let num = (px - py) - (from.x - from.y);
+                if num.signum() == ray_diff.signum() && num % ray_diff == 0 {
+                    let d = num / ray_diff;
+                    if d > 0 && d <= max_dist {
+                        let sx = from.x + d * dir_x;
+                        if px != sx {
+                            let step = (px - sx).signum();
+                            if let Some(pieces_on_diag) = indices.diag1.get(&(px - py)) {
+                                if let Some((nearest_x, _)) =
+                                    SpatialIndices::find_nearest(pieces_on_diag, sx, step)
+                                {
+                                    if nearest_x == px {
+                                        // NO wiggle for diagonal
+                                        out.push(d);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Diag2: S.x + S.y = px + py
+            if ray_sum != 0 {
+                let num = (px + py) - (from.x + from.y);
+                if num.signum() == ray_sum.signum() && num % ray_sum == 0 {
+                    let d = num / ray_sum;
+                    if d > 0 && d <= max_dist {
+                        let sx = from.x + d * dir_x;
+                        if px != sx {
+                            let step = (px - sx).signum();
+                            if let Some(pieces_on_diag) = indices.diag2.get(&(px + py)) {
+                                if let Some((nearest_x, _)) =
+                                    SpatialIndices::find_nearest(pieces_on_diag, sx, step)
+                                {
+                                    if nearest_x == px {
+                                        // NO wiggle for diagonal
+                                        out.push(d);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn generate_sliding_moves(
     board: &Board,
     from: &Coordinate,
@@ -1963,7 +2203,6 @@ pub fn generate_sliding_moves(
     // Fallback limit for short-range slider moves
     const FALLBACK_LIMIT: i64 = 10;
 
-    let _piece_count = board.len();
     let mut moves = MoveList::new();
     let our_color = piece.color();
 
@@ -2039,6 +2278,12 @@ pub fn generate_sliding_moves(
                 target_dists.push(d);
             }
 
+            // CRITICAL: Always add direct capture distance if there's an enemy piece
+            // This is O(1) via spatial indices and covers ANY distance
+            if closest_dist < i64::MAX && closest_is_enemy {
+                target_dists.push(closest_dist);
+            }
+
             // Cache key: (x, y, direction_index) where direction_index encodes (dir_x, dir_y)
             // Direction encoding: 0=E, 1=NE, 2=N, 3=NW, 4=W, 5=SW, 6=S, 7=SE
             let dir_index: u8 = match (dir_x.signum(), dir_y.signum()) {
@@ -2060,201 +2305,127 @@ pub fn generate_sliding_moves(
                 // Use cached interception distances, but still add blocker wiggle room
                 target_dists.extend(cached_dists.iter().filter(|&&d| d <= interception_limit));
             } else {
-                // Compute interception distances
-                // Process pieces for interception using targeted spatial lookups (O(L) where L is limit)
-                let search_range = interception_limit + ENEMY_WIGGLE;
+                // Compute interception distances by iterating PIECES on the ray, not squares
+                // This is O(pieces_on_line) which is typically small
 
                 if is_horizontal {
-                    // Horizontal ray: check only the relevant columns in direction
-                    for x_off in -ENEMY_WIGGLE..=search_range {
-                        let col_x = from.x + x_off * dir_x.signum();
-                        if let Some(pieces_at_col) = indices.cols.get(&col_x) {
-                            for &(_py, packed) in pieces_at_col {
-                                let p = Piece::from_packed(packed);
-                                let is_enemy =
-                                    p.color() != our_color && !p.piece_type().is_uncapturable();
-                                let wiggle = if is_enemy {
-                                    ENEMY_WIGGLE
-                                } else {
-                                    FRIEND_WIGGLE
-                                };
+                    // Horizontal ray: iterate pieces on the same row
+                    if let Some(pieces_on_row) = indices.rows.get(&from.y) {
+                        for &(px, packed) in pieces_on_row {
+                            let dx = px - from.x;
+                            // Skip pieces not in our direction or at origin
+                            if dx == 0 || dx.signum() != dir_x.signum() {
+                                continue;
+                            }
+                            let piece_dist = dx.abs();
+                            // Only interception for pieces within limit (direct capture handled separately)
+                            if piece_dist > interception_limit {
+                                continue;
+                            }
+                            let p = Piece::from_packed(packed);
+                            let is_enemy =
+                                p.color() != our_color && !p.piece_type().is_uncapturable();
+                            let wiggle = if is_enemy {
+                                ENEMY_WIGGLE
+                            } else {
+                                FRIEND_WIGGLE
+                            };
 
-                                for w in -wiggle..=wiggle {
-                                    let tx = col_x + w;
-                                    let dx = tx - from.x;
-                                    if dx != 0 && dx.signum() == dir_x.signum() {
-                                        let d = dx.abs();
-                                        if d <= interception_limit {
-                                            target_dists.push(d);
-                                        }
-                                    }
+                            for w in -wiggle..=wiggle {
+                                let d = piece_dist + w;
+                                if d > 0 && d <= interception_limit {
+                                    target_dists.push(d);
                                 }
                             }
                         }
                     }
                 } else if is_vertical {
-                    // Vertical ray: check only the relevant rows in direction
-                    for y_off in -ENEMY_WIGGLE..=search_range {
-                        let row_y = from.y + y_off * dir_y.signum();
-                        if let Some(pieces_at_row) = indices.rows.get(&row_y) {
-                            for &(_px, packed) in pieces_at_row {
-                                let p = Piece::from_packed(packed);
-                                let is_enemy =
-                                    p.color() != our_color && !p.piece_type().is_uncapturable();
-                                let wiggle = if is_enemy {
-                                    ENEMY_WIGGLE
-                                } else {
-                                    FRIEND_WIGGLE
-                                };
+                    // Vertical ray: iterate pieces on the same column
+                    if let Some(pieces_on_col) = indices.cols.get(&from.x) {
+                        for &(py, packed) in pieces_on_col {
+                            let dy = py - from.y;
+                            if dy == 0 || dy.signum() != dir_y.signum() {
+                                continue;
+                            }
+                            let piece_dist = dy.abs();
+                            if piece_dist > interception_limit {
+                                continue;
+                            }
+                            let p = Piece::from_packed(packed);
+                            let is_enemy =
+                                p.color() != our_color && !p.piece_type().is_uncapturable();
+                            let wiggle = if is_enemy {
+                                ENEMY_WIGGLE
+                            } else {
+                                FRIEND_WIGGLE
+                            };
 
-                                for w in -wiggle..=wiggle {
-                                    let ty = row_y + w;
-                                    let dy = ty - from.y;
-                                    if dy != 0 && dy.signum() == dir_y.signum() {
-                                        let d = dy.abs();
-                                        if d <= interception_limit {
-                                            target_dists.push(d);
-                                        }
-                                    }
+                            for w in -wiggle..=wiggle {
+                                let d = piece_dist + w;
+                                if d > 0 && d <= interception_limit {
+                                    target_dists.push(d);
                                 }
                             }
                         }
                     }
                 } else {
-                    // Diagonal ray: check relevant columns, rows, and diagonals
-                    // 1. Orthogonal x-based interception
-                    for x_off in -ENEMY_WIGGLE..=search_range {
-                        let col_x = from.x + x_off * dir_x.signum();
-                        if let Some(pieces_at_col) = indices.cols.get(&col_x) {
-                            for &(py, packed) in pieces_at_col {
-                                let p = Piece::from_packed(packed);
-                                let is_enemy =
-                                    p.color() != our_color && !p.piece_type().is_uncapturable();
-                                let wiggle = if is_enemy {
-                                    ENEMY_WIGGLE
-                                } else {
-                                    FRIEND_WIGGLE
-                                };
-
-                                let pdx = col_x - from.x;
-                                let pdy = py - from.y;
-                                if pdx.abs() == pdy.abs()
-                                    && pdx != 0
-                                    && pdx.signum() == dir_x.signum()
-                                    && pdy.signum() == dir_y.signum()
-                                {
-                                    continue;
-                                }
-
-                                for w in -wiggle..=wiggle {
-                                    let tx = col_x + w;
-                                    let dx = tx - from.x;
-                                    if dx != 0 && dx.signum() == dir_x.signum() {
-                                        let d = dx.abs();
-                                        if d <= interception_limit {
-                                            target_dists.push(d);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // 2. Orthogonal y-based interception
-                    for y_off in -ENEMY_WIGGLE..=search_range {
-                        let row_y = from.y + y_off * dir_y.signum();
-                        if let Some(pieces_at_row) = indices.rows.get(&row_y) {
-                            for &(px, packed) in pieces_at_row {
-                                let p = Piece::from_packed(packed);
-                                let is_enemy =
-                                    p.color() != our_color && !p.piece_type().is_uncapturable();
-                                let wiggle = if is_enemy {
-                                    ENEMY_WIGGLE
-                                } else {
-                                    FRIEND_WIGGLE
-                                };
-
-                                let pdx = px - from.x;
-                                let pdy = row_y - from.y;
-                                if pdx.abs() == pdy.abs()
-                                    && pdx != 0
-                                    && pdx.signum() == dir_x.signum()
-                                    && pdy.signum() == dir_y.signum()
-                                {
-                                    continue;
-                                }
-
-                                for w in -wiggle..=wiggle {
-                                    let ty = row_y + w;
-                                    let dy = ty - from.y;
-                                    if dy != 0 && dy.signum() == dir_y.signum() {
-                                        let d = dy.abs();
-                                        if d <= interception_limit {
-                                            target_dists.push(d);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // 3. Diagonal proximity using diag1/diag2 indices
-                    let diag_wiggle: i64 = 1;
-                    if dir_x * dir_y > 0 {
-                        let from_key = from.x + from.y;
-                        for k_off in -2..=2 {
-                            if let Some(pieces_on_diag) = indices.diag2.get(&(from_key + k_off)) {
-                                for &(px, _packed) in pieces_on_diag {
-                                    let pdx = px - from.x;
-                                    if pdx == 0 || pdx.signum() != dir_x.signum() {
-                                        continue;
-                                    }
-
-                                    // Original logic used (piece_sum - from_sum) / 2 as base distance
-                                    let diff = k_off;
-                                    let base_d = if dir_x > 0 {
-                                        pdx - diff / 2
-                                    } else {
-                                        -pdx + diff / 2
-                                    };
-
-                                    for dw in -diag_wiggle..=diag_wiggle {
-                                        let d = base_d + dw;
-                                        if d > 0 && d <= interception_limit {
-                                            target_dists.push(d);
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                    // Diagonal ray: iterate pieces on the same diagonal
+                    let is_diag1_dir = dir_x == dir_y;
+                    let diag_key = if is_diag1_dir {
+                        from.x - from.y
                     } else {
-                        let from_key = from.x - from.y;
-                        for k_off in -2..=2 {
-                            if let Some(pieces_on_diag) = indices.diag1.get(&(from_key + k_off)) {
-                                for &(px, _packed) in pieces_on_diag {
-                                    let pdx = px - from.x;
-                                    if pdx == 0 || pdx.signum() != dir_x.signum() {
-                                        continue;
-                                    }
+                        from.x + from.y
+                    };
+                    let diag_map = if is_diag1_dir {
+                        &indices.diag1
+                    } else {
+                        &indices.diag2
+                    };
 
-                                    let diff = k_off;
-                                    let base_d = if dir_x > 0 {
-                                        pdx - diff / 2
-                                    } else {
-                                        -pdx + diff / 2
-                                    };
+                    if let Some(pieces_on_diag) = diag_map.get(&diag_key) {
+                        for &(px, packed) in pieces_on_diag {
+                            let dx = px - from.x;
+                            if dx == 0 || dx.signum() != dir_x.signum() {
+                                continue;
+                            }
+                            let piece_dist = dx.abs();
+                            if piece_dist > interception_limit {
+                                continue;
+                            }
+                            let p = Piece::from_packed(packed);
+                            let is_enemy =
+                                p.color() != our_color && !p.piece_type().is_uncapturable();
+                            let wiggle = if is_enemy {
+                                ENEMY_WIGGLE
+                            } else {
+                                FRIEND_WIGGLE
+                            };
 
-                                    for dw in -diag_wiggle..=diag_wiggle {
-                                        let d = base_d + dw;
-                                        if d > 0 && d <= interception_limit {
-                                            target_dists.push(d);
-                                        }
-                                    }
+                            for w in -wiggle..=wiggle {
+                                let d = piece_dist + w;
+                                if d > 0 && d <= interception_limit {
+                                    target_dists.push(d);
                                 }
                             }
                         }
                     }
                 }
+
+                // Add cross-ray attack targets: pieces on perpendicular rays that we could
+                // attack from squares along our current ray direction
+                find_cross_ray_targets_into(
+                    board,
+                    from,
+                    dir_x,
+                    dir_y,
+                    interception_limit,
+                    indices,
+                    our_color,
+                    piece.piece_type(),
+                    ENEMY_WIGGLE,
+                    FRIEND_WIGGLE,
+                    &mut target_dists,
+                );
 
                 // Store computed distances in cache
                 indices
@@ -2580,18 +2751,10 @@ fn generate_huygen_moves(
 
                         if s == limit {
                             if closest_piece_color != Some(piece.color()) {
-                                moves.push(Move::new(
-                                    from.clone(),
-                                    Coordinate::new(to_x, to_y),
-                                    piece.clone(),
-                                ));
+                                moves.push(Move::new(*from, Coordinate::new(to_x, to_y), *piece));
                             }
                         } else {
-                            moves.push(Move::new(
-                                from.clone(),
-                                Coordinate::new(to_x, to_y),
-                                piece.clone(),
-                            ));
+                            moves.push(Move::new(*from, Coordinate::new(to_x, to_y), *piece));
                         }
                     }
                 }
@@ -2862,15 +3025,19 @@ fn generate_castling_moves_into(
                 let dy = coord.y - from.y;
 
                 if dy == 0 {
-                    let dir = if dx > 0 { 1 } else { -1 };
+                    let dir = if dx > 0 { 1i64 } else { -1i64 };
+
+                    // Use spatial indices to check path - O(log n) instead of O(distance)
                     let mut clear = true;
-                    let mut current_x = from.x + dir;
-                    while current_x != coord.x {
-                        if board.get_piece(current_x, from.y).is_some() {
-                            clear = false;
-                            break;
+                    if let Some(row_pieces) = indices.rows.get(&from.y) {
+                        if let Some((nearest_x, _)) =
+                            SpatialIndices::find_nearest(row_pieces, from.x, dir)
+                        {
+                            if (dir > 0 && nearest_x < coord.x) || (dir < 0 && nearest_x > coord.x)
+                            {
+                                clear = false;
+                            }
                         }
-                        current_x += dir;
                     }
 
                     if clear {
@@ -2943,4 +3110,654 @@ fn generate_huygen_moves_into(
 ) {
     let moves = generate_huygen_moves(board, from, piece, indices, fallback);
     out.extend(moves);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ======================== Bounds Tests ========================
+
+    #[test]
+    fn test_in_bounds_default() {
+        // Default bounds are very large (-1e15 to 1e15)
+        assert!(in_bounds(0, 0));
+        assert!(in_bounds(1000, 1000));
+        assert!(in_bounds(-1000, -1000));
+        assert!(in_bounds(1_000_000_000, 1_000_000_000));
+    }
+
+    #[test]
+    fn test_set_world_bounds() {
+        // Set custom bounds
+        set_world_bounds(-100, 100, -50, 50);
+
+        assert!(in_bounds(0, 0));
+        assert!(in_bounds(100, 50));
+        assert!(in_bounds(-100, -50));
+        assert!(!in_bounds(101, 0));
+        assert!(!in_bounds(0, 51));
+
+        // Reset to large defaults
+        set_world_bounds(
+            -1_000_000_000_000_000,
+            1_000_000_000_000_000,
+            -1_000_000_000_000_000,
+            1_000_000_000_000_000,
+        );
+    }
+
+    #[test]
+    fn test_get_world_size() {
+        set_world_bounds(-100, 100, -50, 50);
+        let size = get_world_size();
+        assert_eq!(size, 200, "Width is larger than height");
+
+        // Reset
+        set_world_bounds(
+            -1_000_000_000_000_000,
+            1_000_000_000_000_000,
+            -1_000_000_000_000_000,
+            1_000_000_000_000_000,
+        );
+    }
+
+    #[test]
+    fn test_get_coord_bounds() {
+        set_world_bounds(-10, 20, -30, 40);
+        let (min_x, max_x, min_y, max_y) = get_coord_bounds();
+        assert_eq!(min_x, -10);
+        assert_eq!(max_x, 20);
+        assert_eq!(min_y, -30);
+        assert_eq!(max_y, 40);
+
+        // Reset
+        set_world_bounds(
+            -1_000_000_000_000_000,
+            1_000_000_000_000_000,
+            -1_000_000_000_000_000,
+            1_000_000_000_000_000,
+        );
+    }
+
+    // ======================== SpatialIndices Tests ========================
+
+    #[test]
+    fn test_spatial_indices_new_empty() {
+        let board = Board::new();
+        let indices = SpatialIndices::new(&board);
+
+        assert!(indices.rows.is_empty());
+        assert!(indices.cols.is_empty());
+        assert!(indices.diag1.is_empty());
+        assert!(indices.diag2.is_empty());
+    }
+
+    #[test]
+    fn test_spatial_indices_add_remove() {
+        let mut indices = SpatialIndices::default();
+        let packed = Piece::new(PieceType::Rook, PlayerColor::White).packed();
+
+        // Add piece at (5, 10)
+        indices.add(5, 10, packed);
+
+        // Check it's in all the right indices
+        assert!(indices.rows.get(&10).is_some());
+        assert!(indices.cols.get(&5).is_some());
+        assert!(indices.diag1.get(&-5).is_some()); // 5 - 10 = -5
+        assert!(indices.diag2.get(&15).is_some()); // 5 + 10 = 15
+
+        // Remove it
+        indices.remove(5, 10);
+
+        // Check it's removed from all indices
+        assert!(indices.rows.get(&10).map(|v| v.is_empty()).unwrap_or(true));
+        assert!(indices.cols.get(&5).map(|v| v.is_empty()).unwrap_or(true));
+    }
+
+    #[test]
+    fn test_spatial_indices_find_nearest_forward() {
+        let vec = vec![(0, 1), (5, 2), (10, 3), (20, 4)];
+
+        // Find nearest forward from position 3
+        let result = SpatialIndices::find_nearest(&vec, 3, 1);
+        assert_eq!(result, Some((5, 2)), "Should find piece at coord 5");
+
+        // Find nearest forward from position 10
+        let result = SpatialIndices::find_nearest(&vec, 10, 1);
+        assert_eq!(result, Some((20, 4)), "Should find piece at coord 20");
+    }
+
+    #[test]
+    fn test_spatial_indices_find_nearest_backward() {
+        let vec = vec![(0, 1), (5, 2), (10, 3), (20, 4)];
+
+        // Find nearest backward from position 7
+        let result = SpatialIndices::find_nearest(&vec, 7, -1);
+        assert_eq!(result, Some((5, 2)), "Should find piece at coord 5");
+
+        // Find nearest backward from position 0
+        let result = SpatialIndices::find_nearest(&vec, 0, -1);
+        assert_eq!(result, None, "No piece before 0");
+    }
+
+    #[test]
+    fn test_spatial_indices_find_nearest_at_extreme_distance() {
+        // Test with large coordinates (infinite chess scale)
+        let vec = vec![(-1_000_000, 1), (0, 2), (1_000_000, 3)];
+
+        let result = SpatialIndices::find_nearest(&vec, 0, 1);
+        assert_eq!(result, Some((1_000_000, 3)), "Should find distant piece");
+
+        let result = SpatialIndices::find_nearest(&vec, 0, -1);
+        assert_eq!(
+            result,
+            Some((-1_000_000, 1)),
+            "Should find distant piece backward"
+        );
+    }
+
+    // ======================== Move Generation Tests ========================
+
+    #[test]
+    fn test_move_new() {
+        let from = Coordinate::new(1, 2);
+        let to = Coordinate::new(3, 4);
+        let piece = Piece::new(PieceType::Knight, PlayerColor::White);
+
+        let m = Move::new(from, to, piece);
+
+        assert_eq!(m.from.x, 1);
+        assert_eq!(m.from.y, 2);
+        assert_eq!(m.to.x, 3);
+        assert_eq!(m.to.y, 4);
+        assert!(m.promotion.is_none());
+        assert!(m.rook_coord.is_none());
+    }
+
+    #[test]
+    fn test_is_enemy_piece_detection() {
+        let white_knight = Piece::new(PieceType::Knight, PlayerColor::White);
+        let black_knight = Piece::new(PieceType::Knight, PlayerColor::Black);
+        let void = Piece::new(PieceType::Void, PlayerColor::Neutral);
+
+        // White sees black as enemy
+        assert!(is_enemy_piece(&black_knight, PlayerColor::White));
+        // Black sees white as enemy
+        assert!(is_enemy_piece(&white_knight, PlayerColor::Black));
+        // Same color is not enemy
+        assert!(!is_enemy_piece(&white_knight, PlayerColor::White));
+        // Void is not enemy (it's neutral, but also blocked by piece type check)
+        assert!(!is_enemy_piece(&void, PlayerColor::White));
+    }
+
+    #[test]
+    fn test_slider_detection_at_distance() {
+        // Test that SpatialIndices can find pieces at large distances
+        // This is the foundation for slider attack detection in infinite chess
+        let mut board = Board::new();
+        board.set_piece(0, 0, Piece::new(PieceType::Rook, PlayerColor::White));
+        board.set_piece(1000, 0, Piece::new(PieceType::King, PlayerColor::Black));
+
+        let indices = SpatialIndices::new(&board);
+
+        // The row should have both pieces
+        let row = indices.rows.get(&0).unwrap();
+        assert_eq!(row.len(), 2, "Row should have 2 pieces");
+
+        // Find nearest from rook position toward king
+        let result = SpatialIndices::find_nearest(row, 0, 1);
+        assert_eq!(
+            result.map(|(c, _)| c),
+            Some(1000),
+            "Should find king at x=1000"
+        );
+    }
+
+    #[test]
+    fn test_knight_moves_generation() {
+        let mut board = Board::new();
+        board.set_piece(4, 4, Piece::new(PieceType::Knight, PlayerColor::White));
+
+        let from = Coordinate::new(4, 4);
+        let piece = Piece::new(PieceType::Knight, PlayerColor::White);
+
+        let mut moves = MoveList::new();
+        generate_leaper_moves_into(&board, &from, &piece, 1, 2, &mut moves);
+
+        // Knight has 8 possible moves from center
+        assert_eq!(moves.len(), 8, "Knight should have 8 moves from (4,4)");
+
+        // Check specific squares
+        let expected = [
+            (5, 6),
+            (6, 5),
+            (6, 3),
+            (5, 2),
+            (3, 2),
+            (2, 3),
+            (2, 5),
+            (3, 6),
+        ];
+        for (x, y) in expected {
+            assert!(
+                moves.iter().any(|m| m.to.x == x && m.to.y == y),
+                "Knight should be able to move to ({}, {})",
+                x,
+                y
+            );
+        }
+    }
+
+    #[test]
+    fn test_king_moves_generation() {
+        let mut board = Board::new();
+        board.set_piece(4, 4, Piece::new(PieceType::King, PlayerColor::White));
+
+        let from = Coordinate::new(4, 4);
+        let piece = Piece::new(PieceType::King, PlayerColor::White);
+
+        let mut moves = MoveList::new();
+        generate_compass_moves_into(&board, &from, &piece, 1, &mut moves);
+
+        // King has 8 possible moves from center
+        assert_eq!(moves.len(), 8, "King should have 8 moves from (4,4)");
+    }
+
+    #[test]
+    fn test_fairy_piece_camel() {
+        let mut board = Board::new();
+        board.set_piece(4, 4, Piece::new(PieceType::Camel, PlayerColor::White));
+
+        let from = Coordinate::new(4, 4);
+        let piece = Piece::new(PieceType::Camel, PlayerColor::White);
+
+        let mut moves = MoveList::new();
+        generate_leaper_moves_into(&board, &from, &piece, 1, 3, &mut moves);
+
+        // Camel leaps (1,3) - 8 squares
+        assert_eq!(moves.len(), 8, "Camel should have 8 moves from (4,4)");
+
+        // Check a specific camel square
+        assert!(
+            moves.iter().any(|m| m.to.x == 5 && m.to.y == 7),
+            "Camel should be able to move to (5, 7)"
+        );
+    }
+
+    #[test]
+    fn test_fairy_piece_zebra() {
+        let mut board = Board::new();
+        board.set_piece(4, 4, Piece::new(PieceType::Zebra, PlayerColor::White));
+
+        let from = Coordinate::new(4, 4);
+        let piece = Piece::new(PieceType::Zebra, PlayerColor::White);
+
+        let mut moves = MoveList::new();
+        generate_leaper_moves_into(&board, &from, &piece, 2, 3, &mut moves);
+
+        // Zebra leaps (2,3) - 8 squares
+        assert_eq!(moves.len(), 8, "Zebra should have 8 moves from (4,4)");
+    }
+
+    #[test]
+    fn test_negative_coordinates() {
+        // Test that piece at negative coordinates generates moves correctly
+        let mut board = Board::new();
+        board.set_piece(
+            -100,
+            -100,
+            Piece::new(PieceType::Knight, PlayerColor::White),
+        );
+
+        let from = Coordinate::new(-100, -100);
+        let piece = Piece::new(PieceType::Knight, PlayerColor::White);
+
+        let mut moves = MoveList::new();
+        generate_leaper_moves_into(&board, &from, &piece, 1, 2, &mut moves);
+
+        assert_eq!(
+            moves.len(),
+            8,
+            "Knight at negative coords should have 8 moves"
+        );
+
+        // Check one of the expected squares
+        assert!(
+            moves.iter().any(|m| m.to.x == -99 && m.to.y == -98),
+            "Knight should be able to move to (-99, -98)"
+        );
+    }
+
+    #[test]
+    fn test_is_enemy_piece() {
+        let white_pawn = Piece::new(PieceType::Pawn, PlayerColor::White);
+        let black_pawn = Piece::new(PieceType::Pawn, PlayerColor::Black);
+
+        assert!(!is_enemy_piece(&white_pawn, PlayerColor::White));
+        assert!(is_enemy_piece(&black_pawn, PlayerColor::White));
+        assert!(is_enemy_piece(&white_pawn, PlayerColor::Black));
+    }
+
+    #[test]
+    fn test_generate_pawn_moves() {
+        use crate::game::PromotionRanks;
+
+        let mut board = Board::new();
+        board.set_piece(4, 2, Piece::new(PieceType::Pawn, PlayerColor::White));
+        board.set_piece(5, 3, Piece::new(PieceType::Pawn, PlayerColor::Black)); // Capture target
+
+        let from = Coordinate::new(4, 2);
+        let piece = Piece::new(PieceType::Pawn, PlayerColor::White);
+
+        let mut rules = GameRules::default();
+        rules.promotions_allowed = Some(vec!["queens".to_string()]);
+        rules.promotion_ranks = Some(PromotionRanks {
+            white: vec![8],
+            black: vec![1],
+        });
+
+        let special = FxHashSet::default();
+        let moves = generate_pawn_moves(&board, &from, &piece, &special, &None, &rules);
+
+        assert!(moves.len() >= 2, "Pawn should have at least 2 moves");
+        // Should include forward move and capture
+        assert!(
+            moves.iter().any(|m| m.to.y == 3 && m.to.x == 4),
+            "Forward move"
+        );
+        assert!(moves.iter().any(|m| m.to.y == 3 && m.to.x == 5), "Capture");
+    }
+
+    #[test]
+    fn test_generate_sliding_moves_rook() {
+        let mut board = Board::new();
+        board.set_piece(4, 4, Piece::new(PieceType::Rook, PlayerColor::White));
+        board.rebuild_tiles();
+
+        let from = Coordinate::new(4, 4);
+        let piece = Piece::new(PieceType::Rook, PlayerColor::White);
+        let indices = SpatialIndices::new(&board);
+
+        let ortho = &[(1, 0), (-1, 0), (0, 1), (0, -1)];
+        let moves = generate_sliding_moves(&board, &from, &piece, ortho, &indices, true, None);
+
+        // Rook on empty board should have many moves (limited by fallback)
+        assert!(moves.len() > 0, "Rook should have some moves");
+    }
+
+    #[test]
+    fn test_generate_sliding_moves_bishop() {
+        let mut board = Board::new();
+        board.set_piece(4, 4, Piece::new(PieceType::Bishop, PlayerColor::White));
+        board.rebuild_tiles();
+
+        let from = Coordinate::new(4, 4);
+        let piece = Piece::new(PieceType::Bishop, PlayerColor::White);
+        let indices = SpatialIndices::new(&board);
+
+        let diag = &[(1, 1), (1, -1), (-1, 1), (-1, -1)];
+        let moves = generate_sliding_moves(&board, &from, &piece, diag, &indices, true, None);
+
+        assert!(moves.len() > 0, "Bishop should have some moves");
+    }
+
+    #[test]
+    fn test_is_square_attacked_by_knight() {
+        let mut board = Board::new();
+        board.set_piece(4, 4, Piece::new(PieceType::Knight, PlayerColor::White));
+        board.rebuild_tiles();
+
+        let indices = SpatialIndices::new(&board);
+        let target_attacked = Coordinate::new(5, 6); // Knight can attack this
+        let target_not_attacked = Coordinate::new(4, 5); // Knight cannot attack this
+
+        assert!(is_square_attacked(
+            &board,
+            &target_attacked,
+            PlayerColor::White,
+            &indices
+        ));
+        assert!(!is_square_attacked(
+            &board,
+            &target_not_attacked,
+            PlayerColor::White,
+            &indices
+        ));
+    }
+
+    #[test]
+    fn test_is_square_attacked_by_rook() {
+        let mut board = Board::new();
+        board.set_piece(4, 4, Piece::new(PieceType::Rook, PlayerColor::White));
+        board.rebuild_tiles();
+
+        let indices = SpatialIndices::new(&board);
+        let target_file = Coordinate::new(4, 10); // Same file
+        let target_rank = Coordinate::new(10, 4); // Same rank
+
+        assert!(is_square_attacked(
+            &board,
+            &target_file,
+            PlayerColor::White,
+            &indices
+        ));
+        assert!(is_square_attacked(
+            &board,
+            &target_rank,
+            PlayerColor::White,
+            &indices
+        ));
+    }
+
+    #[test]
+    fn test_is_square_attacked_blocked() {
+        let mut board = Board::new();
+        board.set_piece(4, 4, Piece::new(PieceType::Rook, PlayerColor::White));
+        board.set_piece(4, 6, Piece::new(PieceType::Pawn, PlayerColor::White)); // Blocker
+        board.rebuild_tiles();
+
+        let indices = SpatialIndices::new(&board);
+        let target_blocked = Coordinate::new(4, 10); // Blocked by pawn at (4,6)
+
+        assert!(!is_square_attacked(
+            &board,
+            &target_blocked,
+            PlayerColor::White,
+            &indices
+        ));
+    }
+
+    #[test]
+    fn test_generate_castling_moves() {
+        let mut board = Board::new();
+        board.set_piece(5, 1, Piece::new(PieceType::King, PlayerColor::White));
+        board.set_piece(8, 1, Piece::new(PieceType::Rook, PlayerColor::White)); // Kingside rook
+        board.rebuild_tiles();
+
+        let from = Coordinate::new(5, 1);
+        let piece = Piece::new(PieceType::King, PlayerColor::White);
+
+        let mut special = FxHashSet::default();
+        special.insert(Coordinate::new(5, 1)); // King has special right
+        special.insert(Coordinate::new(8, 1)); // Rook has special right
+
+        let indices = SpatialIndices::new(&board);
+        let moves = generate_castling_moves(&board, &from, &piece, &special, &indices);
+
+        // Test that the function runs without panicking and returns a MoveList
+        // Castling availability depends on variant rules and board state
+        let _ = moves.len();
+    }
+
+    #[test]
+    fn test_ray_border_distance() {
+        let from = Coordinate::new(0, 0);
+
+        // Moving right (positive x)
+        let dist = ray_border_distance(&from, 1, 0);
+        assert!(dist.is_some());
+        assert!(dist.unwrap() > 0);
+    }
+
+    #[test]
+    fn test_extend_captures_only() {
+        let mut board = Board::new();
+        board.set_piece(4, 4, Piece::new(PieceType::Knight, PlayerColor::White));
+        board.set_piece(5, 6, Piece::new(PieceType::Pawn, PlayerColor::Black)); // Capture target
+
+        let mut all_moves = MoveList::new();
+        let from = Coordinate::new(4, 4);
+        let piece = Piece::new(PieceType::Knight, PlayerColor::White);
+        generate_leaper_moves_into(&board, &from, &piece, 1, 2, &mut all_moves);
+
+        let mut captures_only = MoveList::new();
+        extend_captures_only(&board, PlayerColor::White, all_moves, &mut captures_only);
+
+        // Should have exactly 1 capture (the pawn at 5,6)
+        assert_eq!(captures_only.len(), 1);
+    }
+
+    #[test]
+    fn test_extend_quiets_only() {
+        let mut board = Board::new();
+        board.set_piece(4, 4, Piece::new(PieceType::Knight, PlayerColor::White));
+        board.set_piece(5, 6, Piece::new(PieceType::Pawn, PlayerColor::Black)); // Capture target
+
+        let mut all_moves = MoveList::new();
+        let from = Coordinate::new(4, 4);
+        let piece = Piece::new(PieceType::Knight, PlayerColor::White);
+        generate_leaper_moves_into(&board, &from, &piece, 1, 2, &mut all_moves);
+
+        let mut quiets_only = MoveList::new();
+        extend_quiets_only(&board, all_moves, &mut quiets_only);
+
+        // Should have 7 quiet moves (8 total - 1 capture)
+        assert_eq!(quiets_only.len(), 7);
+    }
+
+    #[test]
+    fn test_generate_compass_moves() {
+        let mut board = Board::new();
+        board.set_piece(4, 4, Piece::new(PieceType::Hawk, PlayerColor::White));
+
+        let from = Coordinate::new(4, 4);
+        let piece = Piece::new(PieceType::Hawk, PlayerColor::White);
+
+        let moves = generate_compass_moves(&board, &from, &piece, 2);
+
+        // Distance 2 compass should have 8 moves (4 ortho + 4 diag)
+        assert_eq!(moves.len(), 8);
+    }
+
+    #[test]
+    fn test_spatial_indices_default() {
+        let indices = SpatialIndices::default();
+        assert!(indices.rows.is_empty());
+        assert!(indices.cols.is_empty());
+        assert!(indices.diag1.is_empty());
+        assert!(indices.diag2.is_empty());
+    }
+
+    #[test]
+    fn test_find_blocker_via_indices() {
+        let mut board = Board::new();
+        board.set_piece(4, 4, Piece::new(PieceType::Rook, PlayerColor::White));
+        board.set_piece(4, 8, Piece::new(PieceType::Pawn, PlayerColor::White)); // Blocker
+        board.rebuild_tiles();
+
+        let from = Coordinate::new(4, 4);
+        let indices = SpatialIndices::new(&board);
+
+        // Looking up (positive y)
+        let (dist, captures) =
+            find_blocker_via_indices(&board, &from, 0, 1, &indices, PlayerColor::White);
+
+        assert!(dist > 0, "Should find a blocker");
+        assert!(!captures, "Own piece should not be a capture");
+    }
+
+    #[test]
+    fn test_generate_knightrider_moves() {
+        let mut board = Board::new();
+        board.set_piece(4, 4, Piece::new(PieceType::Knightrider, PlayerColor::White));
+
+        let from = Coordinate::new(4, 4);
+        let piece = Piece::new(PieceType::Knightrider, PlayerColor::White);
+
+        let moves = generate_knightrider_moves(&board, &from, &piece);
+
+        // Knightrider should have at least 8 moves (the initial knight squares)
+        assert!(moves.len() >= 8, "Knightrider should have at least 8 moves");
+    }
+
+    #[test]
+    fn test_generate_rose_moves() {
+        let mut board = Board::new();
+        board.set_piece(4, 4, Piece::new(PieceType::Rose, PlayerColor::White));
+
+        let from = Coordinate::new(4, 4);
+        let piece = Piece::new(PieceType::Rose, PlayerColor::White);
+
+        let moves = generate_rose_moves(&board, &from, &piece);
+
+        assert!(moves.len() > 0, "Rose should have some moves");
+    }
+
+    #[test]
+    fn test_get_legal_moves() {
+        use crate::game::GameRules;
+
+        let mut board = Board::new();
+        board.set_piece(5, 1, Piece::new(PieceType::King, PlayerColor::White));
+        board.set_piece(5, 8, Piece::new(PieceType::King, PlayerColor::Black));
+        board.set_piece(4, 2, Piece::new(PieceType::Pawn, PlayerColor::White));
+        board.rebuild_tiles();
+
+        let indices = SpatialIndices::new(&board);
+        let special = FxHashSet::default();
+        let rules = GameRules::default();
+
+        let moves = get_legal_moves(
+            &board,
+            PlayerColor::White,
+            &special,
+            &None,
+            &rules,
+            &indices,
+            Some(&Coordinate::new(5, 8)),
+        );
+
+        assert!(moves.len() > 0, "White should have legal moves");
+    }
+
+    #[test]
+    fn test_get_quiescence_captures() {
+        use crate::game::GameRules;
+
+        let mut board = Board::new();
+        board.set_piece(5, 1, Piece::new(PieceType::King, PlayerColor::White));
+        board.set_piece(5, 8, Piece::new(PieceType::King, PlayerColor::Black));
+        board.set_piece(4, 4, Piece::new(PieceType::Knight, PlayerColor::White));
+        board.set_piece(5, 6, Piece::new(PieceType::Pawn, PlayerColor::Black)); // Capture target
+        board.rebuild_tiles();
+
+        let indices = SpatialIndices::new(&board);
+        let special = FxHashSet::default();
+        let rules = GameRules::default();
+
+        let mut captures = MoveList::new();
+        get_quiescence_captures(
+            &board,
+            PlayerColor::White,
+            &special,
+            &None,
+            &rules,
+            &indices,
+            &mut captures,
+        );
+
+        // Should find the knight capture
+        assert!(captures.len() > 0, "Should find capture moves");
+    }
 }

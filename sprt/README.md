@@ -1,254 +1,239 @@
-# HydroChess SPRT Testing Tool
+# SPRT Testing Tool
 
-Sequential Probability Ratio Test (SPRT) for comparing HydroChess engine versions using a **web-based UI**.
+Sequential Probability Ratio Test (SPRT) for validating HydroChess engine changes.
+
+**[← Back to README](../README.md)** | **[Contributing Guide](../docs/CONTRIBUTING.md)** | **[Setup Guide](../docs/SETUP.md)**
 
 ---
 
-## Quick Start (Web UI)
+## What is SPRT?
 
-From the `sprt/` directory:
+SPRT is a statistical test that determines whether a new engine version is stronger, weaker, or equivalent to a baseline. It's the industry standard for chess engine development, used by Stockfish, Leela Chess Zero, and others.
+
+**Use SPRT when:**
+- Changing search algorithms (LMR, pruning, extensions)
+- Modifying evaluation terms
+- Tuning piece values or parameters
+
+---
+
+## Quick Start
+
+### 1. Build Your Baseline
+
+Before making changes, save the current engine as your baseline:
+
+```bash
+# From the engine root directory
+wasm-pack build --target web --out-dir pkg-old
+```
+
+### 2. Make Your Changes
+
+Edit the code and save.
+
+### 3. Run SPRT
 
 ```bash
 cd sprt
-
-# Start the web SPRT helper (builds WASM for web + starts dev server)
 npm run dev
 ```
 
 This will:
+- Build your modified engine → `sprt/web/pkg-new`
+- Copy baseline → `sprt/web/pkg-old`
+- Start a local server at `http://localhost:3000`
 
-- Copy the existing `pkg-old` directory at the engine root into `sprt/web/pkg-old` as the **OLD** reference build
-- Build a new **web** WASM directly into `sprt/web/pkg-new` using `wasm-pack build --target web --out-dir sprt/web/pkg-new`
-- Start `npx serve .` in `sprt/web` on port 3000
+### 4. Open the Web UI
 
-Before running this, build your OLD reference engine once from the project root:
+Navigate to `http://localhost:3000` in your browser.
 
-```bash
-wasm-pack build --target web --out-dir pkg-old
-```
+### 5. Configure and Run
 
-Then open in your browser:
-
-- **URL**: `http://localhost:3000/`
-
-All SPRT configuration and running is done from this page.
+1. Select a **Bounds Preset** (see table below)
+2. Choose **Mode**: Gainer or Non-Regression
+3. Set **Time Per Move** (200ms recommended)
+4. Click **Run SPRT**
 
 ---
 
-## Web UI Overview
+## Configuration Options
 
-The web UI has three main areas:
+### Bounds Presets
 
-1. **SPRT Configuration**
-2. **SPRT Test (status + stats + logs)**
-3. **Game Log + Download buttons**
+| Preset | Gainer Bounds | Non-Reg Bounds | Best For |
+|--------|---------------|----------------|----------|
+| `all` (default) | [0, 10] | [-10, 0] | Most changes |
+| `top200` | [0, 5] | [-5, 0] | Small improvements |
+| `top30` | [0, 3] | [-3, 1] | Subtle changes |
+| `stockfish_stc` | [0, 2] | [-1.75, 0.25] | Very refined changes |
+| `stockfish_ltc` | [0.5, 2.5] | [-1.75, 0.25] | Long time control |
 
-### 1. SPRT Configuration
+### Modes
 
-Controls in the left card:
+- **Gainer**: Prove the new engine is stronger (H1: new > old)
+- **Non-Regression**: Prove the new engine isn't weaker (H1: new ≥ old)
 
-- **Bounds Preset**: `stockfish_ltc`, `stockfish_stc`, `top30`, `top200`, `all`  
-  Same presets as the original CLI tool.
-- **Mode**: `Gainer` or `Non-Regression`  
-  Determines whether you are proving a gain or guarding against regression.
-- **Alpha / Beta**: Type I / II error rates (default 0.05 / 0.05).
-- **Time Per Move (ms)**: Think time per move (default 200ms).
-- **Concurrency**: Number of parallel Web Workers (games in flight).
-- **Min Games (even)**: Minimum number of games before SPRT is allowed to stop.  
-  Automatically rounded **up to an even number** to respect game pairing.
-- **Max Games (even)**: Maximum games for the run.  
-  Also forced to be even.
-- **Max Moves per Game**: Move limit before a game is scored as a draw.
+### Other Settings
 
-### 2. SPRT Test Card
-
-The right card shows:
-
-- **Run SPRT / Stop** buttons
-- **Win / Loss / Draw counters** for the **new** engine vs the old
-- **Estimated Elo difference** (with error bar)
-- **Colored Status line**:
-  - `PASSED (new > old)` – green
-  - `FAILED (no gain)` – red
-  - `INCONCLUSIVE` – yellow
-  - `ABORTED` – when you hit Stop
-- **SPRT Test Logs** box:
-  - A line per game: result, cumulative W/L/D, Elo, LLR, and the opening in brackets, e.g.  
-    `Game 12: draw (W:1 L:0 D:11) Elo≈2.3±15.4 LLR=-0.01 [e2,e4]`
-  - Final summary block similar to the old `printResult`:
-    - Total games, score, win rate, Elo diff ± error
-    - LLR and bounds
-
-On Stop, if at least one game finished, a **Current Results (aborted)** block is printed with the same style of
-summary for the partial run.
-
-### 3. Game Log and Downloads
-
-The **Game Log** panel at the bottom shows a timestamped stream of messages:
-
-- Run start line
-- Per-game progress lines: `Games: N/M  W:x L:y D:z  Elo≈...±...  LLR ... in [lower, upper]`
-- Final completion line or abort line
-
-Buttons:
-
-- **Copy Log** – copies the full Game Log text to the clipboard
-- **Download Logs** – downloads the Game Log as a `.txt` file
-- **Download Games (ICN)** – downloads all completed games in ICN/longconv-like format, one per block
-  (button is hidden/disabled until at least one game has finished).
-
-Each ICN game contains headers like:
-
-```
-[Event "SPRT Test Game 12"] [Site "https://www.infinitechess.org/"] [Variant "Classical"]
-[UTCDate "2025.11.28"] [UTCTime "22:10:00"] [Result "1/2-1/2"] [TimeControl "-"]
-...
-```
-
-- **`[Result "1-0"]`** – new engine wins
-- **`[Result "0-1"]`** – new engine loses
-- **`[Result "1/2-1/2"]`** – draw
-
-Moves are logged in the same coordinate-based style used elsewhere in InfiniteChess and can be copy‑pasted into
-the website tools.
+| Setting | Default | Description |
+|---------|---------|-------------|
+| TC Mode | Base+Inc | What type of time control to use |
+| Concurrency | 50 | Parallel games (Web Workers) |
+| Min Games | 250 | Minimum games before stopping |
+| Max Games | 1000 | Maximum games limit |
+| Max Moves | 200 | Moves before forced draw |
+| Material Adjudication | 1500 | Eval difference to auto win |
 
 ---
 
-## Engine Pairing and Openings
+## Understanding Results
 
-The web SPRT UI compares two **web-target** WASM builds:
+### Status Colors
 
-- **Old engine**: whatever is currently in the root `pkg-old` directory (copied into `sprt/web/pkg-old`)
-- **New engine**: freshly built into `sprt/web/pkg-new` by `wasm-pack build --target web --out-dir sprt/web/pkg-new`
+| Status | Meaning |
+|--------|---------|
+| 🟢 **PASSED** | New engine is stronger (LLR ≥ upper bound) |
+| 🔴 **FAILED** | New engine is weaker (LLR ≤ lower bound) |
+| 🟡 **INCONCLUSIVE** | Need more games |
+| ⚪ **ABORTED** | Test stopped manually |
 
-For each game:
+### Statistics Shown
 
-- Games are run in **pairs**:
-  - Game 0 & 1 share the same opening
-  - Game 2 & 3 share a different opening, etc.
-- Within each pair:
-  - **Even index** game: new engine plays **White**
-  - **Odd index** game: old engine plays **White**
+- **W/L/D**: Wins, Losses, Draws for the new engine
+- **Elo ± Error**: Estimated rating difference
+- **LLR**: Log-likelihood ratio (test statistic)
+- **Bounds**: [lower, upper] threshold for decision
 
-This ensures each opening is played once with each engine taking White, which reduces first-move bias.
+### Example Output
 
-### Random Opening Move
+```
+Game 100: win (W:35 L:25 D:40) Elo≈20.5±12.3 LLR=2.89 [5,4->5,5]
 
-Instead of using an external opening book, the web SPRT UI:
-
-1. Starts from the standard infinite chess position (coordinate-based).
-2. Chooses a **random legal first move for White**
-3. Applies this as a fixed opening for a **pair of games**.
-
-### SPRT Termination and Even Game Counts
-
-Because the tool uses paired games per opening:
-
-- **`minGames` and `maxGames` are forced even** in `runSprt()`
-- The SPRT decision (bounds hit / max games reached) is only evaluated after an **even number** of games
-  (i.e. after a full pair has finished)
-
-This guarantees that the test never stops halfway through a color‑reversed pair.
+═══════════ SPRT PASSED ═══════════
+Total games: 100
+Score: 55.0% (35W 25L 40D)
+Elo difference: +20.5 ± 12.3
+LLR: 2.89 [0.00, 10.00]
+Verdict: New engine is stronger
+═══════════════════════════════════
+```
 
 ---
 
-## Bounds Presets and Modes
+## Game Pairing
 
-Presets are available via the dropdowns:
+Games are run in **color-reversed pairs** to reduce first-move bias:
 
-| Preset           | Gainer Bounds | Non-reg Bounds | Usage                        |
-|------------------|---------------|----------------|------------------------------|
-| `stockfish_ltc`  | [0.5, 2.5]    | [-1.75, 0.25]  | Very strong engines (LTC)    |
-| `stockfish_stc`  | [0, 2]        | [-1.75, 0.25]  | Very strong engines (STC)    |
-| `top30`          | [0, 3]        | [-3, 1]        | Top 30 engines               |
-| `top200`         | [0, 5]        | [-5, 0]        | Top 200 engines              |
-| `all` (default)  | [0, 10]       | [-10, 0]       | All other engines            |
+- Games 0 & 1: Same opening, new engine plays White then Black
+- Games 2 & 3: Different opening, same pattern
+- ...
 
-Modes:
-
-- **Gainer**: Prove that the new engine is at least `elo1` better than `elo0`.
-- **Non-Regression**: Show that the new engine is not worse than a negative `elo0` by more than the preset.
-
-The web UI computes:
-
-- Log-likelihood ratio (LLR) after each game
-- Estimated Elo difference + error bar
-- Final verdict based on the configured `alpha`/`beta` and preset.
+SPRT only makes decisions after completing full pairs.
 
 ---
 
-## Directory Structure (Web Version)
+## Downloads
 
+The UI provides download buttons:
+
+| Button | Content |
+|--------|---------|
+| **Copy Log** | Copy game log to clipboard |
+| **Download Logs** | Save game log as `.txt` |
+| **Download Games (ICN)** | Save games in ICN format |
+
+ICN format includes headers like:
 ```
-sprt/
-├── sprt.js          # Web helper: builds web WASM & starts npx serve in sprt/web
-├── web/
-│   ├── index.html   # Browser UI
-│   ├── main.js      # SPRT logic, workers, ICN generation
-│   ├── sprt-worker.js
-│   ├── pkg-old/     # Copied from root/pkg (old engine)
-│   └── pkg-new/     # Copied from root/pkg-new (new engine)
-├── README.md        # This file
-└── package.json     # Local package with npm scripts
+[Event "SPRT Test Game 12"]
+[Result "1-0"]
+[Opening "5,2->5,4"]
 ```
 
-## SPSA Logic Tuning
+---
 
-The directory also contains an SPSA (Simultaneous Perturbation Stochastic Approximation) tuner for optimizing search parameters. This tool runs self-play games to automatically tune constants like reductions, pruning margins, and history bonuses.
+## SPSA Parameter Tuning
+
+SPSA automatically optimizes search parameters through self-play.
 
 ### Quick Start
 
 ```bash
-# Run the tuner with default settings (auto-resumes if checkpoint exists)
+cd sprt
 npm run spsa
 ```
 
-### Usage Guide
+### Options
 
-The tuner runs iterations of games to optimize parameters defined in `spsa_config.mjs`.
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--games <n>` | 60 | Games per iteration |
+| `--iterations <n>` | 100 | Total iterations |
+| `--tc <ms>` | 200 | Time per move (ms) |
+| `--concurrency <n>` | 20 | Parallel workers |
+| `--fresh` | false | Ignore checkpoints |
+| `--verbose` | false | Show detailed updates |
 
-**Common Options:**
-
-- `--games <n>`: Number of games per side per iteration. Higher = more accurate gradient but slower. (Default: 60)
-- `--iterations <n>`: How many iterations to run. (Default: 100)
-- `--tc <ms>`: Time control per move in milliseconds. (Default: 200)
-- `--concurrency <n>`: Number of parallel workers. (Default: 20)
-- `--fresh`: Ignore existing checkpoints and start tuning from scratch.
-- `--verbose`: Show detailed parameter updates and debug info.
-
-**Examples:**
+### Examples
 
 ```bash
-# Faster run with fewer games per iteration
-npm run spsa -- --games 20 --tc 25
+# Quick test run
+npm run spsa -- --games 20 --iterations 10
 
-# Start fresh with high concurrency
-npm run spsa -- --fresh --concurrency 20
+# Full tuning session
+npm run spsa -- --games 100 --iterations 500
 
-# Run for many iterations
-npm run spsa -- --iterations 1000
+# Resume from checkpoint
+npm run spsa  # Auto-resumes if checkpoint exists
+
+# Start fresh
+npm run spsa -- --fresh
 ```
 
-### Checkpoints and Resuming
+### Checkpoints
 
-- Checkpoints are saved to `sprt/checkpoints/spsa_N.json`.
-- By default, checkpoints are saved every **5% of total iterations** (e.g., every 5 iterations for a 100-iteration run).
-- You can change this frequency with `--checkpoint <n>`.
-- `npm run spsa` will **automatically find the latest checkpoint** and resume from it.
-- Use `--fresh` to force a new run from default parameters.
-- You can also resume from a specific file if needed: 
-  ```bash
-  npm run spsa -- checkpoints/spsa_50.json
-  ```
+- Saved to `sprt/checkpoints/spsa_N.json` every 5% of iterations
+- Auto-resumed on next run
+- Use `--fresh` to ignore checkpoints
 
 ### Configuration
 
-Editable parameters and their bounds are defined in `sprt/spsa_config.mjs`. This file also controls the SPSA hyperparameters (learning rate `a`, perturbation size `c`, stability constant `A`, etc.).
+Edit `sprt/spsa_config.mjs` to:
+- Add/remove tunable parameters
+- Set parameter bounds
+- Adjust SPSA hyperparameters (learning rate, perturbation)
+
+---
+
+## Directory Structure
+
+```
+sprt/
+├── sprt.js              # Build script + dev server
+├── spsa.mjs             # SPSA tuner
+├── spsa_config.mjs      # Tunable parameters
+├── package.json         # npm scripts
+├── checkpoints/         # SPSA checkpoints
+└── web/
+    ├── index.html       # SPRT web UI
+    ├── main.js          # UI logic
+    ├── sprt-worker.js   # Game worker
+    ├── pkg-old/         # Baseline engine
+    └── pkg-new/         # Modified engine
+```
 
 ---
 
 ## References
 
 - [SPRT on Chess Programming Wiki](https://www.chessprogramming.org/Sequential_Probability_Ratio_Test)
-- [OpenBench](https://github.com/AndyGrant/OpenBench) - Distributed SPRT testing
-- [fast-chess](https://github.com/Disservin/fast-chess) - CLI tournament manager
+- [SPSA on Chess Programming Wiki](https://www.chessprogramming.org/SPSA)
+- [Stockfish Testing](https://tests.stockfishchess.org/) - Production SPRT system
+
+---
+
+## Navigation
+
+- **[← Main README](../README.md)**
+- **[Setup Guide](../docs/SETUP.md)**
+- **[Contributing Guide](../docs/CONTRIBUTING.md)**
