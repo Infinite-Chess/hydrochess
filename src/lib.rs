@@ -1,3 +1,4 @@
+#![allow(clippy::collapsible_if)]
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
