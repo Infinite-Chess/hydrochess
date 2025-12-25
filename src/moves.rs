@@ -1053,14 +1053,44 @@ pub fn is_square_attacked(
     }
 
     // Rose check - O(1) early exit if no Roses exist
-    // Rose attacks in circular knight patterns; check if any Rose piece can reach target
+    // For attack detection, we need to find any Rose that can reach target via an unblocked spiral.
+    // We check all positions that could host a Rose and verify if any spiral reaches target unblocked.
     if indices.has_rose[attacker_idx] {
-        for &(dx, dy) in &ROSE_OFFSETS {
-            let x = target.x + dx;
-            let y = target.y + dy;
-            if let Some(piece) = board.get_piece(x, y) {
-                if piece.color() == attacker_color && piece.piece_type() == PieceType::Rose {
-                    return true;
+        // Check every possible Rose position: positions on any spiral endpoint from target
+        // A Rose at position P can attack target T if T is on one of P's spirals, unblocked.
+        // Equivalently: there exists a spiral from some P that reaches T.
+
+        // Iterate over all spiral endpoints from target (reverse direction)
+        for start_dir in 0..8usize {
+            for rot in 0..2usize {
+                let spiral = &ROSE_SPIRALS[start_dir][rot];
+
+                // Check each position along this spiral from target
+                for hop in 0..7 {
+                    let (cum_dx, cum_dy) = spiral[hop];
+                    // This is where a Rose would need to be to reach target at hop=hop
+                    let rose_x = target.x - cum_dx;
+                    let rose_y = target.y - cum_dy;
+
+                    if let Some(piece) = board.get_piece(rose_x, rose_y) {
+                        if piece.color() == attacker_color && piece.piece_type() == PieceType::Rose
+                        {
+                            // Found a Rose! Check if path to target is unblocked
+                            let mut blocked = false;
+                            for prev_hop in 0..hop {
+                                let (prev_dx, prev_dy) = spiral[prev_hop];
+                                let check_x = target.x - cum_dx + prev_dx;
+                                let check_y = target.y - cum_dy + prev_dy;
+                                if board.get_piece(check_x, check_y).is_some() {
+                                    blocked = true;
+                                    break;
+                                }
+                            }
+                            if !blocked {
+                                return true;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2800,66 +2830,120 @@ fn generate_rose_moves(board: &Board, from: &Coordinate, piece: &Piece) -> MoveL
     moves
 }
 
-/// Rose movement offsets (precomputed):
-/// - 8 knight moves (jumps, no blocking)
-/// - 8 diagonal: skips first 2, lands on positions 3 and 4 in each diagonal direction
-/// - 8 orthogonal: skips first 3, lands on position 4; skips 5, lands on 6
-pub static ROSE_OFFSETS: [(i64, i64); 32] = [
-    // Knight moves (8)
-    (-2, -1),
-    (-1, -2),
-    (1, -2),
-    (2, -1),
-    (2, 1),
-    (1, 2),
-    (-1, 2),
-    (-2, 1),
-    // Diagonal: skip 2, then positions 3 and 4
-    (3, 3),
-    (4, 4),
-    (-3, -3),
-    (-4, -4),
-    (3, -3),
-    (4, -4),
-    (-3, 3),
-    (-4, 4),
-    // Orthogonal: skip 3, position 4; skip 5, position 6
-    (4, 0),
-    (6, 0),
-    (-4, 0),
-    (-6, 0),
-    (0, 4),
-    (0, 6),
-    (0, -4),
-    (0, -6),
-    // Extended knight-like: (5,2) in all 8 directions
-    (5, 2),
-    (5, -2),
-    (-5, 2),
-    (-5, -2),
-    (2, 5),
-    (2, -5),
-    (-2, 5),
-    (-2, -5),
+/// Rose movement - Circular knightrider that spirals along knight hops.
+/// The 8 knight directions in counter-clockwise order:
+const ROSE_KNIGHT_DELTAS: [(i64, i64); 8] = [
+    (-2, -1), // index 0: SW-ish
+    (-1, -2), // index 1: S-ish
+    (1, -2),  // index 2: SE-ish
+    (2, -1),  // index 3: E-ish
+    (2, 1),   // index 4: NE-ish
+    (1, 2),   // index 5: N-ish
+    (-1, 2),  // index 6: NW-ish
+    (-2, 1),  // index 7: W-ish
 ];
 
-/// Generate rose moves directly into an output buffer using precomputed offsets.
+/// Precomputed cumulative offsets for all 16 Rose spirals.
+/// Each spiral: 8 starting directions × 2 rotation directions (CCW=+1, CW=-1)
+/// Each entry is a sequence of 7 cumulative (dx, dy) values from the origin.
+/// Spiral stops if blocked at any intermediate square.
+///
+/// ROSE_SPIRALS[start_dir][rotation_dir][hop_index] = (cumulative_dx, cumulative_dy)
+/// rotation_dir: 0 = CCW (+1), 1 = CW (-1)
+pub static ROSE_SPIRALS: [[[(i64, i64); 7]; 2]; 8] = {
+    // Build at compile time
+    let mut spirals = [[[(0i64, 0i64); 7]; 2]; 8];
+    let deltas = ROSE_KNIGHT_DELTAS;
+
+    let mut start = 0usize;
+    while start < 8 {
+        // CCW direction (rotation +1)
+        let mut cum_x = 0i64;
+        let mut cum_y = 0i64;
+        let mut idx = start;
+        let mut hop = 0usize;
+        while hop < 7 {
+            let (dx, dy) = deltas[idx];
+            cum_x += dx;
+            cum_y += dy;
+            spirals[start][0][hop] = (cum_x, cum_y);
+            idx = (idx + 1) % 8; // CCW = next index
+            hop += 1;
+        }
+
+        // CW direction (rotation -1)
+        cum_x = 0;
+        cum_y = 0;
+        idx = start;
+        hop = 0;
+        while hop < 7 {
+            let (dx, dy) = deltas[idx];
+            cum_x += dx;
+            cum_y += dy;
+            spirals[start][1][hop] = (cum_x, cum_y);
+            idx = (idx + 7) % 8; // CW = previous index (equiv to -1 mod 8)
+            hop += 1;
+        }
+
+        start += 1;
+    }
+    spirals
+};
+
+/// Generate rose moves directly into an output buffer.
+/// Uses precomputed spiral paths with proper blocking detection.
 #[inline(always)]
 fn generate_rose_moves_into(board: &Board, from: &Coordinate, piece: &Piece, out: &mut MoveList) {
     let my_color = piece.color();
+    let fx = from.x;
+    let fy = from.y;
 
-    for &(dx, dy) in &ROSE_OFFSETS {
-        let tx = from.x + dx;
-        let ty = from.y + dy;
+    // Use a simple seen-set to avoid duplicate moves (same square reachable via CW and CCW)
+    // Max unique squares is ~32 (well under 64), use inline array
+    let mut seen: [(i64, i64); 64] = [(i64::MAX, i64::MAX); 64];
+    let mut seen_count = 0usize;
 
-        if let Some(target) = board.get_piece(tx, ty) {
-            // Can capture enemy pieces
-            if is_enemy_piece(target, my_color) {
-                out.push(Move::new(*from, Coordinate::new(tx, ty), *piece));
+    // Inline check for seen
+    #[inline(always)]
+    fn is_seen(seen: &[(i64, i64); 64], count: usize, x: i64, y: i64) -> bool {
+        for i in 0..count {
+            if seen[i] == (x, y) {
+                return true;
             }
-        } else {
-            // Empty square - can move there
-            out.push(Move::new(*from, Coordinate::new(tx, ty), *piece));
+        }
+        false
+    }
+
+    // 8 starting directions × 2 rotation directions = 16 spirals
+    for start_dir in 0..8 {
+        for rot in 0..2 {
+            let spiral = &ROSE_SPIRALS[start_dir][rot];
+
+            // Walk along the spiral, checking each square
+            for hop in 0..7 {
+                let (cum_dx, cum_dy) = spiral[hop];
+                let tx = fx + cum_dx;
+                let ty = fy + cum_dy;
+
+                if let Some(target) = board.get_piece(tx, ty) {
+                    // Square occupied - check if capturable
+                    if is_enemy_piece(target, my_color) && !is_seen(&seen, seen_count, tx, ty) {
+                        seen[seen_count] = (tx, ty);
+                        seen_count += 1;
+                        out.push(Move::new(*from, Coordinate::new(tx, ty), *piece));
+                    }
+                    // Blocked - cannot continue this spiral
+                    break;
+                } else {
+                    // Empty square - add move if not seen
+                    if !is_seen(&seen, seen_count, tx, ty) {
+                        seen[seen_count] = (tx, ty);
+                        seen_count += 1;
+                        out.push(Move::new(*from, Coordinate::new(tx, ty), *piece));
+                    }
+                    // Continue spiraling (not blocked)
+                }
+            }
         }
     }
 }
@@ -3759,5 +3843,62 @@ mod tests {
 
         // Should find the knight capture
         assert!(captures.len() > 0, "Should find capture moves");
+    }
+
+    #[test]
+    fn test_generate_rose_moves_unblocked() {
+        // Rose on empty board should have many moves
+        let mut board = Board::new();
+        board.set_piece(4, 4, Piece::new(PieceType::Rose, PlayerColor::White));
+        board.rebuild_tiles();
+
+        let from = Coordinate::new(4, 4);
+        let piece = Piece::new(PieceType::Rose, PlayerColor::White);
+        let mut moves = MoveList::new();
+        generate_rose_moves_into(&board, &from, &piece, &mut moves);
+
+        // Should have moves (each of 16 spirals can go up to 7 hops, though many overlap)
+        assert!(moves.len() > 0, "Rose should have moves on empty board");
+
+        // First hop in any spiral should be a knight move
+        // Check that (-2, -1) from origin is in the moves
+        let has_knight_move = moves.iter().any(|m| m.to.x == 2 && m.to.y == 3);
+        assert!(
+            has_knight_move,
+            "Rose should be able to make knight-like first hops"
+        );
+    }
+
+    #[test]
+    fn test_generate_rose_moves_blocked() {
+        // Rose with a blocker that prevents some moves
+        let mut board = Board::new();
+        board.set_piece(4, 4, Piece::new(PieceType::Rose, PlayerColor::White));
+        // Place blocker at first knight hop destination
+        board.set_piece(3, 2, Piece::new(PieceType::Pawn, PlayerColor::White)); // (4-1, 4-2)
+        board.rebuild_tiles();
+
+        let from = Coordinate::new(4, 4);
+        let piece = Piece::new(PieceType::Rose, PlayerColor::White);
+        let mut moves = MoveList::new();
+        generate_rose_moves_into(&board, &from, &piece, &mut moves);
+
+        // Should NOT have the blocked square as a move (friendly piece)
+        let has_blocked_square = moves.iter().any(|m| m.to.x == 3 && m.to.y == 2);
+        assert!(
+            !has_blocked_square,
+            "Rose should not move to square occupied by friendly piece"
+        );
+    }
+
+    #[test]
+    fn test_generate_rose_spirals_correct() {
+        // Verify the spiral constants are computed correctly
+        // Start direction 0, CCW: deltas[0] + deltas[1] + deltas[2] + ...
+        // deltas[0] = (-2, -1)
+        // deltas[1] = (-1, -2)
+        // Cumulative: hop 0 = (-2, -1), hop 1 = (-3, -3)
+        assert_eq!(ROSE_SPIRALS[0][0][0], (-2, -1), "First CCW hop from dir 0");
+        assert_eq!(ROSE_SPIRALS[0][0][1], (-3, -3), "Second CCW hop from dir 0");
     }
 }
