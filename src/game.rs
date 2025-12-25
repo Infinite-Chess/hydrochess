@@ -8,6 +8,50 @@ use arrayvec::ArrayVec;
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 
+/// Win conditions for a player. Determines how they win the game.
+/// - Checkmate: Standard - win by checkmating the opponent
+/// - RoyalCapture: Win by capturing the opponent's only royal piece
+/// - AllRoyalsCaptured: Win when all opponent's royal pieces are captured
+/// - AllPiecesCaptured: Win when all opponent's pieces are captured
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum WinCondition {
+    #[default]
+    Checkmate,
+    RoyalCapture,
+    AllRoyalsCaptured,
+    AllPiecesCaptured,
+}
+
+impl WinCondition {
+    /// Parse a win condition from a string (as received from JS).
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "checkmate" => Some(WinCondition::Checkmate),
+            "royalcapture" => Some(WinCondition::RoyalCapture),
+            "allroyalscaptured" => Some(WinCondition::AllRoyalsCaptured),
+            "allpiecescaptured" => Some(WinCondition::AllPiecesCaptured),
+            _ => None,
+        }
+    }
+
+    /// Returns true if this win condition requires the opponent to respond to check.
+    /// For Checkmate, checks must be addressed. For capture-based conditions, king can be taken.
+    #[inline]
+    pub fn requires_check_evasion(&self) -> bool {
+        matches!(self, WinCondition::Checkmate)
+    }
+
+    /// Returns true if this win condition is based on capturing royal pieces.
+    /// Used to gate royal capture checks for zero overhead on standard chess.
+    #[inline]
+    pub fn is_royal_capture_based(&self) -> bool {
+        matches!(
+            self,
+            WinCondition::RoyalCapture | WinCondition::AllRoyalsCaptured
+        )
+    }
+}
+
 #[derive(Copy, Clone, Serialize, Deserialize)]
 pub struct EnPassantState {
     pub square: Coordinate,
@@ -29,6 +73,14 @@ pub struct GameRules {
     pub promotion_types: Option<Vec<PieceType>>, // Pre-converted promotion piece types (fast)
     pub promotions_allowed: Option<Vec<String>>, // Piece type codes (only for serialization)
     pub move_rule_limit: Option<u32>,            // 50-move rule limit in halfmoves (default 100)
+    /// Win condition for White: what Black must do to defeat White.
+    /// E.g., "checkmate" means Black must checkmate White to win.
+    #[serde(skip)]
+    pub white_win_condition: WinCondition,
+    /// Win condition for Black: what White must do to defeat Black.
+    /// E.g., "allpiecescaptured" means White must capture all of Black's pieces to win.
+    #[serde(skip)]
+    pub black_win_condition: WinCondition,
 }
 
 impl GameRules {
@@ -628,6 +680,73 @@ impl GameState {
             PlayerColor::Black => self.black_non_pawn_material,
             PlayerColor::Neutral => false,
         }
+    }
+
+    /// Returns true if the side-to-move must respond to check.
+    ///
+    /// In standard chess (checkmate win condition), you must escape check.
+    /// In capture-based variants (royalcapture, allroyalscaptured, allpiecescaptured),
+    /// the opponent wins by capturing pieces, not by giving checkmate, so checks
+    /// don't need to be escaped (the king can be captured).
+    ///
+    /// The logic: YOUR OWN win condition determines if YOU must escape check.
+    /// - Your win condition specifies what the opponent must do to beat you.
+    /// - If your win condition is Checkmate → opponent beats you via checkmate → you must escape
+    /// - If your win condition is capture-based → opponent beats you via capture → you don't need to escape
+    #[inline]
+    pub fn must_escape_check(&self) -> bool {
+        // Our own win condition tells us how the opponent beats us
+        let our_win_condition = match self.turn {
+            PlayerColor::White => self.game_rules.white_win_condition,
+            PlayerColor::Black => self.game_rules.black_win_condition,
+            PlayerColor::Neutral => return true, // Safe default
+        };
+        our_win_condition.requires_check_evasion()
+    }
+
+    /// Returns true if the given color's king can be captured (no check evasion needed).
+    /// This is the opposite of must_escape_check but for a specific color.
+    #[inline]
+    pub fn king_capturable(&self, color: PlayerColor) -> bool {
+        // The color's own win condition tells us if their king can be captured
+        // (i.e., if their opponent wins via capture rather than checkmate)
+        let win_condition = match color {
+            PlayerColor::White => self.game_rules.white_win_condition,
+            PlayerColor::Black => self.game_rules.black_win_condition,
+            PlayerColor::Neutral => return false,
+        };
+        !win_condition.requires_check_evasion()
+    }
+
+    /// Check if the side-to-move has lost by royal capture.
+    /// This is only relevant for RoyalCapture and AllRoyalsCaptured win conditions.
+    /// Returns true if the opponent (who just moved) has captured all required royals.
+    ///
+    /// Zero overhead: This method checks the win condition first and returns false
+    /// immediately for Checkmate and AllPiecesCaptured variants.
+    #[inline]
+    pub fn has_lost_by_royal_capture(&self) -> bool {
+        // Get the side-to-move's win condition (what the opponent must do to beat them)
+        let our_win_condition = match self.turn {
+            PlayerColor::White => self.game_rules.white_win_condition,
+            PlayerColor::Black => self.game_rules.black_win_condition,
+            PlayerColor::Neutral => return false,
+        };
+
+        // Zero overhead: only check for royal loss if win condition is royal-capture based
+        if !our_win_condition.is_royal_capture_based() {
+            return false;
+        }
+
+        // Check if we still have our king
+        let has_king = match self.turn {
+            PlayerColor::White => self.white_king_pos.is_some(),
+            PlayerColor::Black => self.black_king_pos.is_some(),
+            PlayerColor::Neutral => true,
+        };
+
+        // If we have no king, we've lost (in RoyalCapture/AllRoyalsCaptured variants)
+        !has_king
     }
 
     /// Stockfish-style repetition detection for search.
@@ -1346,10 +1465,23 @@ impl GameState {
     /// Check if the side that just moved left their royal piece(s) in check (illegal move).
     /// Call this AFTER make_move to verify legality.
     /// Checks all royal pieces: King, RoyalQueen, RoyalCentaur
+    ///
+    /// Note: In capture-based win condition variants (royalcapture, allroyalscaptured,
+    /// allpiecescaptured), leaving your king in check is NOT illegal since the opponent
+    /// wins by capturing, not by checkmate.
     pub fn is_move_illegal(&self) -> bool {
-        // After make_move, self.turn is the opponent.
+        // After make_move, self.turn is the opponent (the side that will move next).
         // We need to check if the side that just moved (opponent of current turn) has any royal in check.
         let moved_color = self.turn.opponent();
+
+        // Check if the side that moved needs to escape check.
+        // moved_color's win condition tells us what their opponent does to beat them.
+        // If moved_color's win condition is capture-based (not checkmate), then
+        // leaving the king in check is NOT illegal (king can be captured).
+        if self.king_capturable(moved_color) {
+            return false; // Leaving king in check is legal in capture-based variants
+        }
+
         let indices = &self.spatial_indices;
 
         // Fast path: use cached king position for the side that just moved
@@ -1580,6 +1712,18 @@ impl GameState {
             self.hash ^= piece_key(captured.piece_type(), captured.color(), m.to.x, m.to.y);
             // Update spatial indices for captured piece on destination square
             self.spatial_indices.remove(m.to.x, m.to.y);
+
+            // If a royal piece was captured, clear the king position for that side
+            // This is critical for has_lost_by_royal_capture() to detect wins
+            if captured.piece_type().is_royal() {
+                if captured.color() == PlayerColor::White {
+                    undo_info.old_white_king_pos = self.white_king_pos;
+                    self.white_king_pos = None;
+                } else if captured.color() == PlayerColor::Black {
+                    undo_info.old_black_king_pos = self.black_king_pos;
+                    self.black_king_pos = None;
+                }
+            }
 
             // Only update material/piece counts for non-neutral pieces
             if captured.color() != PlayerColor::Neutral {

@@ -944,6 +944,8 @@ mod tests {
             promotion_types: None,
             promotions_allowed: None,
             move_rule_limit: None,
+            white_win_condition: crate::game::WinCondition::Checkmate,
+            black_win_condition: crate::game::WinCondition::Checkmate,
         };
 
         // White pawn at y=5 (can promote at 8)

@@ -201,6 +201,18 @@ struct JsGameRules {
     promotions_allowed: Option<Vec<String>>,
     #[serde(default)]
     move_rule: Option<u32>,
+    #[serde(default)]
+    win_conditions: Option<JsWinConditions>,
+}
+
+/// Win conditions per side, as received from JavaScript.
+/// Each side has an array of conditions; we only use the first.
+#[derive(Deserialize, Default)]
+struct JsWinConditions {
+    #[serde(default)]
+    white: Vec<String>,
+    #[serde(default)]
+    black: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -353,7 +365,7 @@ impl Engine {
 
         // Parse game rules from JS
         let game_rules = if let Some(js_rules) = js_game.game_rules {
-            use game::{GameRules, PromotionRanks};
+            use game::{GameRules, PromotionRanks, WinCondition};
 
             let promotion_ranks = js_rules.promotion_ranks.map(|pr| PromotionRanks {
                 white: pr
@@ -368,11 +380,33 @@ impl Engine {
                     .collect(),
             });
 
+            // Parse win conditions - use the first condition from each side's array.
+            // white_win_condition = what Black must do to beat White
+            // black_win_condition = what White must do to beat Black
+            let (white_win_condition, black_win_condition) =
+                if let Some(wc) = js_rules.win_conditions {
+                    let white_wc = wc
+                        .white
+                        .first()
+                        .and_then(|s| WinCondition::from_str(s))
+                        .unwrap_or(WinCondition::Checkmate);
+                    let black_wc = wc
+                        .black
+                        .first()
+                        .and_then(|s| WinCondition::from_str(s))
+                        .unwrap_or(WinCondition::Checkmate);
+                    (white_wc, black_wc)
+                } else {
+                    (WinCondition::Checkmate, WinCondition::Checkmate)
+                };
+
             let mut rules = GameRules {
                 promotion_ranks,
                 promotion_types: None,
                 promotions_allowed: js_rules.promotions_allowed,
                 move_rule_limit: js_rules.move_rule,
+                white_win_condition,
+                black_win_condition,
             };
             rules.init_promotion_types();
             rules
