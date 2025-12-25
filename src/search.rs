@@ -1646,13 +1646,17 @@ fn negamax_root(
         }
     }
 
-    // Checkmate or stalemate (or loss by capture-all-pieces variants)
+    // Checkmate, stalemate, or loss by capture-based variants
     if legal_moves == 0 {
+        // Determine if this is a loss:
+        // 1. In check AND must escape check (our win condition is checkmate) → checkmate
+        // 2. No pieces left (relevant for allpiecescaptured variants) → loss
+        let checkmate = in_check && game.must_escape_check();
         let no_pieces = !game.has_pieces(game.turn);
-        return if in_check || no_pieces {
+        return if checkmate || no_pieces {
             -MATE_VALUE
         } else {
-            0
+            0 // Stalemate
         };
     }
 
@@ -1716,6 +1720,11 @@ fn negamax(
         // Draw by fifty-move rule or repetition
         if game.is_fifty() || game.is_repetition(ply) {
             return -repetition_penalty();
+        }
+
+        // Royal capture loss: if our king was just captured (RoyalCapture/AllRoyalsCaptured variants)
+        if game.has_lost_by_royal_capture() {
+            return -MATE_VALUE + ply as i32;
         }
 
         // Mate distance pruning: if we already found a faster mate, prune
@@ -2467,10 +2476,14 @@ fn negamax(
 
     // Staged gen doesn't use move_buffers, so no swap needed
 
-    // Checkmate or stalemate detection (also treat no-pieces as loss)
+    // Checkmate, stalemate, or loss by capture-based variants
     if legal_moves == 0 {
+        // Determine if this is a loss:
+        // 1. In check AND must escape check (our win condition is checkmate) → checkmate
+        // 2. No pieces left (relevant for allpiecescaptured variants) → loss
+        let checkmate = in_check && game.must_escape_check();
         let no_pieces = !game.has_pieces(game.turn);
-        if in_check || no_pieces {
+        if checkmate || no_pieces {
             return -MATE_VALUE + ply as i32;
         } else {
             return 0; // Stalemate
@@ -2584,16 +2597,24 @@ fn quiescence(
         return 0;
     }
 
-    let in_check = game.is_in_check();
+    // Royal capture loss: if our king was just captured (RoyalCapture/AllRoyalsCaptured variants)
+    // Zero overhead: has_lost_by_royal_capture returns false immediately for Checkmate variants
+    if game.has_lost_by_royal_capture() {
+        return -MATE_VALUE + ply as i32;
+    }
 
-    // Stand pat (not when in check)
-    let stand_pat = if in_check {
+    let in_check = game.is_in_check();
+    // Only treat check specially if we must escape (checkmate-based win condition)
+    let must_escape = in_check && game.must_escape_check();
+
+    // Stand pat (not when must escape check)
+    let stand_pat = if must_escape {
         -MATE_VALUE + ply as i32
     } else {
         evaluate(game)
     };
 
-    if !in_check {
+    if !must_escape {
         if stand_pat >= beta {
             return beta;
         }
@@ -2607,16 +2628,18 @@ fn quiescence(
         return stand_pat;
     }
 
-    // When in check, generate all pseudo-legal moves (evasions) via the normal generator.
-    // When not in check, use a specialized capture-only generator to avoid creating
+    // When must escape check, generate all pseudo-legal moves (evasions) via the normal generator.
+    // When not must escape, use a specialized capture-only generator to avoid creating
     // thousands of quiet moves only to filter them out.
     // Reuse per-ply move buffer to avoid Vec allocations inside quiescence.
     let mut tactical_moves: MoveList = MoveList::new();
     std::mem::swap(&mut tactical_moves, &mut searcher.move_buffers[ply]);
 
-    if in_check {
+    if must_escape {
+        // In check and must escape - only generate evasion moves
         game.get_evasion_moves_into(&mut tactical_moves);
     } else {
+        // Normal quiescence: generate captures only
         get_quiescence_captures(
             &game.board,
             game.turn,
@@ -2689,8 +2712,12 @@ fn quiescence(
     }
 
     if legal_moves == 0 {
+        // Determine if this is a loss:
+        // 1. In check AND must escape check (our win condition is checkmate) → checkmate
+        // 2. No pieces left (relevant for allpiecescaptured variants) → loss
+        let checkmate = in_check && game.must_escape_check();
         let no_pieces = !game.has_pieces(game.turn);
-        if in_check || no_pieces {
+        if checkmate || no_pieces {
             // Swap back move buffer before returning mate score
             std::mem::swap(&mut searcher.move_buffers[ply], &mut tactical_moves);
             return -MATE_VALUE + ply as i32;

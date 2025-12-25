@@ -386,10 +386,9 @@ fn perft_fairy_piece_mix() {
     // Keep a clean copy of the fairy position so we can reuse it for search tests.
     let base_game = game.clone();
 
-    // run a search-only speed test on the same fairy position,
-    // similar to run_search_only_suite but limited to depth 4 and 3 runs.
+    // run a search-only speed test on the same fairy position
     const NUM_RUNS: usize = 3;
-    const MAX_SEARCH_DEPTH: usize = 6;
+    const MAX_SEARCH_DEPTH: usize = 7;
 
     println!(
         "\nFairy mix search-only benchmark ({} runs, depth 1..{}):",

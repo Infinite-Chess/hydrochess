@@ -345,11 +345,15 @@ fn negamax_root_noisy(
     }
 
     if legal_moves == 0 {
+        // Determine if this is a loss:
+        // 1. In check AND must escape check (our win condition is checkmate) → checkmate
+        // 2. No pieces left (relevant for allpiecescaptured variants) → loss
+        let checkmate = in_check && game.must_escape_check();
         let no_pieces = !game.has_pieces(game.turn);
-        return if in_check || no_pieces {
+        return if checkmate || no_pieces {
             -MATE_VALUE
         } else {
-            0
+            0 // Stalemate
         };
     }
 
@@ -414,6 +418,11 @@ fn negamax_noisy(
             return -repetition_penalty();
         }
 
+        // Royal capture loss: if our king was just captured (RoyalCapture/AllRoyalsCaptured variants)
+        if game.has_lost_by_royal_capture() {
+            return -MATE_VALUE + ply as i32;
+        }
+
         let mate_score = MATE_VALUE - ply as i32;
         alpha = alpha.max(-mate_score);
         beta = beta.min(mate_score - 1);
@@ -461,7 +470,9 @@ fn negamax_noisy(
     }
 
     // Static evaluation for pruning decisions
-    let static_eval = if in_check {
+    // Only use -MATE_VALUE if we're in check AND must escape (checkmate win condition)
+    let must_escape = in_check && game.must_escape_check();
+    let static_eval = if must_escape {
         -MATE_VALUE + ply as i32
     } else {
         evaluate_with_noise(game, noise_amp)
@@ -917,15 +928,23 @@ fn quiescence_noisy(
         return 0;
     }
 
-    let in_check = game.is_in_check();
+    // Royal capture loss: if our king was just captured (RoyalCapture/AllRoyalsCaptured variants)
+    // Zero overhead: has_lost_by_royal_capture returns false immediately for Checkmate variants
+    if game.has_lost_by_royal_capture() {
+        return -MATE_VALUE + ply as i32;
+    }
 
-    let stand_pat = if in_check {
+    let in_check = game.is_in_check();
+    // Only treat check specially if we must escape (checkmate-based win condition)
+    let must_escape = in_check && game.must_escape_check();
+
+    let stand_pat = if must_escape {
         -MATE_VALUE + ply as i32
     } else {
         evaluate_with_noise(game, noise_amp)
     };
 
-    if !in_check {
+    if !must_escape {
         if stand_pat >= beta {
             return beta;
         }
@@ -938,9 +957,11 @@ fn quiescence_noisy(
     let mut tactical_moves: MoveList = MoveList::new();
     std::mem::swap(&mut tactical_moves, &mut searcher.move_buffers[ply]);
 
-    if in_check {
+    if must_escape {
+        // In check and must escape - only generate evasion moves
         game.get_evasion_moves_into(&mut tactical_moves);
     } else {
+        // Normal quiescence: generate captures only
         get_quiescence_captures(
             &game.board,
             game.turn,
@@ -1004,8 +1025,12 @@ fn quiescence_noisy(
     }
 
     if legal_moves == 0 {
+        // Determine if this is a loss:
+        // 1. In check AND must escape check (our win condition is checkmate) → checkmate
+        // 2. No pieces left (relevant for allpiecescaptured variants) → loss
+        let checkmate = in_check && game.must_escape_check();
         let no_pieces = !game.has_pieces(game.turn);
-        if in_check || no_pieces {
+        if checkmate || no_pieces {
             std::mem::swap(&mut searcher.move_buffers[ply], &mut tactical_moves);
             return -MATE_VALUE + ply as i32;
         }

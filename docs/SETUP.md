@@ -6,16 +6,18 @@ This guide walks you through setting up your development environment for HydroCh
 
 ---
 
-## Prerequisites
+## Tools You'll Need
+
+The following tools are required to build and test the engine. If you don't have them yet, follow the installation steps in the next section.
 
 - **Git** - For version control
 - **Rust** - The programming language
 - **wasm-pack** - Tool for building Rust to WebAssembly
-- **Node.js** (optional) - For running SPRT tests
+- **Node.js** (optional) - For running SPRT and SPSA tests
 
 ---
 
-## 1. Install Rust
+## 1. Install Rust (If not installed)
 
 ### Windows
 
@@ -49,7 +51,7 @@ rustup target add wasm32-unknown-unknown
 
 ---
 
-## 3. Install wasm-pack
+## 3. Install wasm-pack (If not installed)
 
 ```bash
 cargo install wasm-pack
@@ -66,9 +68,9 @@ wasm-pack --version
 ## 4. Clone and Build
 
 ```bash
-# Clone the repository (if not already done)
+# Clone the repository
 git clone <repository-url>
-cd hydrochess-wasm
+cd <repository-directory>
 
 # Build for browser
 wasm-pack build --target web
@@ -117,7 +119,7 @@ Settings (`.vscode/settings.json`):
 ```json
 {
     "rust-analyzer.cargo.target": null,
-    "rust-analyzer.checkOnSave.command": "clippy"
+    "rust-analyzer.check.command": "clippy"
 }
 ```
 
@@ -159,5 +161,5 @@ rustup target add wasm32-unknown-unknown
 ## Useful Links
 
 - [The Rust Book](https://doc.rust-lang.org/book/)
-- [wasm-pack Documentation](https://rustwasm.github.io/wasm-pack/)
+- [wasm-pack Documentation](https://drager.github.io/wasm-pack/book/)
 - [Chess Programming Wiki](https://www.chessprogramming.org/)
