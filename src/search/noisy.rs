@@ -119,7 +119,11 @@ fn search_with_searcher_noisy(
         searcher.reset_for_iteration();
         searcher.decay_history();
 
-        if searcher.hot.timer.elapsed_ms() >= searcher.hot.time_limit_ms {
+        // Time check at iteration start - but note that check_time won't stop
+        // during depth 1 due to min_depth_required
+        if searcher.hot.min_depth_required == 0
+            && searcher.hot.timer.elapsed_ms() >= searcher.hot.time_limit_ms
+        {
             searcher.hot.stopped = true;
             break;
         }
@@ -161,7 +165,13 @@ fn search_with_searcher_noisy(
             result
         };
 
-        // Root PV is at pv_table[0]
+        // After depth 1 completes, allow time stops for subsequent depths
+        if depth == 1 {
+            searcher.hot.min_depth_required = 0;
+        }
+
+        // Update best move from this iteration (guaranteed to have a result since
+        // check_time doesn't stop during depth 1)
         if let Some(pv_move) = searcher.pv_table[0] {
             best_move = Some(pv_move);
             best_score = score;
@@ -891,27 +901,27 @@ fn negamax_noisy(ctx: &mut NegamaxNoisyContext) -> i32 {
                 // Continuation history update (Stockfish indices: 0, 1, 2, 3, 5)
                 for &plies_ago in &[0usize, 1, 2, 3, 5] {
                     if ply > plies_ago
-                        && let Some(ref prev_move) = searcher.move_history[ply - plies_ago - 1] {
-                            let prev_piece =
-                                searcher.moved_piece_history[ply - plies_ago - 1] as usize;
-                            if prev_piece < 16 {
-                                let prev_to_hash = hash_coord_32(prev_move.to.x, prev_move.to.y);
+                        && let Some(ref prev_move) = searcher.move_history[ply - plies_ago - 1]
+                    {
+                        let prev_piece = searcher.moved_piece_history[ply - plies_ago - 1] as usize;
+                        if prev_piece < 16 {
+                            let prev_to_hash = hash_coord_32(prev_move.to.x, prev_move.to.y);
 
-                                for quiet in &quiets_searched {
-                                    let q_from_hash = hash_coord_32(quiet.from.x, quiet.from.y);
-                                    let q_to_hash = hash_coord_32(quiet.to.x, quiet.to.y);
-                                    let is_best = quiet.from == m.from && quiet.to == m.to;
+                            for quiet in &quiets_searched {
+                                let q_from_hash = hash_coord_32(quiet.from.x, quiet.from.y);
+                                let q_to_hash = hash_coord_32(quiet.to.x, quiet.to.y);
+                                let is_best = quiet.from == m.from && quiet.to == m.to;
 
-                                    let entry = &mut searcher.cont_history[prev_piece]
-                                        [prev_to_hash][q_from_hash][q_to_hash];
-                                    if is_best {
-                                        *entry += adj - *entry * adj / max_history;
-                                    } else {
-                                        *entry += -adj - *entry * adj / max_history;
-                                    }
+                                let entry = &mut searcher.cont_history[prev_piece][prev_to_hash]
+                                    [q_from_hash][q_to_hash];
+                                if is_best {
+                                    *entry += adj - *entry * adj / max_history;
+                                } else {
+                                    *entry += -adj - *entry * adj / max_history;
                                 }
                             }
                         }
+                    }
                 }
             } else if let Some(cap_type) = captured_type {
                 let bonus = (depth * depth) as i32;

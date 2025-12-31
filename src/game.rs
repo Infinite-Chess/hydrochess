@@ -233,16 +233,14 @@ pub struct GameState {
 
 // For backwards compatibility, keep castling_rights as an alias
 impl GameState {
-    /// Returns pieces that can castle (kings and rooks with special rights)
+    /// Returns pieces that can castle (kings/royals and any non-pawn partner with special rights)
     pub fn castling_rights(&self) -> FxHashSet<Coordinate> {
         let mut rights = FxHashSet::default();
         for coord in &self.special_rights {
             if let Some(piece) = self.board.get_piece(coord.x, coord.y) {
-                // Only include kings and rooks (not pawns) in castling rights
-                if piece.piece_type() == PieceType::King
-                    || piece.piece_type() == PieceType::Rook
-                    || piece.piece_type() == PieceType::RoyalCentaur
-                {
+                // Include royals (kings) and any non-pawn piece as potential castling partners
+                // This matches the move generation logic which accepts any non-pawn, non-royal piece
+                if piece.piece_type().is_royal() || piece.piece_type() != PieceType::Pawn {
                     rights.insert(*coord);
                 }
             }
@@ -771,6 +769,75 @@ impl GameState {
         true
     }
 
+    /// Get blocking squares for non-linear checkers (Rose, etc.)
+    /// Returns a list of intermediate squares that can be blocked to stop the attack.
+    /// For Rose: finds the spiral path used to attack and returns intermediate squares.
+    ///
+    /// This is the generalized equivalent of `is_on_check_ray` for pieces that don't
+    /// attack in straight lines.
+    fn get_nonlinear_blocking_squares(
+        &self,
+        checker_sq: &Coordinate,
+        king_sq: &Coordinate,
+        checker_type: PieceType,
+    ) -> arrayvec::ArrayVec<Coordinate, 8> {
+        use crate::moves::ROSE_SPIRALS;
+
+        let mut blocking = arrayvec::ArrayVec::<Coordinate, 8>::new();
+
+        // Rose blocking squares: find the spiral path from checker to king
+        // and return the intermediate squares
+        // NOTE: Other non-linear piece types can be added here in the future
+        // with their own blocking square logic
+        if checker_type == PieceType::Rose {
+            // Find which spiral the Rose used to reach the king
+            let dx = king_sq.x - checker_sq.x;
+            let dy = king_sq.y - checker_sq.y;
+
+            // Search through all spirals to find one that matches
+            for spiral_dirs in &ROSE_SPIRALS {
+                for spiral in spiral_dirs {
+                    for (hop_idx, &(cum_dx, cum_dy)) in spiral.iter().enumerate() {
+                        if cum_dx == dx && cum_dy == dy {
+                            // Found the spiral path! Verify it's unblocked and collect
+                            // intermediate squares
+                            let mut valid = true;
+                            for (i, &(prev_dx, prev_dy)) in spiral.iter().take(hop_idx).enumerate()
+                            {
+                                let check_x = checker_sq.x + prev_dx;
+                                let check_y = checker_sq.y + prev_dy;
+
+                                // Check if this intermediate square is blocked
+                                if self.board.get_piece(check_x, check_y).is_some() {
+                                    // This path is blocked, try next spiral
+                                    valid = false;
+                                    break;
+                                }
+
+                                // Collect intermediate squares (excluding if i == hop_idx-1
+                                // since that's the one already covered, but we take(hop_idx))
+                                if i < hop_idx {
+                                    blocking.push(Coordinate::new(check_x, check_y));
+                                }
+                            }
+
+                            if valid && !blocking.is_empty() {
+                                return blocking;
+                            } else if valid {
+                                // Direct hit (hop 0), no blocking squares
+                                return blocking;
+                            }
+                            // Clear and try next spiral
+                            blocking.clear();
+                        }
+                    }
+                }
+            }
+        }
+
+        blocking
+    }
+
     /// Initialize starting_squares from the current board: all non-pawn,
     /// non-royal pieces' current coordinates are treated as their original
     /// squares. Intended to be called once when constructing a GameState
@@ -1249,10 +1316,19 @@ impl GameState {
         // Identify if checker is a slider (Ortho, Diag, or Knightrider)
         use crate::attacks::{DIAG_MASK, KNIGHTRIDER_MASK, ORTHO_MASK, matches_mask};
         let checker_p = self.board.get_piece(checker_sq.x, checker_sq.y).unwrap();
-        let is_slider = matches_mask(
-            checker_p.piece_type(),
-            ORTHO_MASK | DIAG_MASK | KNIGHTRIDER_MASK,
-        );
+        let checker_type = checker_p.piece_type();
+        let is_slider = matches_mask(checker_type, ORTHO_MASK | DIAG_MASK | KNIGHTRIDER_MASK);
+
+        // Identify if checker is a non-linear attacker (Rose, etc.)
+        // These pieces have blocking squares but not along a straight line
+        let is_nonlinear_checker = checker_type == PieceType::Rose;
+
+        // For non-linear checkers, compute blocking squares up front
+        let nonlinear_blocking_squares = if is_nonlinear_checker {
+            self.get_nonlinear_blocking_squares(&checker_sq, &king_sq, checker_type)
+        } else {
+            arrayvec::ArrayVec::<Coordinate, 8>::new()
+        };
 
         let check_dist = dx_check.abs().max(dy_check.abs());
         let step_x = dx_check.signum();
@@ -1510,6 +1586,37 @@ impl GameState {
             }
 
             // ==========================================
+            // DIRECT SLIDER CAPTURE OF CHECKER
+            // O(1) checks for infinite-range slider captures - no move gen needed
+            // ==========================================
+            if can_ortho {
+                // Check if checker is on same row or column
+                if from.x == checker_sq.x && from.y != checker_sq.y {
+                    // Same column - vertical capture
+                    if s.is_path_clear_for_rook(&from, &checker_sq) {
+                        out.push(Move::new(from, checker_sq, *piece));
+                    }
+                } else if from.y == checker_sq.y && from.x != checker_sq.x {
+                    // Same row - horizontal capture
+                    if s.is_path_clear_for_rook(&from, &checker_sq) {
+                        out.push(Move::new(from, checker_sq, *piece));
+                    }
+                }
+            }
+
+            if can_diag {
+                // Check if checker is on same diagonal
+                let dx = checker_sq.x - from.x;
+                let dy = checker_sq.y - from.y;
+                if dx != 0 && dx.abs() == dy.abs() {
+                    // On a diagonal
+                    if s.is_path_clear_for_bishop(&from, &checker_sq) {
+                        out.push(Move::new(from, checker_sq, *piece));
+                    }
+                }
+            }
+
+            // ==========================================
             // CAPTURE & BLOCKING DETECTION (for remaining pieces)
             // Uses pseudo-legal move generation for captures
             // ==========================================
@@ -1540,10 +1647,19 @@ impl GameState {
                     out.push(m);
                     continue;
                 }
-                // Blocking moves for pieces without optimized blocking
+                // Blocking moves for sliders (straight line check rays)
                 if is_slider
                     && !has_optimized_blocking
                     && s.is_on_check_ray(&m.to, &king_sq, step_x, step_y, check_dist)
+                {
+                    out.push(m);
+                    continue;
+                }
+                // Blocking moves for non-linear checkers (Rose spirals, etc.)
+                if is_nonlinear_checker
+                    && nonlinear_blocking_squares
+                        .iter()
+                        .any(|sq| sq.x == m.to.x && sq.y == m.to.y)
                 {
                     out.push(m);
                 }
@@ -1735,20 +1851,27 @@ impl GameState {
             rook_coord: None,
         };
 
-        // Detect if this is a castling move to populate rook_coord
-        if piece.piece_type() == PieceType::King {
+        // Detect if this is a castling move to populate rook_coord (partner_coord)
+        // Castling works with any non-pawn, non-royal piece that has special rights
+        if piece.piece_type().is_royal() {
             let dx = to_x - from_x;
             if dx.abs() > 1 {
-                // Use spatial indices to find rook - O(log n) instead of O(distance)
-                let rook_dir = if dx > 0 { 1i64 } else { -1i64 };
+                // Use spatial indices to find castling partner - O(log n) instead of O(distance)
+                let partner_dir = if dx > 0 { 1i64 } else { -1i64 };
                 if let Some(row_pieces) = self.spatial_indices.rows.get(&from_y) {
                     // Find nearest piece past king's destination
-                    if let Some((rook_x, packed)) =
-                        SpatialIndices::find_nearest(row_pieces, to_x, rook_dir)
+                    if let Some((partner_x, packed)) =
+                        SpatialIndices::find_nearest(row_pieces, to_x, partner_dir)
                     {
-                        let r = Piece::from_packed(packed);
-                        if r.piece_type() == PieceType::Rook && r.color() == piece.color() {
-                            m.rook_coord = Some(Coordinate::new(rook_x, from_y));
+                        let partner = Piece::from_packed(packed);
+                        let partner_coord = Coordinate::new(partner_x, from_y);
+                        // Accept any non-pawn, non-royal piece with special rights as a castling partner
+                        if partner.color() == piece.color()
+                            && partner.piece_type() != PieceType::Pawn
+                            && !partner.piece_type().is_royal()
+                            && self.special_rights.contains(&partner_coord)
+                        {
+                            m.rook_coord = Some(partner_coord);
                         }
                     }
                 }
