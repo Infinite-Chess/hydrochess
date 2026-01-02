@@ -223,35 +223,103 @@ function applyMove(position, move) {
         throw new Error('Illegal move: black to move but piece at ' + move.from + ' is not black');
     }
 
-    // Handle castling in the worker's local board representation. The engine
-    // implements castling by moving the king more than 1 square horizontally
-    // and then relocating the rook on the same rank beyond the king's
-    // destination. We mimic that here so our local board stays in sync.
-    const isKing = movingPiece.piece_type === 'k';
     const fromXi = parseInt(fromX, 10);
     const toXi = parseInt(toX, 10);
     const fromYi = parseInt(fromY, 10);
     const toYi = parseInt(toY, 10);
     const dx = toXi - fromXi;
     const dy = toYi - fromYi;
+    const isKing = movingPiece.piece_type === 'k';
+    const isPawn = movingPiece.piece_type === 'p';
 
+    // === SPECIAL RIGHTS MANAGEMENT ===
+    // Remove special rights for the piece that moved
+    const fromKey = fromX + ',' + fromY;
+    if (position.special_rights) {
+        const idx = position.special_rights.indexOf(fromKey);
+        if (idx !== -1) {
+            position.special_rights.splice(idx, 1);
+        }
+
+        // If a king moves, remove special rights for all friendly castling partners on the same rank
+        // Castling partners are any non-pawn, non-king piece on the same rank
+        if (isKing) {
+            const kingRank = fromY; // Use original position for rank check
+            for (const p of pieces) {
+                if (p.player !== movingPiece.player) continue;
+                if (p.piece_type === 'p' || p.piece_type === 'k') continue;
+                if (p.y !== kingRank) continue; // Must be on same rank as king was
+
+                const partnerKey = p.x + ',' + p.y;
+                const partnerIdx = position.special_rights.indexOf(partnerKey);
+                if (partnerIdx !== -1) {
+                    position.special_rights.splice(partnerIdx, 1);
+                }
+            }
+        }
+
+        // If a rook/guard moves, check if king should lose its right
+        // (King loses castling right only when it moves, which is already handled above)
+        // But we track partner movement by removing partner's special right
+    }
+
+    // === EN PASSANT HANDLING ===
+    // Handle en passant capture: if pawn moves diagonally to en_passant square, capture the pawn
+    if (isPawn && position.en_passant) {
+        const epSquare = position.en_passant.square;
+        const epPawnSquare = position.en_passant.pawn_square;
+        if (toX + ',' + toY === epSquare) {
+            // Remove the pawn at pawn_square
+            const epIdx = pieces.findIndex(p => p.x + ',' + p.y === epPawnSquare);
+            if (epIdx !== -1) {
+                pieces.splice(epIdx, 1);
+            }
+        }
+    }
+
+    // Reset en passant - will be set below if this is a double pawn push
+    position.en_passant = null;
+
+    // Track en passant for double pawn push
+    if (isPawn && Math.abs(dy) === 2) {
+        const dir = movingPiece.player === 'w' ? 1 : -1;
+        const epY = fromYi + dir; // The en passant capture square is between from and to
+        position.en_passant = {
+            square: fromX + ',' + epY,
+            pawn_square: toX + ',' + toY
+        };
+    }
+
+    // Handle castling in the worker's local board representation. The engine
+    // implements castling by moving the king more than 1 square horizontally
+    // and then relocating the rook on the same rank beyond the king's
+    // destination. We mimic that here so our local board stays in sync.
     if (isKing && dy === 0 && Math.abs(dx) > 1) {
-        const rookDir = dx > 0 ? 1 : -1;
-        let rookXi = toXi + rookDir; // search beyond king's destination
-        // We stop if we run into any non-rook piece or wander too far.
-        while (Math.abs(rookXi - toXi) <= 16) {
-            const rookXStr = String(rookXi);
-            const pieceAt = pieces.find(p => p.x === rookXStr && p.y === fromY);
+        const castleDir = dx > 0 ? 1 : -1;
+        let partnerXi = toXi + castleDir; // search beyond king's destination
+        // Look for any friendly piece (not just rooks) - engine supports castling with Guards etc.
+        while (Math.abs(partnerXi - toXi) <= 16) {
+            const partnerXStr = String(partnerXi);
+            const pieceAt = pieces.find(p => p.x === partnerXStr && p.y === fromY);
             if (pieceAt) {
-                if (pieceAt.player === movingPiece.player && pieceAt.piece_type === 'r') {
-                    // Move rook to the square the king jumped over
-                    const rookToXi = toXi - rookDir;
-                    pieceAt.x = String(rookToXi);
+                // Accept any friendly piece as the castling partner (rook, guard, etc.)
+                if (pieceAt.player === movingPiece.player) {
+                    // Remove special rights for the castling partner
+                    if (position.special_rights) {
+                        const partnerKey = pieceAt.x + ',' + pieceAt.y;
+                        const partnerIdx = position.special_rights.indexOf(partnerKey);
+                        if (partnerIdx !== -1) {
+                            position.special_rights.splice(partnerIdx, 1);
+                        }
+                    }
+                    // Move the castling partner to the square the king jumped over
+                    const partnerToXi = toXi - castleDir;
+                    pieceAt.x = String(partnerToXi);
                     pieceAt.y = fromY;
                 }
                 break;
             }
-            rookXi += rookDir;
+            partnerXi += castleDir;
         }
     }
 
@@ -274,19 +342,10 @@ function applyMove(position, move) {
 //   - repetition (threefold) and 50-move rule
 //   - time forfeits
 //   - illegal moves / engine failure
+//   - insufficient material (via engine's is_sufficient_material() function)
 //
 // Several variants (e.g. Pawn_Horde) are *designed* to have only one king
 // on the board, so treating "kings < 2" as checkmate is incorrect and was
-// causing games to end after a single move in SPRT logs. To avoid
-// hardcoding variant-specific rules here (and to keep the harness fast), we
-// no longer try to detect wins or draws based solely on king count or total
-// piece count.
-//
-// For now, this helper never declares the game over; we rely entirely on
-// the engine and the explicit adjudication logic above.
-function isGameOver(_position) {
-    return { over: false };
-}
 
 function clonePosition(position) {
     // Simple deep clone for our small position objects
@@ -294,9 +353,93 @@ function clonePosition(position) {
 }
 
 function makePositionKey(position) {
-    const parts = position.board.pieces.map((p) => p.player + p.piece_type + p.x + ',' + p.y);
-    parts.sort();
-    return position.turn + '|' + parts.join(';');
+    // Include all pieces with their positions
+    const pieces = position.board.pieces.map((p) => p.player + p.piece_type + p.x + ',' + p.y);
+    pieces.sort();
+
+    // Compute EFFECTIVE castling rights for threefold repetition.
+    // A side can castle if and only if:
+    // 1. The king has special rights
+    // 2. At least one castling partner (rook/guard) on the same side has special rights
+    // If either condition fails, the other piece's rights become irrelevant.
+    let castlingRights = '';
+
+    if (position.special_rights && position.special_rights.length > 0) {
+        const rights = new Set(position.special_rights);
+        const boardPieces = position.board.pieces;
+
+        // Find kings and their castling partners with rights
+        for (const color of ['w', 'b']) {
+            const king = boardPieces.find(p => p.player === color && p.piece_type === 'k');
+            if (!king) continue;
+
+            const kingKey = king.x + ',' + king.y;
+            const kingHasRights = rights.has(kingKey);
+
+            if (!kingHasRights) {
+                // King has moved - this side cannot castle, rook rights are irrelevant
+                continue;
+            }
+
+            // King has rights - check if any castling partner has rights
+            // Castling partners are any friendly non-pawn, non-king piece on the same rank
+            const kingY = parseInt(king.y, 10);
+            let hasPartnerWithRights = false;
+
+            for (const p of boardPieces) {
+                if (p.player !== color) continue;
+                // Any non-pawn, non-king piece can be a castling partner
+                if (p.piece_type === 'p' || p.piece_type === 'k') continue;
+
+                const partnerY = parseInt(p.y, 10);
+                // For infinite chess, we check pieces on the same rank as the king
+                if (partnerY !== kingY) continue;
+
+                const partnerKey = p.x + ',' + p.y;
+                if (rights.has(partnerKey)) {
+                    hasPartnerWithRights = true;
+                    break;
+                }
+            }
+
+            if (hasPartnerWithRights) {
+                // This side CAN castle
+                castlingRights += color;
+            }
+            // If no partner has rights, king's rights are irrelevant - this side cannot castle
+        }
+    }
+
+    // Compute individual PAWN special rights (double-push rights)
+    let pawnRights = '';
+    if (position.special_rights && position.special_rights.length > 0) {
+        const rights = new Set(position.special_rights);
+        const boardPieces = position.board.pieces;
+        const pawnRightsCoords = [];
+
+        for (const p of boardPieces) {
+            if (p.piece_type === 'p') {
+                const key = p.x + ',' + p.y;
+                if (rights.has(key)) {
+                    pawnRightsCoords.push(key);
+                }
+            }
+        }
+
+        if (pawnRightsCoords.length > 0) {
+            pawnRightsCoords.sort();
+            pawnRights = pawnRightsCoords.join(';');
+        }
+    }
+
+    // Include en passant square if present
+    // For threefold repetition, positions must have same en passant possibility
+    let ep = '';
+    if (position.en_passant && position.en_passant.square) {
+        ep = position.en_passant.square;
+    }
+
+    return position.turn + '|' + pieces.join(';') + '|' + castlingRights + '|' + pawnRights + '|' + ep;
 }
 
 function nowMs() {
@@ -359,6 +502,37 @@ async function playSingleGame(timePerMove, maxMoves, newPlaysWhite, materialThre
         return next;
     }
 
+    // Helper for definitive terminal check (mate/stalemate) to prioritize over adjudication
+    const getTerminalResult = (context = "") => {
+        try {
+            const gameInput = clonePosition(startPosition);
+            gameInput.move_history = moveHistory.slice();
+            gameInput.halfmove_clock = halfmoveClock;
+            gameInput.fullmove_number = fullmoveNumber;
+
+            const checker = new EngineNew(gameInput);
+            const legal = typeof checker.get_legal_moves_js === 'function' ? checker.get_legal_moves_js() : [];
+            const inCheck = typeof checker.is_in_check === 'function' && checker.is_in_check();
+            checker.free();
+
+            if (Array.isArray(legal) && legal.length === 0) {
+                const winningColor = position.turn === 'w' ? 'b' : 'w';
+                if (inCheck) {
+                    const result = winningColor === newColor ? 'win' : 'loss';
+                    const result_token = winningColor === 'w' ? '1-0' : '0-1';
+                    for (const s of texelSamples) s.result_token = result_token;
+                    moveLines.push('# Checkmate' + context);
+                    return { result, log: moveLines.join('\n'), reason: 'checkmate', samples: texelSamples };
+                } else {
+                    for (const s of texelSamples) s.result_token = '1/2-1/2';
+                    moveLines.push('# Stalemate' + context);
+                    return { result: 'draw', log: moveLines.join('\n'), reason: 'stalemate', samples: texelSamples };
+                }
+            }
+        } catch (e) { }
+        return null;
+    };
+
     // Initial position before any moves
     recordRepetition();
 
@@ -406,6 +580,9 @@ async function playSingleGame(timePerMove, maxMoves, newPlaysWhite, materialThre
                     }
 
                     if (winningColor) {
+                        const terminal = getTerminalResult(' (terminal state detected during adjudication)');
+                        if (terminal) return terminal;
+
                         const evalCp = winningColor === 'w'
                             ? Math.min(lastEvalNew, lastEvalOld)
                             : Math.max(lastEvalNew, lastEvalOld);
@@ -673,27 +850,10 @@ async function playSingleGame(timePerMove, maxMoves, newPlaysWhite, materialThre
                 comment += textComment;
             }
 
-            // Calculate counters *before* applying the move, because applyMove updates the board
-            {
-                const pieces = position.board.pieces;
-                const [fromX, fromY] = move.from.split(',');
-                const [toX, toY] = move.to.split(',');
-                const movingPiece = pieces.find(p => p.x === fromX && p.y === fromY);
-                // Check for capture: is there a piece at dest?
-                const targetPiece = pieces.find(p => p.x === toX && p.y === toY);
-                const isCapture = !!targetPiece;
-                const isPawn = movingPiece && movingPiece.piece_type === 'p';
-
-                if (isPawn || isCapture) {
-                    halfmoveClock = 0;
-                } else {
-                    halfmoveClock++;
-                }
-
-                // If it was Black's turn, increment fullmove number
-                if (position.turn === 'b') {
-                    fullmoveNumber++;
-                }
+            // Increment fullmove number after Black's move (position.turn is already flipped)
+            // Note: We check for 'w' because applyMove already toggled the turn
+            if (position.turn === 'w') {
+                fullmoveNumber++;
             }
 
             moveLines.push(
@@ -715,6 +875,9 @@ async function playSingleGame(timePerMove, maxMoves, newPlaysWhite, materialThre
 
             const repCount = recordRepetition();
             if (repCount >= 3) {
+                const terminal = getTerminalResult(' on repetition move');
+                if (terminal) return terminal;
+
                 for (const s of texelSamples) {
                     s.result_token = '1/2-1/2';
                 }
@@ -722,26 +885,36 @@ async function playSingleGame(timePerMove, maxMoves, newPlaysWhite, materialThre
             }
 
             if (halfmoveClock >= 100) {
+                const terminal = getTerminalResult(' on 50-move rule');
+                if (terminal) return terminal;
+
                 for (const s of texelSamples) {
                     s.result_token = '1/2-1/2';
                 }
                 return { result: 'draw', log: moveLines.join('\n'), reason: 'fifty_move', samples: texelSamples };
             }
 
-            const gameState = isGameOver(position);
-            if (gameState.over) {
-                if (gameState.reason === 'draw') {
+            // Check for insufficient material using the engine's detection
+            // The engine has comprehensive rules for infinite chess including K+B vs K, K+N vs K, etc.
+            try {
+                const checker = new EngineNew(gameInput);
+                const hasSufficientMaterial = typeof checker.is_sufficient_material === 'function'
+                    ? checker.is_sufficient_material()
+                    : true; // Default to true if function doesn't exist (old engine builds)
+                checker.free();
+
+                if (!hasSufficientMaterial) {
+                    const terminal = getTerminalResult(' with insufficient material');
+                    if (terminal) return terminal;
+
                     for (const s of texelSamples) {
                         s.result_token = '1/2-1/2';
                     }
+                    moveLines.push('# Draw by insufficient material');
                     return { result: 'draw', log: moveLines.join('\n'), reason: 'insufficient_material', samples: texelSamples };
                 }
-                const result = sideToMove === newColor ? 'win' : 'loss';
-                const result_token = result === 'win' ? '1-0' : '0-1';
-                for (const s of texelSamples) {
-                    s.result_token = result_token;
-                }
-                return { result, log: moveLines.join('\n'), reason: gameState.reason || 'checkmate', samples: texelSamples };
+            } catch (e) {
+                // If the check fails, continue the game
             }
         }
     } catch (e) {
@@ -750,6 +923,10 @@ async function playSingleGame(timePerMove, maxMoves, newPlaysWhite, materialThre
         e.moveHistory = moveHistory;
         throw e;
     }
+
+    // Before declaring max_moves draw, check if the last move delivered checkmate/stalemate
+    const terminal = getTerminalResult(' on final move');
+    if (terminal) return terminal;
 
     for (const s of texelSamples) {
         s.result_token = '1/2-1/2';
