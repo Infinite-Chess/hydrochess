@@ -238,7 +238,7 @@ fn run_search_only_suite() {
     println!("================================================================");
 
     const NUM_RUNS: usize = 5;
-    const MAX_DEPTH: usize = 8;
+    const MAX_DEPTH: usize = 10;
 
     println!(
         "Running {} sequential search tests to depth {}...",
@@ -388,7 +388,7 @@ fn perft_fairy_piece_mix() {
 
     // run a search-only speed test on the same fairy position
     const NUM_RUNS: usize = 3;
-    const MAX_SEARCH_DEPTH: usize = 7;
+    const MAX_SEARCH_DEPTH: usize = 8;
 
     println!(
         "\nFairy mix search-only benchmark ({} runs, depth 1..{}):",
