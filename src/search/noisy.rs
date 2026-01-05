@@ -62,23 +62,37 @@ pub fn get_best_move_with_noise(
     game.recompute_piece_counts();
     // Initialize correction history hashes
     game.recompute_correction_hashes();
-    let mut searcher = Searcher::new(time_limit_ms);
-    searcher.hot.time_limit_ms = time_limit_ms;
-    searcher.silent = silent;
-    searcher.set_corrhist_mode(game);
-    searcher.move_rule_limit = game
-        .game_rules
-        .move_rule_limit
-        .map_or(i32::MAX, |v| v as i32);
 
     if noise_amp <= 0 {
         let result = super::get_best_move(game, max_depth, time_limit_ms, silent);
         return result;
     }
 
-    let result = search_with_searcher_noisy(&mut searcher, game, max_depth, noise_amp);
-    let stats = super::build_search_stats(&searcher);
-    result.map(|(m, eval)| (m, eval, stats))
+    // Use persistent global searcher (Stockfish pattern)
+    super::GLOBAL_SEARCHER.with(|cell| {
+        let mut opt = cell.borrow_mut();
+
+        // Get or create the persistent searcher
+        let searcher = opt.get_or_insert_with(|| super::Searcher::new(time_limit_ms));
+
+        // Initialize searcher for this search
+        searcher.new_search();
+
+        // Update search parameters for this search
+        searcher.hot.time_limit_ms = time_limit_ms;
+        searcher.silent = silent;
+        searcher.hot.timer.reset();
+
+        searcher.set_corrhist_mode(game);
+        searcher.move_rule_limit = game
+            .game_rules
+            .move_rule_limit
+            .map_or(i32::MAX, |v| v as i32);
+
+        let result = search_with_searcher_noisy(searcher, game, max_depth, noise_amp);
+        let stats = super::build_search_stats(searcher);
+        result.map(|(m, eval)| (m, eval, stats))
+    })
 }
 
 fn search_with_searcher_noisy(
@@ -117,7 +131,6 @@ fn search_with_searcher_noisy(
 
     for depth in 1..=max_depth {
         searcher.reset_for_iteration();
-        searcher.decay_history();
 
         // Time check at iteration start - but note that check_time won't stop
         // during depth 1 due to min_depth_required
@@ -248,8 +261,6 @@ fn search_with_searcher_noisy(
             }
         }
     }
-
-    searcher.tt.increment_age();
 
     best_move.map(|m| (m, best_score))
 }
@@ -502,9 +513,9 @@ fn negamax_noisy(ctx: &mut NegamaxNoisyContext) -> i32 {
         0
     };
 
-    // Transposition table probe
     let hash = TranspositionTable::generate_hash(game);
     let mut tt_move: Option<Move> = None;
+    let mut tt_value: Option<i32> = None;
 
     let rule50_count = game.halfmove_clock;
     if let Some((score, best)) = super::probe_tt_with_shared(
@@ -520,10 +531,13 @@ fn negamax_noisy(ctx: &mut NegamaxNoisyContext) -> i32 {
         },
     ) {
         tt_move = best;
+        tt_value = Some(score);
         // Stockfish's "graph history interaction" workaround:
+        // Don't cutoff on mate scores (they need full verification at each depth)
         let rule_limit = searcher.move_rule_limit as u32;
         if !is_pv
             && score != super::INFINITY + 1
+            && score.abs() < super::MATE_SCORE
             && game.halfmove_clock < rule_limit.saturating_sub(4)
             && game.repetition == 0
         {
@@ -632,6 +646,85 @@ fn negamax_noisy(ctx: &mut NegamaxNoisyContext) -> i32 {
         // Internal iterative reductions
         if !all_node && depth >= 6 && tt_move.is_none() && prior_reduction <= 3 {
             depth -= 1;
+        }
+    }
+    // =========================================================================
+    // ProbCut Pruning
+    // =========================================================================
+    let prob_cut_beta = beta + 235 - if improving { 63 } else { 0 };
+    if !is_pv
+        && !in_check
+        && depth >= 5
+        && beta.abs() < super::MATE_SCORE
+        && !tt_value.is_some_and(|v| v < prob_cut_beta)
+    {
+        let mut prob_cut_depth = (depth as i32 - 4 - (static_eval - beta) / 315).max(0) as usize;
+        if prob_cut_depth > depth {
+            prob_cut_depth = depth;
+        }
+
+        let mut captures: MoveList = MoveList::new();
+        let ctx = crate::moves::MoveGenContext {
+            special_rights: &game.special_rights,
+            en_passant: &game.en_passant,
+            game_rules: &game.game_rules,
+            indices: &game.spatial_indices,
+            enemy_king_pos: game.enemy_king_pos(),
+        };
+        crate::moves::get_quiescence_captures(&game.board, game.turn, &ctx, &mut captures);
+        super::sort_captures(game, &mut captures);
+
+        for m in &captures {
+            if super::static_exchange_eval(game, m) < prob_cut_beta - static_eval {
+                continue;
+            }
+
+            let undo = game.make_move(m);
+            if game.is_move_illegal() {
+                game.undo_move(m, undo);
+                continue;
+            }
+
+            let mut val = -quiescence_noisy(
+                searcher,
+                game,
+                ply + 1,
+                -prob_cut_beta,
+                -prob_cut_beta + 1,
+                noise_amp,
+            );
+
+            if val >= prob_cut_beta {
+                val = -negamax_noisy(&mut NegamaxNoisyContext {
+                    searcher,
+                    game,
+                    depth: prob_cut_depth,
+                    ply: ply + 1,
+                    alpha: -prob_cut_beta,
+                    beta: -prob_cut_beta + 1,
+                    allow_null: true,
+                    noise_amp,
+                });
+            }
+
+            game.undo_move(m, undo);
+
+            if searcher.hot.stopped {
+                return 0;
+            }
+
+            if val >= prob_cut_beta {
+                searcher.tt.store(&crate::search::tt::TTStoreParams {
+                    hash,
+                    depth: prob_cut_depth + 1,
+                    flag: crate::search::tt::TTFlag::LowerBound,
+                    score: val,
+                    best_move: Some(*m),
+                    ply,
+                });
+
+                return val;
+            }
         }
     }
 
@@ -938,8 +1031,18 @@ fn negamax_noisy(ctx: &mut NegamaxNoisyContext) -> i32 {
 
     std::mem::swap(&mut searcher.move_buffers[ply], &mut moves);
 
-    if best_move.is_none() {
-        return 0;
+    // Checkmate, stalemate, or loss by capture-based variants
+    if legal_moves == 0 {
+        // Determine if this is a loss:
+        // 1. In check AND must escape check (our win condition is checkmate) → checkmate
+        // 2. No pieces left (relevant for allpiecescaptured variants) → loss
+        let checkmate = in_check && game.must_escape_check();
+        let no_pieces = !game.has_pieces(game.turn);
+        if checkmate || no_pieces {
+            return -MATE_VALUE + ply as i32;
+        } else {
+            return 0; // Stalemate
+        }
     }
 
     let flag = if best_score <= alpha_orig {

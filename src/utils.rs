@@ -45,7 +45,7 @@ pub static IS_PRIME_LOOKUP: [bool; 128] = {
     table
 };
 
-/// Fast O(1) prime check for distances under 128, falls back to O(√n) for larger values.
+/// Fast O(1) prime check for distances under 128, falls back to O(log^3 n) for larger values.
 /// This is the hot path for Huygens piece logic where distances are typically < 100.
 #[inline(always)]
 pub fn is_prime_fast(n: i64) -> bool {
