@@ -4,6 +4,13 @@ use crate::utils::{PRIMES_UNDER_128, is_prime_fast, is_prime_i64};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveGenType {
+    All,
+    Quiets,
+    Captures,
+}
+
 /// Stack-allocated move list with inline capacity of 128 moves.
 /// Spills to heap if this limit is exceeded, preventing panics.
 pub type MoveList = Vec<Move>;
@@ -33,6 +40,7 @@ struct CrossRayContext<'a> {
     piece_type: PieceType,
     enemy_wiggle: i64,
     friend_wiggle: i64,
+    enemy_king_pos: Option<Coordinate>,
 }
 
 pub struct SlidingMoveContext<'a> {
@@ -41,7 +49,6 @@ pub struct SlidingMoveContext<'a> {
     pub piece: &'a Piece,
     pub directions: &'a [(i64, i64)],
     pub indices: &'a SpatialIndices,
-    pub fallback: bool,
     pub enemy_king_pos: Option<&'a Coordinate>,
 }
 
@@ -337,7 +344,7 @@ pub fn is_piece_attacking_square(
         indices,
         enemy_king_pos: None,
     };
-    get_pseudo_legal_moves_for_piece_into(board, piece, from, &ctx, false, &mut moves);
+    get_pseudo_legal_moves_for_piece_into(board, piece, from, &ctx, &mut moves);
     moves.iter().any(|m| m.to.x == to.x && m.to.y == to.y)
 }
 
@@ -573,7 +580,6 @@ pub fn get_legal_moves_into(
     turn: PlayerColor,
     ctx: &MoveGenContext,
     out: &mut MoveList,
-    fallback: bool,
 ) {
     use crate::tiles::TILE_SIZE;
 
@@ -614,26 +620,14 @@ pub fn get_legal_moves_into(
             let y = cy * TILE_SIZE + ly;
             let from = Coordinate::new(x, y);
 
-            get_pseudo_legal_moves_for_piece_into(board, &piece, &from, ctx, fallback, out);
+            get_pseudo_legal_moves_for_piece_into(board, &piece, &from, ctx, out);
         }
     }
 }
 
 pub fn get_legal_moves(board: &Board, turn: PlayerColor, ctx: &MoveGenContext) -> MoveList {
     let mut moves = MoveList::new();
-    get_legal_moves_into(
-        board, turn, ctx, &mut moves, false, // Normal mode
-    );
-
-    // Fallback: if no pseudo-legal moves found, try short-range slider fallback
-    // Note: This logic triggers on 0 *pseudo-legal* moves.
-    // If strict generation yields 0 moves, we might be stuck, so we retry.
-    if moves.is_empty() {
-        get_legal_moves_into(
-            board, turn, ctx, &mut moves, true, // Fallback mode
-        );
-    }
-
+    get_legal_moves_into(board, turn, ctx, &mut moves);
     moves
 }
 
@@ -715,37 +709,29 @@ fn generate_captures_for_piece(
 
         // Knight-like leapers
         PieceType::Knight => {
-            let m = generate_leaper_moves(board, from, piece, 1, 2);
-            extend_captures_only(board, piece.color(), m, out);
+            generate_leaper_moves_into(board, from, piece, 1, 2, MoveGenType::Captures, out);
         }
         PieceType::Camel => {
-            let m = generate_leaper_moves(board, from, piece, 1, 3);
-            extend_captures_only(board, piece.color(), m, out);
+            generate_leaper_moves_into(board, from, piece, 1, 3, MoveGenType::Captures, out);
         }
         PieceType::Giraffe => {
-            let m = generate_leaper_moves(board, from, piece, 1, 4);
-            extend_captures_only(board, piece.color(), m, out);
+            generate_leaper_moves_into(board, from, piece, 1, 4, MoveGenType::Captures, out);
         }
         PieceType::Zebra => {
-            let m = generate_leaper_moves(board, from, piece, 2, 3);
-            extend_captures_only(board, piece.color(), m, out);
+            generate_leaper_moves_into(board, from, piece, 2, 3, MoveGenType::Captures, out);
         }
 
         // King/Guard/Centaur/RoyalCentaur/Hawk: use compass moves, then filter captures
         PieceType::King | PieceType::Guard => {
-            let m = generate_compass_moves(board, from, piece, 1);
-            extend_captures_only(board, piece.color(), m, out);
+            generate_compass_moves_into(board, from, piece, 1, MoveGenType::Captures, out);
         }
         PieceType::Centaur | PieceType::RoyalCentaur => {
-            let m = generate_compass_moves(board, from, piece, 1);
-            extend_captures_only(board, piece.color(), m, out);
-            let knight_m = generate_leaper_moves(board, from, piece, 1, 2);
-            extend_captures_only(board, piece.color(), knight_m, out);
+            generate_compass_moves_into(board, from, piece, 1, MoveGenType::Captures, out);
+            generate_leaper_moves_into(board, from, piece, 1, 2, MoveGenType::Captures, out);
         }
         PieceType::Hawk => {
-            let mut m = generate_compass_moves(board, from, piece, 2);
-            m.extend(generate_compass_moves(board, from, piece, 3));
-            extend_captures_only(board, piece.color(), m, out);
+            generate_compass_moves_into(board, from, piece, 2, MoveGenType::Captures, out);
+            generate_compass_moves_into(board, from, piece, 3, MoveGenType::Captures, out);
         }
 
         // Standard sliders and slider-leaper compounds
@@ -762,39 +748,33 @@ fn generate_captures_for_piece(
         PieceType::Chancellor => {
             // Rook + knight
             generate_sliding_capture_moves(board, from, piece, &[(1, 0), (0, 1)], indices, out);
-            let m = generate_leaper_moves(board, from, piece, 1, 2);
-            extend_captures_only(board, piece.color(), m, out);
+            generate_leaper_moves_into(board, from, piece, 1, 2, MoveGenType::Captures, out);
         }
         PieceType::Archbishop => {
             // Bishop + knight
             generate_sliding_capture_moves(board, from, piece, &[(1, 1), (1, -1)], indices, out);
-            let m = generate_leaper_moves(board, from, piece, 1, 2);
-            extend_captures_only(board, piece.color(), m, out);
+            generate_leaper_moves_into(board, from, piece, 1, 2, MoveGenType::Captures, out);
         }
         PieceType::Amazon => {
             // Queen + knight
             generate_sliding_capture_moves(board, from, piece, &[(1, 0), (0, 1)], indices, out);
             generate_sliding_capture_moves(board, from, piece, &[(1, 1), (1, -1)], indices, out);
-            let m = generate_leaper_moves(board, from, piece, 1, 2);
-            extend_captures_only(board, piece.color(), m, out);
+            generate_leaper_moves_into(board, from, piece, 1, 2, MoveGenType::Captures, out);
         }
 
         // Knightrider: sliding along knight vectors
         PieceType::Knightrider => {
-            let m = generate_knightrider_moves(board, from, piece);
-            extend_captures_only(board, piece.color(), m, out);
+            generate_knightrider_moves_into(board, from, piece, MoveGenType::Captures, out);
         }
 
         // Huygen: use existing generator and keep only captures
         PieceType::Huygen => {
-            let m = generate_huygen_moves(board, from, piece, indices, false);
-            extend_captures_only(board, piece.color(), m, out);
+            generate_huygen_moves_into(board, from, piece, indices, MoveGenType::Captures, out);
         }
 
         // Rose: use existing generator and keep only captures
         PieceType::Rose => {
-            let m = generate_rose_moves(board, from, piece);
-            extend_captures_only(board, piece.color(), m, out);
+            generate_rose_moves_into(board, from, piece, MoveGenType::Captures, out);
         }
     }
 }
@@ -807,7 +787,6 @@ pub fn get_pseudo_legal_moves_for_piece_into(
     piece: &Piece,
     from: &Coordinate,
     ctx: &MoveGenContext,
-    fallback: bool,
     out: &mut MoveList,
 ) {
     let special_rights = ctx.special_rights;
@@ -829,16 +808,20 @@ pub fn get_pseudo_legal_moves_for_piece_into(
                 out,
             );
         }
-        PieceType::Knight => generate_leaper_moves_into(board, from, piece, 1, 2, out),
+        PieceType::Knight => {
+            generate_leaper_moves_into(board, from, piece, 1, 2, MoveGenType::All, out)
+        }
         PieceType::Hawk => {
-            generate_compass_moves_into(board, from, piece, 2, out);
-            generate_compass_moves_into(board, from, piece, 3, out);
+            generate_compass_moves_into(board, from, piece, 2, MoveGenType::All, out);
+            generate_compass_moves_into(board, from, piece, 3, MoveGenType::All, out);
         }
         PieceType::King => {
-            generate_compass_moves_into(board, from, piece, 1, out);
+            generate_compass_moves_into(board, from, piece, 1, MoveGenType::All, out);
             generate_castling_moves_into(board, from, piece, special_rights, indices, out);
         }
-        PieceType::Guard => generate_compass_moves_into(board, from, piece, 1, out),
+        PieceType::Guard => {
+            generate_compass_moves_into(board, from, piece, 1, MoveGenType::All, out)
+        }
         PieceType::Rook => {
             generate_sliding_moves_into(
                 &SlidingMoveContext {
@@ -847,7 +830,6 @@ pub fn get_pseudo_legal_moves_for_piece_into(
                     piece,
                     directions: &[(1, 0), (0, 1)],
                     indices,
-                    fallback,
                     enemy_king_pos,
                 },
                 out,
@@ -861,7 +843,6 @@ pub fn get_pseudo_legal_moves_for_piece_into(
                     piece,
                     directions: &[(1, 1), (1, -1)],
                     indices,
-                    fallback,
                     enemy_king_pos,
                 },
                 out,
@@ -875,7 +856,6 @@ pub fn get_pseudo_legal_moves_for_piece_into(
                     piece,
                     directions: &[(1, 0), (0, 1)],
                     indices,
-                    fallback,
                     enemy_king_pos,
                 },
                 out,
@@ -887,14 +867,13 @@ pub fn get_pseudo_legal_moves_for_piece_into(
                     piece,
                     directions: &[(1, 1), (1, -1)],
                     indices,
-                    fallback,
                     enemy_king_pos,
                 },
                 out,
             );
         }
         PieceType::Chancellor => {
-            generate_leaper_moves_into(board, from, piece, 1, 2, out);
+            generate_leaper_moves_into(board, from, piece, 1, 2, MoveGenType::All, out);
             generate_sliding_moves_into(
                 &SlidingMoveContext {
                     board,
@@ -902,14 +881,13 @@ pub fn get_pseudo_legal_moves_for_piece_into(
                     piece,
                     directions: &[(1, 0), (0, 1)],
                     indices,
-                    fallback,
                     enemy_king_pos,
                 },
                 out,
             );
         }
         PieceType::Archbishop => {
-            generate_leaper_moves_into(board, from, piece, 1, 2, out);
+            generate_leaper_moves_into(board, from, piece, 1, 2, MoveGenType::All, out);
             generate_sliding_moves_into(
                 &SlidingMoveContext {
                     board,
@@ -917,14 +895,13 @@ pub fn get_pseudo_legal_moves_for_piece_into(
                     piece,
                     directions: &[(1, 1), (1, -1)],
                     indices,
-                    fallback,
                     enemy_king_pos,
                 },
                 out,
             );
         }
         PieceType::Amazon => {
-            generate_leaper_moves_into(board, from, piece, 1, 2, out);
+            generate_leaper_moves_into(board, from, piece, 1, 2, MoveGenType::All, out);
             generate_sliding_moves_into(
                 &SlidingMoveContext {
                     board,
@@ -932,7 +909,6 @@ pub fn get_pseudo_legal_moves_for_piece_into(
                     piece,
                     directions: &[(1, 0), (0, 1)],
                     indices,
-                    fallback,
                     enemy_king_pos,
                 },
                 out,
@@ -944,28 +920,37 @@ pub fn get_pseudo_legal_moves_for_piece_into(
                     piece,
                     directions: &[(1, 1), (1, -1)],
                     indices,
-                    fallback,
                     enemy_king_pos,
                 },
                 out,
             );
         }
-        PieceType::Camel => generate_leaper_moves_into(board, from, piece, 1, 3, out),
-        PieceType::Giraffe => generate_leaper_moves_into(board, from, piece, 1, 4, out),
-        PieceType::Zebra => generate_leaper_moves_into(board, from, piece, 2, 3, out),
+        PieceType::Camel => {
+            generate_leaper_moves_into(board, from, piece, 1, 3, MoveGenType::All, out)
+        }
+        PieceType::Giraffe => {
+            generate_leaper_moves_into(board, from, piece, 1, 4, MoveGenType::All, out)
+        }
+        PieceType::Zebra => {
+            generate_leaper_moves_into(board, from, piece, 2, 3, MoveGenType::All, out)
+        }
         // Knightrider: slide along all 8 knight directions until blocked
-        PieceType::Knightrider => generate_knightrider_moves_into(board, from, piece, out),
+        PieceType::Knightrider => {
+            generate_knightrider_moves_into(board, from, piece, MoveGenType::All, out)
+        }
         PieceType::Centaur => {
-            generate_compass_moves_into(board, from, piece, 1, out);
-            generate_leaper_moves_into(board, from, piece, 1, 2, out);
+            generate_compass_moves_into(board, from, piece, 1, MoveGenType::All, out);
+            generate_leaper_moves_into(board, from, piece, 1, 2, MoveGenType::All, out);
         }
         PieceType::RoyalCentaur => {
-            generate_compass_moves_into(board, from, piece, 1, out);
-            generate_leaper_moves_into(board, from, piece, 1, 2, out);
+            generate_compass_moves_into(board, from, piece, 1, MoveGenType::All, out);
+            generate_leaper_moves_into(board, from, piece, 1, 2, MoveGenType::All, out);
             generate_castling_moves_into(board, from, piece, special_rights, indices, out);
         }
-        PieceType::Huygen => generate_huygen_moves_into(board, from, piece, indices, fallback, out),
-        PieceType::Rose => generate_rose_moves_into(board, from, piece, out),
+        PieceType::Huygen => {
+            generate_huygen_moves_into(board, from, piece, indices, MoveGenType::All, out)
+        }
+        PieceType::Rose => generate_rose_moves_into(board, from, piece, MoveGenType::All, out),
     }
 }
 
@@ -975,10 +960,9 @@ pub fn get_pseudo_legal_moves_for_piece(
     piece: &Piece,
     from: &Coordinate,
     ctx: &MoveGenContext,
-    fallback: bool,
 ) -> MoveList {
     let mut out = MoveList::new();
-    get_pseudo_legal_moves_for_piece_into(board, piece, from, ctx, fallback, &mut out);
+    get_pseudo_legal_moves_for_piece_into(board, piece, from, ctx, &mut out);
     out
 }
 
@@ -1008,22 +992,33 @@ pub fn is_square_attacked(
     let pawn_type_mask = 1u32 << (PieceType::Pawn as u8);
 
     // SINGLE-PASS: Check all tiles once, checking all leaper+pawn types per tile
+    // Combined mask of ALL leaper types that attack via nearby tiles
+    const ALL_LEAPER_MASK: u32 = KNIGHT_MASK
+        | KING_MASK
+        | CAMEL_MASK
+        | GIRAFFE_MASK
+        | ZEBRA_MASK
+        | HAWK_MASK
+        | (1u32 << (PieceType::Pawn as u8));
+
     for n in 0..9 {
         let Some(tile) = neighborhood[n] else {
             continue;
         };
 
-        // Get attacker occupancy for this tile
-        let occ = if is_white {
-            tile.occ_white
+        // Get attacker occupancy and type mask for this tile
+        let (occ, type_mask) = if is_white {
+            (tile.occ_white, tile.type_mask_white)
         } else {
-            tile.occ_black
+            (tile.occ_black, tile.type_mask_black)
         };
-        if occ == 0 {
+
+        // Fast early-exit: no attackers of any leaper type in this tile
+        if occ == 0 || (type_mask & ALL_LEAPER_MASK) == 0 {
             continue;
         }
 
-        // Check each leaper type mask against occupancy
+        // Check each leaper type - only if tile has that type
         let masks_to_check = [
             (masks::KNIGHT_MASKS[local_idx][n], KNIGHT_MASK),
             (masks::KING_MASKS[local_idx][n], KING_MASK),
@@ -1034,7 +1029,12 @@ pub fn is_square_attacked(
             (pawn_masks[local_idx][n], pawn_type_mask),
         ];
 
-        for (attack_mask, type_mask) in masks_to_check {
+        for (attack_mask, req_type_mask) in masks_to_check {
+            // Skip if tile has no pieces of this type (fast O(1) check)
+            if (type_mask & req_type_mask) == 0 {
+                continue;
+            }
+
             let candidates = occ & attack_mask;
             if candidates != 0 {
                 let mut bits = candidates;
@@ -1045,7 +1045,7 @@ pub fn is_square_attacked(
                     let packed = tile.piece[bit_idx];
                     if packed != 0 {
                         let pt = Piece::from_packed(packed).piece_type();
-                        if matches_mask(pt, type_mask) {
+                        if matches_mask(pt, req_type_mask) {
                             return true;
                         }
                     }
@@ -1260,148 +1260,6 @@ pub fn is_square_attacked(
     }
 
     false
-}
-
-#[allow(dead_code)]
-fn generate_pawn_moves(
-    board: &Board,
-    from: &Coordinate,
-    piece: &Piece,
-    special_rights: &FxHashSet<Coordinate>,
-    en_passant: &Option<EnPassantState>,
-    game_rules: &GameRules,
-) -> MoveList {
-    let mut moves = MoveList::new();
-    let direction = match piece.color() {
-        PlayerColor::White => 1,
-        PlayerColor::Black => -1,
-        PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
-    };
-
-    // Get promotion ranks for this color
-    // If promotion_ranks is not set AND promotions_allowed is not set, use empty (no promotions)
-    let promotion_ranks: Vec<i64> = if let Some(ranks) = game_rules.promotion_ranks.as_ref() {
-        match piece.color() {
-            PlayerColor::White => ranks.white.clone(),
-            PlayerColor::Black => ranks.black.clone(),
-            PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
-        }
-    } else if game_rules
-        .promotions_allowed
-        .as_deref()
-        .unwrap_or(&[])
-        .is_empty()
-    {
-        // No promotion_ranks AND no promotions_allowed = no promotions anywhere
-        vec![]
-    } else {
-        // promotions_allowed is set but no ranks = use classical defaults
-        match piece.color() {
-            PlayerColor::White => vec![],
-            PlayerColor::Black => vec![],
-            PlayerColor::Neutral => unsafe { std::hint::unreachable_unchecked() },
-        }
-    };
-
-    // Get allowed promotion pieces (use pre-converted types, default to Q, R, B, N)
-    let default_promos = [
-        PieceType::Queen,
-        PieceType::Rook,
-        PieceType::Bishop,
-        PieceType::Knight,
-    ];
-    let promotion_pieces: &[PieceType] = game_rules
-        .promotion_types
-        .as_deref()
-        .unwrap_or(&default_promos);
-
-    // Helper function to add pawn move with promotion handling
-    fn add_pawn_move_inner(
-        moves: &mut MoveList,
-        from: Coordinate,
-        to_x: i64,
-        to_y: i64,
-        piece: Piece,
-        promotion_ranks: &[i64],
-        promotion_pieces: &[PieceType],
-    ) {
-        if promotion_ranks.contains(&to_y) {
-            // Generate a move for each possible promotion piece
-            for &promo in promotion_pieces {
-                let mut m = Move::new(from, Coordinate::new(to_x, to_y), piece);
-                m.promotion = Some(promo);
-                moves.push(m);
-            }
-        } else {
-            moves.push(Move::new(from, Coordinate::new(to_x, to_y), piece));
-        }
-    }
-
-    // Move forward 1
-    let to_y = from.y + direction;
-    let to_x = from.x;
-
-    // Check if square is blocked
-    let forward_blocked = board.get_piece(to_x, to_y).is_some();
-
-    if !forward_blocked {
-        add_pawn_move_inner(
-            &mut moves,
-            *from,
-            to_x,
-            to_y,
-            *piece,
-            &promotion_ranks,
-            promotion_pieces,
-        );
-
-        // Move forward 2 if pawn has special rights (double-move available)
-        // This is now dynamic - based on special_rights set, not hardcoded starting rank
-        // Note: double-move cannot result in promotion, so no need to check
-        if special_rights.contains(from) {
-            let to_y_2 = from.y + (direction * 2);
-            // Must also check that the target square isn't blocked
-            if board.get_piece(to_x, to_y_2).is_none() {
-                moves.push(Move::new(*from, Coordinate::new(to_x, to_y_2), *piece));
-            }
-        }
-    }
-
-    // Captures (including neutral pieces - they can be captured)
-    for dx in [-1i64, 1] {
-        let capture_x = from.x + dx;
-        let capture_y = from.y + direction;
-
-        if let Some(target) = board.get_piece(capture_x, capture_y) {
-            // Can capture any piece that's not the same color as us
-            // This includes neutral pieces (obstacles can be captured)
-            if is_enemy_piece(target, piece.color()) {
-                add_pawn_move_inner(
-                    &mut moves,
-                    *from,
-                    capture_x,
-                    capture_y,
-                    *piece,
-                    &promotion_ranks,
-                    promotion_pieces,
-                );
-            }
-        } else {
-            // En Passant - cannot result in promotion so no promotion check needed
-            if en_passant
-                .as_ref()
-                .is_some_and(|ep| ep.square.x == capture_x && ep.square.y == capture_y)
-            {
-                moves.push(Move::new(
-                    *from,
-                    Coordinate::new(capture_x, capture_y),
-                    *piece,
-                ));
-            }
-        }
-    }
-
-    moves
 }
 
 /// Generate only pawn captures (including en passant) for quiescence.
@@ -1656,32 +1514,6 @@ fn generate_sliding_capture_moves(
 //     dist_r.min(dist_f)
 // }
 
-/// Extend out with only capturing moves from a pre-generated move list.
-fn extend_captures_only(
-    board: &Board,
-    our_color: PlayerColor,
-    moves_in: MoveList,
-    out: &mut MoveList,
-) {
-    for m in moves_in {
-        if let Some(target) = board.get_piece(m.to.x, m.to.y) {
-            // Allow capturing obstacles (neutral but capturable), block only Voids
-            if is_enemy_piece(target, our_color) && !target.piece_type().is_uncapturable() {
-                out.push(m);
-            }
-        }
-    }
-}
-
-/// Extend out with only quiet (non-capturing) moves from a pre-generated move list.
-fn extend_quiets_only(board: &Board, moves_in: MoveList, out: &mut MoveList) {
-    for m in moves_in {
-        if board.get_piece(m.to.x, m.to.y).is_none() {
-            out.push(m);
-        }
-    }
-}
-
 /// Generate only quiet (non-capturing) moves for staged move generation.
 /// This is the complement of get_quiescence_captures.
 pub fn get_quiet_moves_into(
@@ -1726,163 +1558,156 @@ fn generate_quiets_for_piece(
 
         // Knight-like leapers: filter to empty squares
         PieceType::Knight => {
-            let m = generate_leaper_moves(board, from, piece, 1, 2);
-            extend_quiets_only(board, m, out);
+            generate_leaper_moves_into(board, from, piece, 1, 2, MoveGenType::Quiets, out);
         }
         PieceType::Camel => {
-            let m = generate_leaper_moves(board, from, piece, 1, 3);
-            extend_quiets_only(board, m, out);
+            generate_leaper_moves_into(board, from, piece, 1, 3, MoveGenType::Quiets, out);
         }
         PieceType::Giraffe => {
-            let m = generate_leaper_moves(board, from, piece, 1, 4);
-            extend_quiets_only(board, m, out);
+            generate_leaper_moves_into(board, from, piece, 1, 4, MoveGenType::Quiets, out);
         }
         PieceType::Zebra => {
-            let m = generate_leaper_moves(board, from, piece, 2, 3);
-            extend_quiets_only(board, m, out);
+            generate_leaper_moves_into(board, from, piece, 2, 3, MoveGenType::Quiets, out);
         }
 
         // King: compass + castling
         PieceType::King => {
-            let m = generate_compass_moves(board, from, piece, 1);
-            extend_quiets_only(board, m, out);
+            generate_compass_moves_into(board, from, piece, 1, MoveGenType::Quiets, out);
             // Castling is always a quiet move
             let castling = generate_castling_moves(board, from, piece, special_rights, indices);
             out.extend(castling);
         }
         PieceType::Guard => {
-            let m = generate_compass_moves(board, from, piece, 1);
-            extend_quiets_only(board, m, out);
+            generate_compass_moves_into(board, from, piece, 1, MoveGenType::Quiets, out);
         }
         PieceType::Centaur => {
-            let m = generate_compass_moves(board, from, piece, 1);
-            extend_quiets_only(board, m, out);
-            let knight_m = generate_leaper_moves(board, from, piece, 1, 2);
-            extend_quiets_only(board, knight_m, out);
+            generate_compass_moves_into(board, from, piece, 1, MoveGenType::Quiets, out);
+            generate_leaper_moves_into(board, from, piece, 1, 2, MoveGenType::Quiets, out);
         }
         PieceType::RoyalCentaur => {
-            let m = generate_compass_moves(board, from, piece, 1);
-            extend_quiets_only(board, m, out);
-            let knight_m = generate_leaper_moves(board, from, piece, 1, 2);
-            extend_quiets_only(board, knight_m, out);
+            generate_compass_moves_into(board, from, piece, 1, MoveGenType::Quiets, out);
+            generate_leaper_moves_into(board, from, piece, 1, 2, MoveGenType::Quiets, out);
             let castling = generate_castling_moves(board, from, piece, special_rights, indices);
             out.extend(castling);
         }
         PieceType::Hawk => {
-            let mut m = generate_compass_moves(board, from, piece, 2);
-            m.extend(generate_compass_moves(board, from, piece, 3));
-            extend_quiets_only(board, m, out);
+            generate_compass_moves_into(board, from, piece, 2, MoveGenType::Quiets, out);
+            generate_compass_moves_into(board, from, piece, 3, MoveGenType::Quiets, out);
         }
 
         // Sliders
         PieceType::Rook => {
-            let m = generate_sliding_moves(&SlidingMoveContext {
-                board,
-                from,
-                piece,
-                directions: &[(1, 0), (0, 1)],
-                indices,
-                fallback: false,
-                enemy_king_pos,
-            });
-            extend_quiets_only(board, m, out);
+            generate_sliding_quiets_into(
+                &SlidingMoveContext {
+                    board,
+                    from,
+                    piece,
+                    directions: &[(1, 0), (0, 1)],
+                    indices,
+                    enemy_king_pos,
+                },
+                out,
+            );
         }
         PieceType::Bishop => {
-            let m = generate_sliding_moves(&SlidingMoveContext {
-                board,
-                from,
-                piece,
-                directions: &[(1, 1), (1, -1)],
-                indices,
-                fallback: false,
-                enemy_king_pos,
-            });
-            extend_quiets_only(board, m, out);
+            generate_sliding_quiets_into(
+                &SlidingMoveContext {
+                    board,
+                    from,
+                    piece,
+                    directions: &[(1, 1), (1, -1)],
+                    indices,
+                    enemy_king_pos,
+                },
+                out,
+            );
         }
         PieceType::Queen | PieceType::RoyalQueen => {
-            let mut m = generate_sliding_moves(&SlidingMoveContext {
-                board,
-                from,
-                piece,
-                directions: &[(1, 0), (0, 1)],
-                indices,
-                fallback: false,
-                enemy_king_pos,
-            });
-            m.extend(generate_sliding_moves(&SlidingMoveContext {
-                board,
-                from,
-                piece,
-                directions: &[(1, 1), (1, -1)],
-                indices,
-                fallback: false,
-                enemy_king_pos,
-            }));
-            extend_quiets_only(board, m, out);
+            generate_sliding_quiets_into(
+                &SlidingMoveContext {
+                    board,
+                    from,
+                    piece,
+                    directions: &[(1, 0), (0, 1)],
+                    indices,
+                    enemy_king_pos,
+                },
+                out,
+            );
+            generate_sliding_quiets_into(
+                &SlidingMoveContext {
+                    board,
+                    from,
+                    piece,
+                    directions: &[(1, 1), (1, -1)],
+                    indices,
+                    enemy_king_pos,
+                },
+                out,
+            );
         }
         PieceType::Chancellor => {
-            let knight_m = generate_leaper_moves(board, from, piece, 1, 2);
-            extend_quiets_only(board, knight_m, out);
-            let rook_m = generate_sliding_moves(&SlidingMoveContext {
-                board,
-                from,
-                piece,
-                directions: &[(1, 0), (0, 1)],
-                indices,
-                fallback: false,
-                enemy_king_pos,
-            });
-            extend_quiets_only(board, rook_m, out);
+            generate_leaper_moves_into(board, from, piece, 1, 2, MoveGenType::Quiets, out);
+            generate_sliding_quiets_into(
+                &SlidingMoveContext {
+                    board,
+                    from,
+                    piece,
+                    directions: &[(1, 0), (0, 1)],
+                    indices,
+                    enemy_king_pos,
+                },
+                out,
+            );
         }
         PieceType::Archbishop => {
-            let knight_m = generate_leaper_moves(board, from, piece, 1, 2);
-            extend_quiets_only(board, knight_m, out);
-            let bishop_m = generate_sliding_moves(&SlidingMoveContext {
-                board,
-                from,
-                piece,
-                directions: &[(1, 1), (1, -1)],
-                indices,
-                fallback: false,
-                enemy_king_pos,
-            });
-            extend_quiets_only(board, bishop_m, out);
+            generate_leaper_moves_into(board, from, piece, 1, 2, MoveGenType::Quiets, out);
+            generate_sliding_quiets_into(
+                &SlidingMoveContext {
+                    board,
+                    from,
+                    piece,
+                    directions: &[(1, 1), (1, -1)],
+                    indices,
+                    enemy_king_pos,
+                },
+                out,
+            );
         }
         PieceType::Amazon => {
-            let knight_m = generate_leaper_moves(board, from, piece, 1, 2);
-            extend_quiets_only(board, knight_m, out);
-            let mut queen_m = generate_sliding_moves(&SlidingMoveContext {
-                board,
-                from,
-                piece,
-                directions: &[(1, 0), (0, 1)],
-                indices,
-                fallback: false,
-                enemy_king_pos,
-            });
-            queen_m.extend(generate_sliding_moves(&SlidingMoveContext {
-                board,
-                from,
-                piece,
-                directions: &[(1, 1), (1, -1)],
-                indices,
-                fallback: false,
-                enemy_king_pos,
-            }));
-            extend_quiets_only(board, queen_m, out);
+            generate_leaper_moves_into(board, from, piece, 1, 2, MoveGenType::Quiets, out);
+            generate_sliding_quiets_into(
+                &SlidingMoveContext {
+                    board,
+                    from,
+                    piece,
+                    directions: &[(1, 0), (0, 1)],
+                    indices,
+                    enemy_king_pos,
+                },
+                out,
+            );
+            generate_sliding_quiets_into(
+                &SlidingMoveContext {
+                    board,
+                    from,
+                    piece,
+                    directions: &[(1, 1), (1, -1)],
+                    indices,
+                    enemy_king_pos,
+                },
+                out,
+            );
         }
 
         PieceType::Knightrider => {
-            let m = generate_knightrider_moves(board, from, piece);
-            extend_quiets_only(board, m, out);
+            generate_knightrider_moves_into(board, from, piece, MoveGenType::Quiets, out);
         }
         PieceType::Huygen => {
-            let m = generate_huygen_moves(board, from, piece, indices, false);
-            extend_quiets_only(board, m, out);
+            generate_huygen_moves_into(board, from, piece, indices, MoveGenType::Quiets, out);
         }
         PieceType::Rose => {
-            let m = generate_rose_moves(board, from, piece);
-            extend_quiets_only(board, m, out);
+            generate_rose_moves_into(board, from, piece, MoveGenType::Quiets, out);
         }
     }
 }
@@ -1928,85 +1753,64 @@ fn generate_pawn_quiet_moves(
         .as_deref()
         .unwrap_or(&default_promos);
 
+    // Helper function for promotion moves
+    #[inline]
+    fn add_pawn_move(
+        out: &mut MoveList,
+        from: Coordinate,
+        to_x: i64,
+        to_y: i64,
+        piece: Piece,
+        promotion_ranks: &[i64],
+        promotion_pieces: &[PieceType],
+    ) {
+        if promotion_ranks.contains(&to_y) {
+            for &promo in promotion_pieces {
+                let mut m = Move::new(from, Coordinate::new(to_x, to_y), piece);
+                m.promotion = Some(promo);
+                out.push(m);
+            }
+        } else {
+            out.push(Move::new(from, Coordinate::new(to_x, to_y), piece));
+        }
+    }
+
     // Single push
     let to_y = from.y + direction;
     let to_x = from.x;
 
     if board.get_piece(to_x, to_y).is_none() {
         // Square is empty, can push
-        if promotion_ranks.contains(&to_y) {
-            for &promo in promotion_pieces {
-                let mut m = Move::new(*from, Coordinate::new(to_x, to_y), *piece);
-                m.promotion = Some(promo);
-                out.push(m);
-            }
-        } else {
-            out.push(Move::new(*from, Coordinate::new(to_x, to_y), *piece));
-        }
+        add_pawn_move(
+            out,
+            *from,
+            to_x,
+            to_y,
+            *piece,
+            &promotion_ranks,
+            promotion_pieces,
+        );
 
         // Double push if pawn has special rights
         if special_rights.contains(from) {
             let double_y = from.y + 2 * direction;
             if board.get_piece(to_x, double_y).is_none() {
-                out.push(Move::new(*from, Coordinate::new(to_x, double_y), *piece));
+                add_pawn_move(
+                    out,
+                    *from,
+                    to_x,
+                    double_y,
+                    *piece,
+                    &promotion_ranks,
+                    promotion_pieces,
+                );
             }
         }
     }
-}
-
-fn generate_compass_moves(
-    board: &Board,
-    from: &Coordinate,
-    piece: &Piece,
-    distance: i64,
-) -> MoveList {
-    let mut moves = MoveList::new();
-    let dist = distance;
-    let offsets = [
-        (-dist, dist),
-        (0, dist),
-        (dist, dist),
-        (-dist, 0),
-        (dist, 0),
-        (-dist, -dist),
-        (0, -dist),
-        (dist, -dist),
-    ];
-
-    for (dx, dy) in offsets {
-        let to_x = from.x + dx;
-        let to_y = from.y + dy;
-
-        // Skip if outside world border
-        if !in_bounds(to_x, to_y) {
-            continue;
-        }
-
-        if let Some(target) = board.get_piece(to_x, to_y) {
-            if is_enemy_piece(target, piece.color()) {
-                moves.push(Move::new(*from, Coordinate::new(to_x, to_y), *piece));
-            }
-        } else {
-            moves.push(Move::new(*from, Coordinate::new(to_x, to_y), *piece));
-        }
-    }
-
-    moves
-}
-
-fn generate_leaper_moves(
-    board: &Board,
-    from: &Coordinate,
-    piece: &Piece,
-    m: i64,
-    n: i64,
-) -> MoveList {
-    let mut moves = MoveList::new();
-    generate_leaper_moves_into(board, from, piece, m, n, &mut moves);
-    moves
 }
 
 /// Generate leaper moves directly into an output buffer
+/// gen_type controls which move types to generate: All, Quiets only, or Captures only
 #[inline]
 fn generate_leaper_moves_into(
     board: &Board,
@@ -2014,6 +1818,7 @@ fn generate_leaper_moves_into(
     piece: &Piece,
     m: i64,
     n: i64,
+    gen_type: MoveGenType,
     out: &mut MoveList,
 ) {
     let offsets = [
@@ -2037,22 +1842,29 @@ fn generate_leaper_moves_into(
         }
 
         if let Some(target) = board.get_piece(to_x, to_y) {
-            if is_enemy_piece(target, piece.color()) {
+            // Target square occupied - this would be a capture
+            let dominated = is_enemy_piece(target, piece.color());
+            if dominated && gen_type != MoveGenType::Quiets {
                 out.push(Move::new(*from, Coordinate::new(to_x, to_y), *piece));
             }
         } else {
-            out.push(Move::new(*from, Coordinate::new(to_x, to_y), *piece));
+            // Empty square - quiet move
+            if gen_type != MoveGenType::Captures {
+                out.push(Move::new(*from, Coordinate::new(to_x, to_y), *piece));
+            }
         }
     }
 }
 
 /// Generate compass moves directly into an output buffer
+/// gen_type controls which move types to generate: All, Quiets only, or Captures only
 #[inline]
 fn generate_compass_moves_into(
     board: &Board,
     from: &Coordinate,
     piece: &Piece,
     distance: i64,
+    gen_type: MoveGenType,
     out: &mut MoveList,
 ) {
     let dist = distance;
@@ -2077,11 +1889,16 @@ fn generate_compass_moves_into(
         }
 
         if let Some(target) = board.get_piece(to_x, to_y) {
-            if is_enemy_piece(target, piece.color()) {
+            // Target square occupied - this would be a capture
+            let dominated = is_enemy_piece(target, piece.color());
+            if dominated && gen_type != MoveGenType::Quiets {
                 out.push(Move::new(*from, Coordinate::new(to_x, to_y), *piece));
             }
         } else {
-            out.push(Move::new(*from, Coordinate::new(to_x, to_y), *piece));
+            // Empty square - quiet move
+            if gen_type != MoveGenType::Captures {
+                out.push(Move::new(*from, Coordinate::new(to_x, to_y), *piece));
+            }
         }
     }
 }
@@ -2156,6 +1973,7 @@ fn find_cross_ray_targets_into(ctx: &CrossRayContext, dir_x: i64, dir_y: i64, ou
     let piece_type = ctx.piece_type;
     let enemy_wiggle = ctx.enemy_wiggle;
     let friend_wiggle = ctx.friend_wiggle;
+    let enemy_king_pos = ctx.enemy_king_pos;
 
     // Check OUR piece's attack capabilities
     let our_attacks_ortho = matches!(
@@ -2213,6 +2031,16 @@ fn find_cross_ray_targets_into(ctx: &CrossRayContext, dir_x: i64, dir_y: i64, ou
             }
         }
 
+        let is_king = is_enemy && enemy_king_pos.is_some_and(|k| k.x == px && k.y == py)
+            || (is_enemy && p.piece_type() == PieceType::King); // Fallback check if pos not passed
+
+        // For enemy KING, we ignore max_dist to ensure we find check moves
+        let current_max_dist = if is_king {
+            2_000_000_000
+        } else {
+            max_dist
+        };
+
         let wiggle = if is_enemy {
             enemy_wiggle
         } else {
@@ -2227,7 +2055,7 @@ fn find_cross_ray_targets_into(ctx: &CrossRayContext, dir_x: i64, dir_y: i64, ou
                 let num = px - from.x;
                 if num.signum() == dir_x.signum() && num % dir_x == 0 {
                     let d = num / dir_x;
-                    if d > 0 && d <= max_dist {
+                    if d > 0 && d <= current_max_dist {
                         let sy = from.y + d * dir_y;
                         if py != sy
                             && let Some((_nearest_y, _)) = indices
@@ -2241,7 +2069,7 @@ fn find_cross_ray_targets_into(ctx: &CrossRayContext, dir_x: i64, dir_y: i64, ou
                             // Wiggle allowed for orthogonal
                             for w in -wiggle..=wiggle {
                                 let wd = d + w;
-                                if wd > 0 && wd <= max_dist {
+                                if wd > 0 && wd <= current_max_dist {
                                     out.push(wd);
                                 }
                             }
@@ -2255,7 +2083,7 @@ fn find_cross_ray_targets_into(ctx: &CrossRayContext, dir_x: i64, dir_y: i64, ou
                 let num = py - from.y;
                 if num.signum() == dir_y.signum() && num % dir_y == 0 {
                     let d = num / dir_y;
-                    if d > 0 && d <= max_dist {
+                    if d > 0 && d <= current_max_dist {
                         let sx = from.x + d * dir_x;
                         if px != sx
                             && let Some((_nearest_x, _)) = indices
@@ -2269,7 +2097,7 @@ fn find_cross_ray_targets_into(ctx: &CrossRayContext, dir_x: i64, dir_y: i64, ou
                             // Wiggle allowed for orthogonal
                             for w in -wiggle..=wiggle {
                                 let wd = d + w;
-                                if wd > 0 && wd <= max_dist {
+                                if wd > 0 && wd <= current_max_dist {
                                     out.push(wd);
                                 }
                             }
@@ -2287,7 +2115,7 @@ fn find_cross_ray_targets_into(ctx: &CrossRayContext, dir_x: i64, dir_y: i64, ou
                 let num = (px - py) - (from.x - from.y);
                 if num.signum() == ray_diff.signum() && num % ray_diff == 0 {
                     let d = num / ray_diff;
-                    if d > 0 && d <= max_dist {
+                    if d > 0 && d <= current_max_dist {
                         let sx = from.x + d * dir_x;
                         if px != sx
                             && let Some((_nearest_x, _)) = indices
@@ -2310,7 +2138,7 @@ fn find_cross_ray_targets_into(ctx: &CrossRayContext, dir_x: i64, dir_y: i64, ou
                 let num = (px + py) - (from.x + from.y);
                 if num.signum() == ray_sum.signum() && num % ray_sum == 0 {
                     let d = num / ray_sum;
-                    if d > 0 && d <= max_dist {
+                    if d > 0 && d <= current_max_dist {
                         let sx = from.x + d * dir_x;
                         if px != sx
                             && let Some((_nearest_x, _)) = indices
@@ -2331,13 +2159,16 @@ fn find_cross_ray_targets_into(ctx: &CrossRayContext, dir_x: i64, dir_y: i64, ou
     }
 }
 
-pub fn generate_sliding_moves(ctx: &SlidingMoveContext) -> MoveList {
+fn generate_sliding_moves_impl(
+    ctx: &SlidingMoveContext,
+    out: &mut MoveList,
+    gen_type: MoveGenType,
+) {
     let board = ctx.board;
     let from = ctx.from;
     let piece = ctx.piece;
     let directions = ctx.directions;
     let indices = ctx.indices;
-    let fallback = ctx.fallback;
     let enemy_king_pos = ctx.enemy_king_pos;
 
     // Original wiggle values - important for tactics
@@ -2348,23 +2179,12 @@ pub fn generate_sliding_moves(ctx: &SlidingMoveContext) -> MoveList {
     const BASE_INTERCEPTION_DIST: i64 = 25;
     const MAX_INTERCEPTION_DIST: i64 = 50;
 
-    // Fallback limit for short-range slider moves
-    const FALLBACK_LIMIT: i64 = 10;
-
-    // Far move generation for slider activation
-    // Generates one ~50 square move for each open ray to help activate dormant rooks/queens
-    // const FAR_MOVE_DISTANCE: i64 = 50;
-    // const FAR_MOVE_BORDER_SAFETY: i64 = 100;
-
-    let mut moves = MoveList::new();
     let our_color = piece.color();
 
-    // Distance-aware wiggle calculation:
-    // Close range (1-10): full wiggle
-    // Far range (11+): no wiggle (only direct targets)
+    // Royal pieces: ALWAYS full wiggle (for safety/mate)
     #[inline(always)]
-    fn distance_wiggle(dist: i64, is_enemy: bool, base_wiggle: i64) -> i64 {
-        if dist <= 10 {
+    fn distance_wiggle(dist: i64, is_enemy: bool, base_wiggle: i64, is_royal: bool) -> i64 {
+        if is_royal || dist <= 10 {
             base_wiggle
         } else if is_enemy {
             1
@@ -2381,32 +2201,6 @@ pub fn generate_sliding_moves(ctx: &SlidingMoveContext) -> MoveList {
             let dir_y = dy_raw * sign;
 
             if dir_x == 0 && dir_y == 0 {
-                continue;
-            }
-
-            if fallback {
-                for dist in 1..=FALLBACK_LIMIT {
-                    let tx = from.x + dir_x * dist;
-                    let ty = from.y + dir_y * dist;
-
-                    // Stop if out of bounds (though unlikely with infinite board coords)
-                    if !in_bounds(tx, ty) {
-                        break;
-                    }
-
-                    if let Some(target) = board.get_piece(tx, ty) {
-                        // If blocked, check if we can capture
-                        // Obstacles are neutral but capturable - check is_uncapturable()
-                        let is_enemy =
-                            target.color() != our_color && !target.piece_type().is_uncapturable();
-                        if is_enemy {
-                            moves.push(Move::new(*from, Coordinate::new(tx, ty), *piece));
-                        }
-                        break; // blocked
-                    } else {
-                        moves.push(Move::new(*from, Coordinate::new(tx, ty), *piece));
-                    }
-                }
                 continue;
             }
 
@@ -2529,7 +2323,9 @@ pub fn generate_sliding_moves(ctx: &SlidingMoveContext) -> MoveList {
                             } else {
                                 FRIEND_WIGGLE
                             };
-                            let wiggle = distance_wiggle(piece_dist, is_enemy, base_wiggle);
+                            let is_royal = piece.piece_type().is_royal();
+                            let wiggle =
+                                distance_wiggle(piece_dist, is_enemy, base_wiggle, is_royal);
 
                             for w in -wiggle..=wiggle {
                                 let d = piece_dist + w;
@@ -2559,7 +2355,9 @@ pub fn generate_sliding_moves(ctx: &SlidingMoveContext) -> MoveList {
                             } else {
                                 FRIEND_WIGGLE
                             };
-                            let wiggle = distance_wiggle(piece_dist, is_enemy, base_wiggle);
+                            let is_royal = piece.piece_type().is_royal();
+                            let wiggle =
+                                distance_wiggle(piece_dist, is_enemy, base_wiggle, is_royal);
 
                             for w in -wiggle..=wiggle {
                                 let d = piece_dist + w;
@@ -2601,7 +2399,9 @@ pub fn generate_sliding_moves(ctx: &SlidingMoveContext) -> MoveList {
                             } else {
                                 FRIEND_WIGGLE
                             };
-                            let wiggle = distance_wiggle(piece_dist, is_enemy, base_wiggle);
+                            let is_royal = piece.piece_type().is_royal();
+                            let wiggle =
+                                distance_wiggle(piece_dist, is_enemy, base_wiggle, is_royal);
 
                             for w in -wiggle..=wiggle {
                                 let d = piece_dist + w;
@@ -2625,6 +2425,7 @@ pub fn generate_sliding_moves(ctx: &SlidingMoveContext) -> MoveList {
                     piece_type: piece.piece_type(),
                     enemy_wiggle: ENEMY_WIGGLE,
                     friend_wiggle: FRIEND_WIGGLE,
+                    enemy_king_pos: enemy_king_pos.cloned(),
                 };
                 find_cross_ray_targets_into(&cr_ctx, dir_x, dir_y, &mut cross_targets);
                 target_dists.extend(cross_targets);
@@ -2761,12 +2562,17 @@ pub fn generate_sliding_moves(ctx: &SlidingMoveContext) -> MoveList {
                     continue;
                 }
 
-                moves.push(Move::new(*from, Coordinate::new(sq_x, sq_y), *piece));
+                let is_capture = d == closest_dist && closest_is_enemy;
+                if (gen_type == MoveGenType::Captures && !is_capture)
+                    || (gen_type == MoveGenType::Quiets && is_capture)
+                {
+                    continue;
+                }
+
+                out.push(Move::new(*from, Coordinate::new(sq_x, sq_y), *piece));
             }
         }
     }
-
-    moves
 }
 
 /// Find the closest blocker on a ray using spatial indices (O(log n))
@@ -2825,14 +2631,16 @@ fn find_blocker_via_indices(
 /// 2. O(log n) binary search in spatial indices for blocker detection
 /// 3. When no blocker, only generates moves to "interesting" squares aligned with cross-ray pieces
 /// 4. is_prime_fast() for O(1) primality checks instead of O(√n)
-fn generate_huygen_moves(
+/// gen_type controls which move types to generate: All, Quiets only, or Captures only
+fn generate_huygen_moves_into(
     board: &Board,
     from: &Coordinate,
     piece: &Piece,
     indices: &SpatialIndices,
-    fallback: bool,
-) -> MoveList {
-    let mut moves = MoveList::new();
+    gen_type: MoveGenType,
+    out: &mut MoveList,
+) {
+    let my_color = piece.color();
 
     // Four orthogonal directions: right, left, up, down
     const ORTHO_DIRECTIONS: [(i64, i64); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
@@ -2843,7 +2651,7 @@ fn generate_huygen_moves(
     for &(dir_x, dir_y) in &ORTHO_DIRECTIONS {
         // Find the closest blocker at a prime distance in this direction
         let (blocker_dist, blocker_color) =
-            find_huygen_blocker(board, from, dir_x, dir_y, indices, piece.color(), fallback);
+            find_huygen_blocker(board, from, dir_x, dir_y, indices, my_color);
 
         if blocker_dist < i64::MAX {
             // CASE 1: Blocker found at prime distance
@@ -2859,25 +2667,27 @@ fn generate_huygen_moves(
                 if prime_dist == blocker_dist {
                     // At blocker - can only move here if enemy (capture)
                     if let Some(color) = blocker_color {
-                        if color != piece.color() {
-                            moves.push(Move::new(*from, Coordinate::new(to_x, to_y), *piece));
+                        if color != my_color && gen_type != MoveGenType::Quiets {
+                            out.push(Move::new(*from, Coordinate::new(to_x, to_y), *piece));
                         }
                     }
                 } else {
                     // Before blocker - empty square, valid move
-                    moves.push(Move::new(*from, Coordinate::new(to_x, to_y), *piece));
+                    if gen_type != MoveGenType::Captures {
+                        out.push(Move::new(*from, Coordinate::new(to_x, to_y), *piece));
+                    }
                 }
             }
 
             // IMPORTANT: Handle captures at prime distances > 127
             // The loop above only covers primes up to 127, but blocker could be further
-            if blocker_dist > 127 {
+            if blocker_dist > 127 && gen_type != MoveGenType::Quiets {
                 if let Some(color) = blocker_color {
-                    if color != piece.color() {
+                    if color != my_color {
                         // Blocker is enemy at prime distance > 127 - generate capture
                         let to_x = from.x + dir_x * blocker_dist;
                         let to_y = from.y + dir_y * blocker_dist;
-                        moves.push(Move::new(*from, Coordinate::new(to_x, to_y), *piece));
+                        out.push(Move::new(*from, Coordinate::new(to_x, to_y), *piece));
                     }
                 }
             }
@@ -2885,44 +2695,42 @@ fn generate_huygen_moves(
             // CASE 2: No blocker found at any prime distance
             // Only generate moves to "interesting" squares that are aligned with pieces on cross-rays
             // This prevents move explosion on infinite boards
-            for &prime_dist in &PRIMES_UNDER_128 {
-                if prime_dist > OPEN_RAY_LIMIT {
-                    break;
-                }
+            if gen_type != MoveGenType::Captures {
+                for &prime_dist in &PRIMES_UNDER_128 {
+                    if prime_dist > OPEN_RAY_LIMIT {
+                        break;
+                    }
 
-                let to_x = from.x + dir_x * prime_dist;
-                let to_y = from.y + dir_y * prime_dist;
+                    let to_x = from.x + dir_x * prime_dist;
+                    let to_y = from.y + dir_y * prime_dist;
 
-                // Check if this destination is "interesting" - aligned with some piece on cross-ray
-                let aligned = if dir_x != 0 {
-                    // Moving horizontally - check if to_x column has any pieces
-                    indices.cols.get(&to_x).is_some_and(|v| !v.is_empty())
-                } else {
-                    // Moving vertically - check if to_y row has any pieces
-                    indices.rows.get(&to_y).is_some_and(|v| !v.is_empty())
-                };
+                    // Check if this destination is "interesting" (aligned with some piece on cross-ray)
+                    // OR if it's one of the first 2 prime distances (2, 3) which are always generated.
+                    let aligned = if dir_x != 0 {
+                        indices.cols.get(&to_x).is_some_and(|v| !v.is_empty())
+                    } else {
+                        indices.rows.get(&to_y).is_some_and(|v| !v.is_empty())
+                    };
 
-                if aligned {
-                    moves.push(Move::new(*from, Coordinate::new(to_x, to_y), *piece));
+                    if aligned || prime_dist <= 3 {
+                        out.push(Move::new(*from, Coordinate::new(to_x, to_y), *piece));
+                    }
                 }
             }
         }
     }
-
-    moves
 }
 
 /// Find the closest blocker at a prime distance for Huygens using spatial indices.
 /// Returns (distance_to_blocker, blocker_color). If no blocker, returns (i64::MAX, None).
 #[inline]
 fn find_huygen_blocker(
-    board: &Board,
+    _board: &Board,
     from: &Coordinate,
     dir_x: i64,
     dir_y: i64,
     indices: &SpatialIndices,
     our_color: PlayerColor,
-    fallback: bool,
 ) -> (i64, Option<PlayerColor>) {
     // Get the appropriate spatial index line (row or column)
     let is_horizontal = dir_x != 0;
@@ -2940,7 +2748,7 @@ fn find_huygen_blocker(
             Ok(idx) => {
                 // Found our position, iterate in the direction to find first blocker at prime distance
                 if (is_horizontal && dir_x > 0) || (!is_horizontal && dir_y > 0) {
-                    // Positive direction: iterate forward from idx+1
+                    // Positive direction: iterate forward from idx + 1
                     for (coord, packed) in vec.iter().skip(idx + 1) {
                         let dist = coord - our_coord;
                         // O(1) prime check
@@ -2956,7 +2764,7 @@ fn find_huygen_blocker(
                         }
                     }
                 } else {
-                    // Negative direction: iterate backward from idx-1
+                    // Negative direction: iterate backward from idx - 1
                     for (coord, packed) in vec.iter().take(idx).rev() {
                         let dist = our_coord - coord;
                         // O(1) prime check
@@ -2973,55 +2781,12 @@ fn find_huygen_blocker(
                 }
             }
             Err(_) => {
-                // Piece not in index (shouldn't happen), use fallback
+                // Piece not in index (shouldn't happen)
             }
-        }
-    }
-
-    // Fallback: quick O(n) scan if spatial indices fail (rare case)
-    if fallback {
-        let mut closest = i64::MAX;
-        let mut closest_color = None;
-
-        for ((px, py), target_piece) in board.iter() {
-            let dx = px - from.x;
-            let dy = py - from.y;
-
-            // Check if on the ray
-            let dist = if is_horizontal {
-                if dy == 0 && dx.signum() == dir_x {
-                    dx.abs()
-                } else {
-                    continue;
-                }
-            } else if dx == 0 && dy.signum() == dir_y {
-                dy.abs()
-            } else {
-                continue;
-            };
-
-            if dist > 0 && is_prime_fast(dist) && dist < closest {
-                closest = dist;
-                closest_color = Some(if target_piece.piece_type() == PieceType::Void {
-                    our_color
-                } else {
-                    target_piece.color()
-                });
-            }
-        }
-
-        if closest < i64::MAX {
-            return (closest, closest_color);
         }
     }
 
     (i64::MAX, None)
-}
-
-fn generate_rose_moves(board: &Board, from: &Coordinate, piece: &Piece) -> MoveList {
-    let mut moves = MoveList::new();
-    generate_rose_moves_into(board, from, piece, &mut moves);
-    moves
 }
 
 /// Rose movement - Circular knightrider that spirals along knight hops.
@@ -3086,8 +2851,15 @@ pub static ROSE_SPIRALS: [[[(i64, i64); 7]; 2]; 8] = {
 
 /// Generate rose moves directly into an output buffer.
 /// Uses precomputed spiral paths with proper blocking detection.
+/// gen_type controls which move types to generate: All, Quiets only, or Captures only
 #[inline(always)]
-fn generate_rose_moves_into(board: &Board, from: &Coordinate, piece: &Piece, out: &mut MoveList) {
+fn generate_rose_moves_into(
+    board: &Board,
+    from: &Coordinate,
+    piece: &Piece,
+    gen_type: MoveGenType,
+    out: &mut MoveList,
+) {
     let my_color = piece.color();
     let fx = from.x;
     let fy = from.y;
@@ -3116,8 +2888,12 @@ fn generate_rose_moves_into(board: &Board, from: &Coordinate, piece: &Piece, out
                 let ty = fy + cum_dy;
 
                 if let Some(target) = board.get_piece(tx, ty) {
-                    // Square occupied - check if capturable
-                    if is_enemy_piece(target, my_color) && !is_seen(&seen, seen_count, tx, ty) {
+                    // Square occupied - this would be a capture
+                    let dominated = is_enemy_piece(target, my_color);
+                    if dominated
+                        && gen_type != MoveGenType::Quiets
+                        && !is_seen(&seen, seen_count, tx, ty)
+                    {
                         seen[seen_count] = (tx, ty);
                         seen_count += 1;
                         out.push(Move::new(*from, Coordinate::new(tx, ty), *piece));
@@ -3125,8 +2901,8 @@ fn generate_rose_moves_into(board: &Board, from: &Coordinate, piece: &Piece, out
                     // Blocked - cannot continue this spiral
                     break;
                 } else {
-                    // Empty square - add move if not seen
-                    if !is_seen(&seen, seen_count, tx, ty) {
+                    // Empty square - quiet move
+                    if gen_type != MoveGenType::Captures && !is_seen(&seen, seen_count, tx, ty) {
                         seen[seen_count] = (tx, ty);
                         seen_count += 1;
                         out.push(Move::new(*from, Coordinate::new(tx, ty), *piece));
@@ -3336,35 +3112,37 @@ fn generate_castling_moves_into(
 /// Generate sliding moves directly into an output buffer
 #[inline]
 pub fn generate_sliding_moves_into(ctx: &SlidingMoveContext, out: &mut MoveList) {
-    // Reuse implementation by delegating to existing function and extending
-    let moves = generate_sliding_moves(ctx);
-    out.extend(moves);
+    generate_sliding_moves_impl(ctx, out, MoveGenType::All);
+}
+
+/// Generate only quiet (non-capture) sliding moves directly into output buffer.
+#[inline]
+pub fn generate_sliding_quiets_into(ctx: &SlidingMoveContext, out: &mut MoveList) {
+    generate_sliding_moves_impl(ctx, out, MoveGenType::Quiets);
 }
 
 /// Generate knightrider moves directly into an output buffer
+/// gen_type controls which move types to generate: All, Quiets only, or Captures only
 #[inline]
 fn generate_knightrider_moves_into(
     board: &Board,
     from: &Coordinate,
     piece: &Piece,
+    gen_type: MoveGenType,
     out: &mut MoveList,
 ) {
     let moves = generate_knightrider_moves(board, from, piece);
-    out.extend(moves);
-}
-
-/// Generate huygen moves directly into an output buffer
-#[inline]
-fn generate_huygen_moves_into(
-    board: &Board,
-    from: &Coordinate,
-    piece: &Piece,
-    indices: &SpatialIndices,
-    fallback: bool,
-    out: &mut MoveList,
-) {
-    let moves = generate_huygen_moves(board, from, piece, indices, fallback);
-    out.extend(moves);
+    for m in moves {
+        let is_capture = board.get_piece(m.to.x, m.to.y).is_some();
+        // Filter based on gen_type
+        if gen_type == MoveGenType::Quiets && is_capture {
+            continue;
+        }
+        if gen_type == MoveGenType::Captures && !is_capture {
+            continue;
+        }
+        out.push(m);
+    }
 }
 
 #[cfg(test)]
@@ -3578,7 +3356,7 @@ mod tests {
         let piece = Piece::new(PieceType::Knight, PlayerColor::White);
 
         let mut moves = MoveList::new();
-        generate_leaper_moves_into(&board, &from, &piece, 1, 2, &mut moves);
+        generate_leaper_moves_into(&board, &from, &piece, 1, 2, MoveGenType::All, &mut moves);
 
         // Knight has 8 possible moves from center
         assert_eq!(moves.len(), 8, "Knight should have 8 moves from (4,4)");
@@ -3613,7 +3391,7 @@ mod tests {
         let piece = Piece::new(PieceType::King, PlayerColor::White);
 
         let mut moves = MoveList::new();
-        generate_compass_moves_into(&board, &from, &piece, 1, &mut moves);
+        generate_compass_moves_into(&board, &from, &piece, 1, MoveGenType::All, &mut moves);
 
         // King has 8 possible moves from center
         assert_eq!(moves.len(), 8, "King should have 8 moves from (4,4)");
@@ -3628,7 +3406,7 @@ mod tests {
         let piece = Piece::new(PieceType::Camel, PlayerColor::White);
 
         let mut moves = MoveList::new();
-        generate_leaper_moves_into(&board, &from, &piece, 1, 3, &mut moves);
+        generate_leaper_moves_into(&board, &from, &piece, 1, 3, MoveGenType::All, &mut moves);
 
         // Camel leaps (1,3) - 8 squares
         assert_eq!(moves.len(), 8, "Camel should have 8 moves from (4,4)");
@@ -3649,7 +3427,7 @@ mod tests {
         let piece = Piece::new(PieceType::Zebra, PlayerColor::White);
 
         let mut moves = MoveList::new();
-        generate_leaper_moves_into(&board, &from, &piece, 2, 3, &mut moves);
+        generate_leaper_moves_into(&board, &from, &piece, 2, 3, MoveGenType::All, &mut moves);
 
         // Zebra leaps (2,3) - 8 squares
         assert_eq!(moves.len(), 8, "Zebra should have 8 moves from (4,4)");
@@ -3669,7 +3447,7 @@ mod tests {
         let piece = Piece::new(PieceType::Knight, PlayerColor::White);
 
         let mut moves = MoveList::new();
-        generate_leaper_moves_into(&board, &from, &piece, 1, 2, &mut moves);
+        generate_leaper_moves_into(&board, &from, &piece, 1, 2, MoveGenType::All, &mut moves);
 
         assert_eq!(
             moves.len(),
@@ -3715,7 +3493,8 @@ mod tests {
         };
 
         let special = FxHashSet::default();
-        let moves = generate_pawn_moves(&board, &from, &piece, &special, &None, &rules);
+        let mut moves = MoveList::new();
+        generate_pawn_moves_into(&board, &from, &piece, &special, &None, &rules, &mut moves);
 
         assert!(moves.len() >= 2, "Pawn should have at least 2 moves");
         // Should include forward move and capture
@@ -3737,15 +3516,18 @@ mod tests {
         let indices = SpatialIndices::new(&board);
 
         let ortho = &[(1, 0), (-1, 0), (0, 1), (0, -1)];
-        let moves = generate_sliding_moves(&SlidingMoveContext {
-            board: &board,
-            from: &from,
-            piece: &piece,
-            directions: ortho,
-            indices: &indices,
-            fallback: true,
-            enemy_king_pos: None,
-        });
+        let mut moves = MoveList::new();
+        generate_sliding_moves_into(
+            &SlidingMoveContext {
+                board: &board,
+                from: &from,
+                piece: &piece,
+                directions: ortho,
+                indices: &indices,
+                enemy_king_pos: None,
+            },
+            &mut moves,
+        );
 
         // Rook on empty board should have many moves (limited by fallback)
         assert!(!moves.is_empty(), "Rook should have some moves");
@@ -3762,15 +3544,18 @@ mod tests {
         let indices = SpatialIndices::new(&board);
 
         let diag = &[(1, 1), (1, -1), (-1, 1), (-1, -1)];
-        let moves = generate_sliding_moves(&SlidingMoveContext {
-            board: &board,
-            from: &from,
-            piece: &piece,
-            directions: diag,
-            indices: &indices,
-            fallback: true,
-            enemy_king_pos: None,
-        });
+        let mut moves = MoveList::new();
+        generate_sliding_moves_into(
+            &SlidingMoveContext {
+                board: &board,
+                from: &from,
+                piece: &piece,
+                directions: diag,
+                indices: &indices,
+                enemy_king_pos: None,
+            },
+            &mut moves,
+        );
 
         assert!(!moves.is_empty(), "Bishop should have some moves");
     }
@@ -3874,42 +3659,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extend_captures_only() {
-        let mut board = Board::new();
-        board.set_piece(4, 4, Piece::new(PieceType::Knight, PlayerColor::White));
-        board.set_piece(5, 6, Piece::new(PieceType::Pawn, PlayerColor::Black)); // Capture target
-
-        let mut all_moves = MoveList::new();
-        let from = Coordinate::new(4, 4);
-        let piece = Piece::new(PieceType::Knight, PlayerColor::White);
-        generate_leaper_moves_into(&board, &from, &piece, 1, 2, &mut all_moves);
-
-        let mut captures_only = MoveList::new();
-        extend_captures_only(&board, PlayerColor::White, all_moves, &mut captures_only);
-
-        // Should have exactly 1 capture (the pawn at 5,6)
-        assert_eq!(captures_only.len(), 1);
-    }
-
-    #[test]
-    fn test_extend_quiets_only() {
-        let mut board = Board::new();
-        board.set_piece(4, 4, Piece::new(PieceType::Knight, PlayerColor::White));
-        board.set_piece(5, 6, Piece::new(PieceType::Pawn, PlayerColor::Black)); // Capture target
-
-        let mut all_moves = MoveList::new();
-        let from = Coordinate::new(4, 4);
-        let piece = Piece::new(PieceType::Knight, PlayerColor::White);
-        generate_leaper_moves_into(&board, &from, &piece, 1, 2, &mut all_moves);
-
-        let mut quiets_only = MoveList::new();
-        extend_quiets_only(&board, all_moves, &mut quiets_only);
-
-        // Should have 7 quiet moves (8 total - 1 capture)
-        assert_eq!(quiets_only.len(), 7);
-    }
-
-    #[test]
     fn test_generate_compass_moves() {
         let mut board = Board::new();
         board.set_piece(4, 4, Piece::new(PieceType::Hawk, PlayerColor::White));
@@ -3917,7 +3666,8 @@ mod tests {
         let from = Coordinate::new(4, 4);
         let piece = Piece::new(PieceType::Hawk, PlayerColor::White);
 
-        let moves = generate_compass_moves(&board, &from, &piece, 2);
+        let mut moves = MoveList::new();
+        generate_compass_moves_into(&board, &from, &piece, 2, MoveGenType::All, &mut moves);
 
         // Distance 2 compass should have 8 moves (4 ortho + 4 diag)
         assert_eq!(moves.len(), 8);
@@ -3972,7 +3722,8 @@ mod tests {
         let from = Coordinate::new(4, 4);
         let piece = Piece::new(PieceType::Rose, PlayerColor::White);
 
-        let moves = generate_rose_moves(&board, &from, &piece);
+        let mut moves = MoveList::new();
+        generate_rose_moves_into(&board, &from, &piece, MoveGenType::All, &mut moves);
 
         assert!(!moves.is_empty(), "Rose should have some moves");
     }
@@ -4044,7 +3795,7 @@ mod tests {
         let from = Coordinate::new(4, 4);
         let piece = Piece::new(PieceType::Rose, PlayerColor::White);
         let mut moves = MoveList::new();
-        generate_rose_moves_into(&board, &from, &piece, &mut moves);
+        generate_rose_moves_into(&board, &from, &piece, MoveGenType::All, &mut moves);
 
         // Should have moves (each of 16 spirals can go up to 7 hops, though many overlap)
         assert!(!moves.is_empty(), "Rose should have moves on empty board");
@@ -4070,7 +3821,7 @@ mod tests {
         let from = Coordinate::new(4, 4);
         let piece = Piece::new(PieceType::Rose, PlayerColor::White);
         let mut moves = MoveList::new();
-        generate_rose_moves_into(&board, &from, &piece, &mut moves);
+        generate_rose_moves_into(&board, &from, &piece, MoveGenType::All, &mut moves);
 
         // Should NOT have the blocked square as a move (friendly piece)
         let has_blocked_square = moves.iter().any(|m| m.to.x == 3 && m.to.y == 2);

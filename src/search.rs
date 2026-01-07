@@ -129,7 +129,7 @@ use params::{
 };
 
 mod tt;
-pub use tt::{TTEntry, TTFlag, TranspositionTable};
+pub use tt::{TTEntry, TTFlag, TTProbeParams, TTStoreParams, TranspositionTable};
 
 // Shared TT for Lazy SMP - uses SharedArrayBuffer from JavaScript
 // Shared TT for Lazy SMP - uses SharedArrayBuffer from JavaScript
@@ -342,6 +342,26 @@ pub struct SearcherHot {
     /// Tracks the minimum depth that must be completed before time stops are allowed.
     /// Set to 1 at search start, cleared to 0 after depth 1 completes.
     pub min_depth_required: usize,
+    /// Optimum time to use for this search (soft limit) - Stockfish-style
+    pub optimum_time_ms: u128,
+    /// Maximum time to use for this search (hard limit) - Stockfish-style
+    pub maximum_time_ms: u128,
+    /// Total best move changes (instability) persisted across iterations (Stockfish's totBestMoveChanges)
+    pub tot_best_move_changes: f64,
+    /// Best move changes IN THE CURRENT ITERATION (Stockfish's bestMoveChanges)
+    pub best_move_changes: f64,
+    /// Nodes spent on the current best move (first root move) in the current iteration (Stockfish move effort)
+    pub best_move_nodes: u64,
+    /// Running average score (Stockfish's bestPreviousAverageScore) - smoothed across iterations
+    pub best_previous_average_score: i32,
+    /// Running scores for falling eval (circular buffer of last 4 iterations)
+    pub iter_values: [i32; 4],
+    /// Index into iter_values circular buffer
+    pub iter_idx: usize,
+    /// Previous time reduction factor (for smoothing across iterations)
+    pub prev_time_reduction: f64,
+    /// Depth at which best move was last changed
+    pub last_best_move_depth: usize,
 }
 
 impl Default for Timer {
@@ -353,15 +373,10 @@ impl Default for Timer {
 impl Timer {
     pub fn new() -> Self {
         #[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
-        {
-            Self { start: now_ms() }
-        }
+        let start = now_ms();
         #[cfg(any(not(target_arch = "wasm32"), target_os = "wasi"))]
-        {
-            Self {
-                start: Instant::now(),
-            }
-        }
+        let start = Instant::now();
+        Timer { start }
     }
 
     pub fn reset(&mut self) {
@@ -384,6 +399,38 @@ impl Timer {
         {
             self.start.elapsed().as_millis()
         }
+    }
+}
+
+impl SearcherHot {
+    /// Calculate optimum and maximum time.
+    ///
+    /// The engine typically receives an allocated slice of time (from lib.rs effective_time_limit_ms).
+    /// We treat `time_ms` as our budget for this move:
+    /// - `maximum_time_ms`: The hard limit (budget minus safety buffer)
+    /// - `optimum_time_ms`: Target time (75% of maximum) - extensions can push us toward maximum
+    ///
+    /// The dynamic factors (fallingEval, etc.) can extend optimum by up to ~2x, capped at maximum.
+    pub fn init_time_management(&mut self, time_ms: u128, _ply: usize) {
+        if time_ms == u128::MAX {
+            self.optimum_time_ms = u128::MAX;
+            self.maximum_time_ms = u128::MAX;
+            return;
+        }
+
+        // Safety buffer to prevent communication latency flag falls.
+        // Scale buffer based on time: 2% of time, min 5ms, max 100ms
+        let safety_buffer = ((time_ms as f64 * 0.02) as u128).clamp(5, 100);
+
+        self.maximum_time_ms = time_ms.saturating_sub(safety_buffer).max(1);
+
+        // Optimum time target: aim for 75% of the available slot.
+        // The dynamic scaling factors (fallingEval up to 1.7x, instability up to ~1.5x)
+        // can extend this toward maximum when needed.
+        self.optimum_time_ms = (self.maximum_time_ms as f64 * 0.75) as u128;
+
+        // Ensure optimum is at least something reasonable
+        self.optimum_time_ms = self.optimum_time_ms.max(1).min(self.maximum_time_ms);
     }
 }
 
@@ -552,10 +599,15 @@ pub struct Searcher {
     /// Used to adjust depth based on prior search decisions.
     pub reduction_stack: Vec<i32>,
 
+    /// Cutoff count per ply.
+    /// Tracks number of beta cutoffs at each ply.
+    /// Used to increase LMR when next ply has many fail highs.
+    pub cutoff_cnt: Vec<u8>,
+
     /// Dynamic move rule limit (e.g. 100 for 50-move rule)
     pub move_rule_limit: i32,
 
-    /// Low Ply History (Stockfish-style): [ply][move_hash] -> score
+    /// Low Ply History: [ply][move_hash] -> score
     /// Tracks which moves were successful at low plies (first 4 from root).
     /// Used to boost ordering for moves that worked well near root.
     pub low_ply_history: Box<[[i32; LOW_PLY_HISTORY_ENTRIES]; LOW_PLY_HISTORY_SIZE]>,
@@ -585,6 +637,16 @@ impl Searcher {
                 stopped: false,
                 seldepth: 0,
                 min_depth_required: 1, // Must complete at least depth 1
+                optimum_time_ms: 0,
+                maximum_time_ms: 0,
+                tot_best_move_changes: 0.0,
+                best_move_changes: 0.0,
+                best_move_nodes: 0,
+                best_previous_average_score: 0,
+                iter_values: [0; 4],
+                iter_idx: 0,
+                prev_time_reduction: 1.0,
+                last_best_move_depth: 0,
             },
             tt: TranspositionTable::new(16),
             pv_table,
@@ -611,7 +673,8 @@ impl Searcher {
             lastmove_corrhist: Box::new([0i32; LASTMOVE_CORRHIST_SIZE]),
             tt_move_history: 0,
             reduction_stack: vec![0; MAX_PLY],
-            move_rule_limit: 100, // Default, will be updated from GameState
+            cutoff_cnt: vec![0; MAX_PLY + 2], // +2 for (ply+2) access pattern
+            move_rule_limit: 100,             // Default, will be updated from GameState
             low_ply_history: Box::new([[0i32; LOW_PLY_HISTORY_ENTRIES]; LOW_PLY_HISTORY_SIZE]),
         }
     }
@@ -667,6 +730,16 @@ impl Searcher {
         // Reset search control
         self.hot.min_depth_required = 1;
 
+        // Reset time management variables
+        self.hot.tot_best_move_changes = 0.0;
+        self.hot.best_move_changes = 0.0;
+        self.hot.best_move_nodes = 0;
+        self.hot.best_previous_average_score = 0;
+        self.hot.iter_values.fill(0);
+        self.hot.iter_idx = 0;
+        self.hot.prev_time_reduction = 1.0;
+        self.hot.last_best_move_depth = 0;
+
         // Reset iterative deepening state
         self.prev_score = 0;
         self.best_move_root = None;
@@ -680,7 +753,7 @@ impl Searcher {
         // Reset TT move history - hits on the old TT are no longer relevant
         self.tt_move_history = 0;
 
-        // Stockfish: Fill lowPlyHistory with 97 at the start of iterative deepening
+        // Fill lowPlyHistory with 97 at the start of iterative deepening
         // (not 0, to give a small positive bias to moves that haven't been seen)
         for row in self.low_ply_history.iter_mut() {
             row.fill(97);
@@ -761,7 +834,7 @@ impl Searcher {
         *entry += clamped - *entry * clamped.abs() / max_h;
     }
 
-    /// Update low ply history (Stockfish-style) for moves that caused beta cutoff at low plies.
+    /// Update low ply history for moves that caused beta cutoff at low plies.
     /// Only updates for ply < LOW_PLY_HISTORY_SIZE (first 4 plies from root).
     #[inline]
     pub fn update_low_ply_history(&mut self, ply: usize, move_hash: usize, bonus: i32) {
@@ -786,8 +859,29 @@ impl Searcher {
             return false;
         }
 
-        if self.hot.nodes & 8191 == 0 && self.hot.timer.elapsed_ms() >= self.hot.time_limit_ms {
-            self.hot.stopped = true;
+        if self.hot.nodes & 8191 == 0 {
+            let elapsed = self.hot.timer.elapsed_ms();
+            let limit = if self.hot.maximum_time_ms > 0 {
+                self.hot.maximum_time_ms
+            } else {
+                self.hot.time_limit_ms
+            };
+
+            if elapsed >= limit {
+                self.hot.stopped = true;
+                return true;
+            }
+
+            // Proactive Safety Stop:
+            // Only trigger if we're very close to the limit and NPS is slow.
+            // This is a last-resort safety, not a regular termination condition.
+            if self.hot.nodes > 8192 {
+                let time_to_next_check = (8192.0 * elapsed as f64) / self.hot.nodes as f64;
+                // Only stop if we literally cannot reach the next check in time.
+                if (elapsed as f64 + time_to_next_check) > limit as f64 {
+                    self.hot.stopped = true;
+                }
+            }
         }
         self.hot.stopped
     }
@@ -1052,14 +1146,21 @@ fn search_with_searcher(
 
     let mut best_move: Option<Move> = fallback_move; // Already cloned above
     let mut best_score = -INFINITY;
-    let mut stability: usize = 0;
-    let mut prev_iter_score: i32 = 0;
-    let mut has_prev_iter_score = false;
     let mut prev_root_move_coords: Option<(i64, i64, i64, i64)> = None;
+
+    // Initialize time management
+    // For now, use ply=0 as this is the root search
+    searcher
+        .hot
+        .init_time_management(searcher.hot.time_limit_ms, 0);
 
     // Iterative deepening with aspiration windows
     for depth in 1..=max_depth {
         searcher.reset_for_iteration();
+
+        // Age out PV variability metric at START of each iteration
+        // Note: Decay the PERSISTED tot, not the per-iteration changes.
+        searcher.hot.tot_best_move_changes /= 2.0;
 
         // Time check at start of each iteration - but always complete depth 1
         if searcher.hot.min_depth_required == 0
@@ -1136,13 +1237,11 @@ fn search_with_searcher(
 
             let coords = (pv_move.from.x, pv_move.from.y, pv_move.to.x, pv_move.to.y);
             if let Some(prev_coords) = prev_root_move_coords {
-                if prev_coords == coords {
-                    stability += 1;
-                } else {
-                    stability = 0;
+                // Track best move changes for instability calculation
+                if prev_coords != coords {
+                    searcher.hot.best_move_changes += 1.0;
+                    searcher.hot.last_best_move_depth = depth;
                 }
-            } else {
-                stability = 0;
             }
             prev_root_move_coords = Some(coords);
         }
@@ -1156,53 +1255,72 @@ fn search_with_searcher(
             break;
         }
 
-        // If we've used more than 50% of time, don't start another iteration
+        // Time Management Check
         if searcher.hot.time_limit_ms != u128::MAX {
-            let elapsed = searcher.hot.timer.elapsed_ms();
-            let limit = searcher.hot.time_limit_ms;
+            let elapsed = searcher.hot.timer.elapsed_ms() as f64;
 
-            if best_move.is_some() {
-                let mut factor = 1.1_f64 - 0.03_f64 * (stability as f64);
-                if factor < 0.5 {
-                    factor = 0.5;
-                }
+            // Step 1: Effort tracking (Situational awareness of nodes spent on best move)
+            let nodes_effort = (searcher.hot.best_move_nodes as f64 * 100000.0)
+                / (searcher.hot.nodes as f64).max(1.0);
+            let high_best_move_effort = if nodes_effort >= 93340.0 { 0.76 } else { 1.0 };
 
-                if has_prev_iter_score && best_score - prev_iter_score > aspiration_window() {
-                    factor *= 1.1;
-                }
+            // Step 2: Instability accumulation
+            // Accumulate current iteration's changes into persisted tot_best_move_changes
+            searcher.hot.tot_best_move_changes += searcher.hot.best_move_changes;
+            searcher.hot.best_move_changes = 0.0;
 
-                if factor > 1.0 {
-                    factor = 1.0;
-                }
+            // fallingEval: increase time when score is dropping
+            let iter_val = searcher.hot.iter_values[searcher.hot.iter_idx];
+            let prev_avg = searcher.hot.best_previous_average_score;
+            let falling_eval = (11.85
+                + 2.24 * (prev_avg - best_score) as f64
+                + 0.93 * (iter_val - best_score) as f64)
+                / 100.0;
+            let falling_eval = falling_eval.clamp(0.57, 1.70);
 
-                let ideal_ms = (limit as f64 * factor) as u128;
-                let soft_limit = std::cmp::min(limit, ideal_ms);
+            // timeReduction: decrease time when best move is stable
+            let k = 0.51;
+            let center = (searcher.hot.last_best_move_depth as f64) + 12.15;
+            let time_reduction = 0.66 + 0.85 / (0.98 + (-k * (depth as f64 - center)).exp());
 
-                if elapsed >= soft_limit {
-                    break;
-                }
+            let reduction = (1.43 + searcher.hot.prev_time_reduction) / (2.28 * time_reduction);
 
-                prev_iter_score = best_score;
-                has_prev_iter_score = true;
-            }
+            // bestMoveInstability: increase time when best move keeps changing
+            // CAP at 2.5 to prevent runaway time extensions
+            let instability = (1.02 + 2.14 * searcher.hot.tot_best_move_changes).min(2.5);
 
-            let cutoff = if limit <= 300 {
-                // Very short thinks: keep ~50% heuristic
-                limit / 2
-            } else if limit <= 2000 {
-                // Short blitz: leave ~250ms safety buffer
-                limit.saturating_sub(250)
-            } else if limit <= 8000 {
-                // Rapid-ish: leave ~500ms safety buffer (e.g. 4s -> 3.5s)
-                limit.saturating_sub(500)
+            // Total time calculation
+            // Clamp the total factors to prevent wild swings
+            let total_factors =
+                (falling_eval * reduction * instability * high_best_move_effort).clamp(0.5, 2.5);
+            let total_time = searcher.hot.optimum_time_ms as f64 * total_factors;
+
+            // Single legal move: cap time for better UX
+            let total_time = if legal_moves.len() == 1 {
+                total_time.min(502.0)
             } else {
-                // Long thinks: use almost all allotted time but keep a small buffer
-                limit.saturating_sub(2000)
+                total_time
             };
 
-            if elapsed >= cutoff {
+            // Soft limit check with maximum time constraint
+            if elapsed > total_time.min(searcher.hot.maximum_time_ms as f64) {
+                searcher.hot.stopped = true;
                 break;
             }
+
+            // Update iter_values circular buffer AFTER the time check
+            searcher.hot.iter_values[searcher.hot.iter_idx] = best_score;
+            searcher.hot.iter_idx = (searcher.hot.iter_idx + 1) & 3;
+
+            // Update running average score
+            if searcher.hot.best_previous_average_score == 0 {
+                searcher.hot.best_previous_average_score = best_score;
+            } else {
+                searcher.hot.best_previous_average_score =
+                    (best_score + searcher.hot.best_previous_average_score) / 2;
+            }
+
+            searcher.hot.prev_time_reduction = time_reduction;
         }
     }
 
@@ -1236,7 +1354,7 @@ pub fn get_best_move_threaded(
     // Initialize correction history hashes
     game.recompute_correction_hashes();
 
-    // Use persistent global searcher (Stockfish pattern)
+    // Use persistent global searcher
     GLOBAL_SEARCHER.with(|cell| {
         let mut opt = cell.borrow_mut();
 
@@ -1696,7 +1814,7 @@ fn negamax_root(
     let mut best_move: Option<Move> = None;
     let mut legal_moves = 0;
 
-    for m in moves {
+    for (move_idx, m) in moves.iter().enumerate() {
         // Skip excluded moves (for MultiPV subsequent passes)
         if !searcher.excluded_moves.is_empty() {
             let coords = (m.from.x, m.from.y, m.to.x, m.to.y);
@@ -1704,6 +1822,8 @@ fn negamax_root(
                 continue;
             }
         }
+
+        let nodes_before_move = searcher.hot.nodes;
 
         // Note: All threads search all moves. Thread variation comes from:
         // 1. Shared TT - threads benefit from each other's entries
@@ -1773,6 +1893,11 @@ fn negamax_root(
             best_score = score;
             best_move = Some(*m);
 
+            // If a new best move is found after the first move, it's instability
+            if legal_moves > 1 {
+                searcher.hot.best_move_changes += 1.0;
+            }
+
             if score > alpha {
                 alpha = score;
 
@@ -1790,6 +1915,13 @@ fn negamax_root(
 
         if alpha >= beta {
             break;
+        }
+
+        // Track nodes spent on this move (effort)
+        // If this is the current first move in the list (most likely the best move),
+        // track its effort for time management.
+        if move_idx == 0 {
+            searcher.hot.best_move_nodes = searcher.hot.nodes - nodes_before_move;
         }
     }
 
@@ -1864,6 +1996,11 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
     searcher.hot.nodes += 1;
     searcher.pv_length[ply] = 0;
 
+    // Initialize cutoff count for grandchild ply
+    if ply + 2 < MAX_PLY {
+        searcher.cutoff_cnt[ply + 2] = 0;
+    }
+
     // Time management and selective depth tracking
     if searcher.check_time() {
         return 0;
@@ -1908,6 +2045,7 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
     let hash = TranspositionTable::generate_hash(game);
     let mut tt_move: Option<Move> = None;
     let mut tt_value: Option<i32> = None;
+    let mut tt_depth: u8 = 0; // For TT move extension
 
     // Stockfish passes rule50_count (halfmove_clock) directly to value_from_tt
     let rule50_count = game.halfmove_clock;
@@ -1925,8 +2063,12 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
     ) {
         tt_move = best;
         tt_value = Some(score);
+        // Get TT depth for qsearch extension decision
+        if let Some((_, d, _, _)) = searcher.tt.probe_for_singular(hash, ply) {
+            tt_depth = d;
+        }
         // In non-PV nodes, use TT cutoff if valid score returned
-        // Stockfish's "graph history interaction" workaround:
+        // "graph history interaction" workaround:
         // - Don't produce TT cutoffs when rule50 is high (>= 96)
         // - Don't produce TT cutoffs when position has repetition history
         // - Don't cutoff on mate scores (they need full verification at each depth)
@@ -2106,8 +2248,14 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                 continue;
             }
 
+            // Fast legality check (skips is_move_illegal for non-pinned pieces)
+            let fast_legal = game.is_legal_fast(m, in_check);
+            if let Ok(false) = fast_legal {
+                continue;
+            }
+
             let undo = game.make_move(m);
-            if game.is_move_illegal() {
+            if fast_legal.is_err() && game.is_move_illegal() {
                 game.undo_move(m, undo);
                 continue;
             }
@@ -2238,7 +2386,6 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                     if see_value < -see_margin {
                         continue;
                     }
-                    // }
                 }
             } else {
                 // Quiet move pruning
@@ -2278,6 +2425,13 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
             }
         }
 
+        // Check legality BEFORE make_move (Pin Detection)
+        // returns Ok(true) if legal, Ok(false) if illegal, Err if unsure
+        let fast_legal = game.is_legal_fast(&m, in_check);
+        if let Ok(false) = fast_legal {
+            continue; // Definitely illegal (pinned piece moving off ray)
+        }
+
         // Prefetch TT entry for child position BEFORE making the move.
         // This warms the cache so the TT probe in the recursive call is faster.
         // Compute approximate child hash: toggle side + move piece from->to
@@ -2295,7 +2449,8 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
         let mut undo = game.make_move(&m);
 
         // Check if move is illegal (leaves our king in check)
-        if game.is_move_illegal() {
+        // Only check if fast check was inconclusive (Err)
+        if fast_legal.is_err() && game.is_move_illegal() {
             game.undo_move(&m, undo);
             continue;
         }
@@ -2320,11 +2475,8 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
 
         legal_moves += 1;
 
-        // Calculate per-move extension
-        // Stockfish-style Singular Extension + Multi-Cut:
-        // When we're about to search the TT move at sufficient depth, first verify
-        // it's truly singular by doing a reduced search excluding it.
-        let mut extension: usize = 0;
+        // Calculate per-move extension (can be negative for negative extensions)
+        let mut extension: i32 = 0;
 
         let is_tt_move = tt_move
             .filter(|tt_m| m.from == tt_m.from && m.to == tt_m.to && m.promotion == tt_m.promotion)
@@ -2357,8 +2509,14 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                     break;
                 }
 
+                // Fast legality check (skips is_move_illegal for non-pinned pieces)
+                let fast_legal = game.is_legal_fast(&se_m, in_check);
+                if let Ok(false) = fast_legal {
+                    continue;
+                }
+
                 let se_undo = game.make_move(&se_m);
-                if game.is_move_illegal() {
+                if fast_legal.is_err() && game.is_move_illegal() {
                     game.undo_move(&se_m, se_undo);
                     continue;
                 }
@@ -2379,6 +2537,10 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                 game.undo_move(&se_m, se_undo);
 
                 if searcher.hot.stopped {
+                    // Restore searcher state before returning
+                    searcher.prev_move_stack[ply] = prev_entry_backup;
+                    searcher.move_history[ply] = move_history_backup;
+                    searcher.moved_piece_history[ply] = piece_history_backup;
                     return 0;
                 }
 
@@ -2398,19 +2560,38 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
             undo = new_undo;
 
             if se_best < singular_beta {
-                // TT move is singular - extend it
+                // TT move is singular - calculate extension level
+                // Double extension margin: how much below singular_beta for +2 extension
+                let double_margin = (depth as i32) * 2;
+                // Triple extension margin: how much below for +3 extension
+                let triple_margin = (depth as i32) * 4;
+
                 extension = 1;
+                if se_best < singular_beta - double_margin {
+                    extension = 2;
+                }
+                if se_best < singular_beta - triple_margin && is_pv {
+                    extension = 3;
+                }
             } else if se_best >= beta && !is_pv {
                 // Multi-cut: alternatives also beat beta, prune the whole subtree
-                // Apply negative penalty to TT Move History - the TT move wasn't truly singular
-                // Stockfish uses: max(-400 - 100 * depth, -4000)
                 let penalty = (-400 - 100 * depth as i32).max(-4000);
                 let max_tt_hist = 8192;
                 searcher.tt_move_history +=
                     penalty - searcher.tt_move_history * penalty.abs() / max_tt_hist;
 
                 game.undo_move(&m, undo);
+                searcher.prev_move_stack[ply] = prev_entry_backup;
+                searcher.move_history[ply] = move_history_backup;
+                searcher.moved_piece_history[ply] = piece_history_backup;
                 return beta;
+            } else if tt_value.is_some_and(|v| v >= beta) {
+                // Negative extension: TT move is assumed to fail high but wasn't singular
+                // Reduce depth to favor other moves
+                extension = -3;
+            } else if cut_node {
+                // On cut nodes, if TT move isn't assumed to fail high, reduce it
+                extension = -2;
             }
         }
 
@@ -2426,10 +2607,12 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                 NodeType::Cut
             };
             // Full window search for first legal move
+            // Calculate new depth: base depth - 1 + extension (extension can be negative)
+            let new_depth = ((depth as i32) - 1 + extension).max(0) as usize;
             score = -negamax(&mut NegamaxContext {
                 searcher,
                 game,
-                depth: depth - 1 + extension,
+                depth: new_depth,
                 ply: ply + 1,
                 alpha: -beta,
                 beta: -alpha,
@@ -2465,6 +2648,15 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                     reduction -= 1;
                 }
 
+                // Increase reduction if next ply has a lot of fail highs
+                // We use a simpler version: add 1 to reduction when many cutoffs
+                if ply + 1 < MAX_PLY && searcher.cutoff_cnt[ply + 1] > 2 {
+                    reduction += 1;
+                    if all_node {
+                        reduction += 1;
+                    }
+                }
+
                 // TT Move History adjustment:
                 // If TT moves have been unreliable (low tt_move_history), reduce less
                 // since the move ordering from TT may not be trustworthy.
@@ -2473,19 +2665,12 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                     reduction -= 1;
                 }
 
-                // Reduce less for forking piece checks (high tactical importance)
-                // if reduction > 0
-                //     && (gives_check && (p_type == PieceType::Queen || p_type == PieceType::Amazon))
-                // {
-                //     reduction -= 1;
-                // }
-
                 // Ensure reduction stays in valid range [0, depth-2]
                 reduction = reduction.clamp(0, (depth as i32) - 2);
             }
 
             // Base child depth after LMR (with singular extension if applicable)
-            let mut new_depth = depth as i32 - 1 + extension as i32 - reduction;
+            let mut new_depth = (depth as i32) - 1 + extension - reduction;
 
             // History Leaf Pruning (Fruit-style)
             // Only in non-PV, quiet, shallow nodes and after enough moves
@@ -2510,6 +2695,10 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                     // and history is really bad, prune this move entirely.
                     if new_depth <= 0 && value < hlp_history_leaf() {
                         game.undo_move(&m, undo);
+                        // Restore searcher state before continuing
+                        searcher.prev_move_stack[ply] = prev_entry_backup;
+                        searcher.move_history[ply] = move_history_backup;
+                        searcher.moved_piece_history[ply] = piece_history_backup;
                         continue;
                     }
                 }
@@ -2550,10 +2739,37 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
             if s > alpha && (reduction > 0 || s < beta) {
                 // Re-search with PV-like search if we're in PV, otherwise same child type
                 let research_type = if is_pv { NodeType::PV } else { child_type };
+
+                // LMR deeper/shallower re-search depth adjustment
+                // If reduced search returned good value, search deeper
+                // If it returned bad value, search shallower
+                let base_depth = (depth as i32) - 1 + extension;
+                let do_deeper_search =
+                    (search_depth as i32) < base_depth && s > (best_score + 43 + 2 * base_depth);
+                let do_shallower_search = s < best_score + 9;
+                let adjusted_depth = (base_depth + (do_deeper_search as i32)
+                    - (do_shallower_search as i32))
+                    .max(0) as usize;
+
+                // TT move extension: prevent dropping to qsearch if TT has decisive/deep info
+                // For PV nodes with the TT move, if about to go to qsearch and:
+                // - TT has mate score with depth > 0, OR
+                // - TT depth > 1
+                // then ensure minimum depth of 1
+                let mut pv_depth = adjusted_depth;
+                if is_pv && is_tt_move && pv_depth == 0 {
+                    let has_decisive =
+                        tt_value.is_some_and(|v| v.abs() > MATE_SCORE) && tt_depth > 0;
+                    let has_deep_tt = tt_depth > 1;
+                    if has_decisive || has_deep_tt {
+                        pv_depth = 1;
+                    }
+                }
+
                 s = -negamax(&mut NegamaxContext {
                     searcher,
                     game,
-                    depth: depth - 1 + extension,
+                    depth: pv_depth,
                     ply: ply + 1,
                     alpha: -beta,
                     beta: -alpha,
@@ -2629,10 +2845,23 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                     searcher.pv_table[ply_base + 1 + j] = searcher.pv_table[child_base + j];
                 }
                 searcher.pv_length[ply] = child_len + 1;
+
+                // Depth reduction on alpha improvement
+                // Reduce depth for remaining moves after finding a score improvement.
+                // Balanced by hindsight depth adjustments and LMR deeper/shallower.
+                //     if depth > 2 && depth < 14 && score.abs() < MATE_SCORE {
+                //         depth -= 2;
+                //     }
             }
         }
 
         if alpha >= beta {
+            // Increment cutoff count
+            // We increment for low-extension cutoffs or PV nodes
+            if (extension < 2 || is_pv) && ply < MAX_PLY {
+                searcher.cutoff_cnt[ply] = searcher.cutoff_cnt[ply].saturating_add(1);
+            }
+
             if !is_capture {
                 // History bonus for quiet cutoff move, with maluses for previously searched quiets
                 let idx = hash_move_dest(&m);
@@ -2896,10 +3125,9 @@ fn quiescence(
     const DELTA_MARGIN: i32 = 200;
 
     for m in &tactical_moves {
-        // SEE-based pruning and delta pruning for captures when not in check.
-        // static_exchange_eval returns 0 for non-captures or special cases
-        // (e.g. en passant target squares), so it is safe to call unconditionally.
+        // Filter: If not in check, apply SEE and delta pruning
         if !in_check {
+            // See gain for the capture/promotion
             let see_gain = static_exchange_eval(game, m);
 
             // Prune clearly losing captures that don't even break even materially.
@@ -2914,9 +3142,15 @@ fn quiescence(
             }
         }
 
+        // Fast legality check (skips is_move_illegal for non-pinned pieces)
+        let fast_legal = game.is_legal_fast(m, in_check);
+        if let Ok(false) = fast_legal {
+            continue;
+        }
+
         let undo = game.make_move(m);
 
-        if game.is_move_illegal() {
+        if fast_legal.is_err() && game.is_move_illegal() {
             game.undo_move(m, undo);
             continue;
         }

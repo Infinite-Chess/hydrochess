@@ -114,6 +114,23 @@ pub fn get_piece_value(piece_type: PieceType) -> i32 {
     }
 }
 
+pub fn get_centrality_weight(piece_type: PieceType) -> i64 {
+    match piece_type {
+        PieceType::King => 2000,
+        PieceType::Queen | PieceType::RoyalQueen | PieceType::Amazon => 1000,
+        PieceType::Rook | PieceType::Chancellor => 500,
+        PieceType::Bishop | PieceType::Archbishop => 300,
+        PieceType::Knight | PieceType::Centaur | PieceType::RoyalCentaur => 300,
+        PieceType::Camel | PieceType::Giraffe | PieceType::Zebra => 300,
+        PieceType::Knightrider => 400,
+        PieceType::Hawk => 350,
+        PieceType::Rose => 350,
+        PieceType::Guard | PieceType::Huygen => 250,
+        // Pawns and others have 0 weight for "Piece Cloud" centrality
+        _ => 0,
+    }
+}
+
 // Rook heuristics
 // Slightly increased based on Texel tuning (optimum around ~37), but kept
 // moderate so rooks are encouraged to activate without over-penalizing
@@ -131,7 +148,6 @@ const SLIDER_NET_BONUS: i32 = 20;
 // Open rays are extremely dangerous on infinite boards - sliders can attack from anywhere.
 const KING_RING_MISSING_PENALTY: i32 = 45;
 const KING_OPEN_RAY_PENALTY: i32 = 30; // Open rays are very dangerous on infinite boards
-const KING_ENEMY_SLIDER_PENALTY: i32 = 65; // Per Texel tuning suggestions
 
 // King pawn shield heuristics
 // Reward having pawns in front of the king and penalize the king walking
@@ -151,6 +167,11 @@ const PIECE_CLOUD_CHEB_RADIUS: i64 = 16;
 const SLIDER_AXIS_WIGGLE: i64 = 5; // A slider is "active" if its ray passes within 5 sq of center
 const PIECE_CLOUD_CHEB_MAX_EXCESS: i64 = 64;
 const CLOUD_PENALTY_PER_100_VALUE: i32 = 1;
+
+// Max distance a single piece can skew the cloud center from the reference point.
+// Prevents extreme outliers (e.g., a queen at 1e15) from dominating the weighted average.
+// Pieces beyond this distance have their position clamped for centroid calculation.
+const CLOUD_CENTER_MAX_SKEW_DIST: i64 = 16;
 
 // Connected pawns bonus
 const CONNECTED_PAWN_BONUS: i32 = 8;
@@ -214,25 +235,41 @@ const DEVELOPED_PHASE_ATTACK_SCALE: i32 = 100;
 pub fn compute_cloud_center(board: &Board) -> Option<Coordinate> {
     let mut sum_x: i64 = 0;
     let mut sum_y: i64 = 0;
-    let mut count: i64 = 0;
+    let mut total_weight: i64 = 0;
 
-    // BITBOARD: O(1) per tile summation using bitwise helpers
     for (cx, cy, tile) in board.tiles.iter() {
-        let bits = tile.occ_all & !tile.occ_void & !tile.occ_pawns;
+        let mut bits = tile.occ_all & !tile.occ_void & !tile.occ_pawns;
         if bits == 0 {
             continue;
         }
 
-        let n = bits.count_ones() as i64;
-        sum_x += n * cx * 8 + tile.sum_lx(bits) as i64;
-        sum_y += n * cy * 8 + tile.sum_ly(bits) as i64;
-        count += n;
+        while bits != 0 {
+            let idx = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+
+            let packed = tile.piece[idx];
+            // packed should not be 0 since bits came from occ_all
+            if packed == 0 {
+                continue;
+            }
+
+            let piece = crate::board::Piece::from_packed(packed);
+            let weight = get_centrality_weight(piece.piece_type());
+
+            if weight > 0 {
+                let x = cx * 8 + (idx % 8) as i64;
+                let y = cy * 8 + (idx / 8) as i64;
+                sum_x += weight * x;
+                sum_y += weight * y;
+                total_weight += weight;
+            }
+        }
     }
 
-    if count > 0 {
+    if total_weight > 0 {
         Some(Coordinate {
-            x: sum_x / count,
-            y: sum_y / count,
+            x: sum_x / total_weight,
+            y: sum_y / total_weight,
         })
     } else {
         None
@@ -445,6 +482,7 @@ fn evaluate_inner(game: &GameState) -> i32 {
         score += evaluate_pieces(game, &white_king, &black_king);
         score += evaluate_king_safety(game, &white_king, &black_king);
         score += evaluate_pawn_structure(game);
+        score += evaluate_threats(game);
     }
 
     // Return from current player's perspective
@@ -481,18 +519,56 @@ pub fn evaluate_pieces(
     let mut finite_count: i64 = 0;
     */
 
+    // Compute reference point for cloud center clamping (kings' midpoint or origin).
+    // This prevents distant pieces from heavily skewing the weighted average.
+    let ref_x: i64 = match (white_king, black_king) {
+        (Some(wk), Some(bk)) => (wk.x + bk.x) / 2,
+        (Some(wk), None) => wk.x,
+        (None, Some(bk)) => bk.x,
+        (None, None) => 0,
+    };
+    let ref_y: i64 = match (white_king, black_king) {
+        (Some(wk), Some(bk)) => (wk.y + bk.y) / 2,
+        (Some(wk), None) => wk.y,
+        (None, Some(bk)) => bk.y,
+        (None, None) => 0,
+    };
+
     for (cx, cy, tile) in game.board.tiles.iter() {
         // SIMD: Fast skip empty tiles using parallel zero check
         if crate::simd::both_zero(tile.occ_white, tile.occ_black) {
             continue;
         }
 
-        let cloud_bits = tile.occ_all & !tile.occ_void & !tile.occ_pawns;
-        if cloud_bits != 0 {
-            let n = cloud_bits.count_ones() as i64;
-            cloud_sum_x += n * cx * 8 + tile.sum_lx(cloud_bits) as i64;
-            cloud_sum_y += n * cy * 8 + tile.sum_ly(cloud_bits) as i64;
-            cloud_count += n;
+        let mut cloud_bits = tile.occ_all & !tile.occ_void & !tile.occ_pawns;
+        while cloud_bits != 0 {
+            let idx = cloud_bits.trailing_zeros() as usize;
+            cloud_bits &= cloud_bits - 1;
+
+            let packed = tile.piece[idx];
+            if packed == 0 {
+                continue;
+            }
+            let piece = crate::board::Piece::from_packed(packed);
+            let weight = get_centrality_weight(piece.piece_type());
+
+            if weight > 0 {
+                let raw_x = cx * 8 + (idx % 8) as i64;
+                let raw_y = cy * 8 + (idx / 8) as i64;
+
+                // Clamp position to prevent distant outliers from skewing center.
+                // Compute offset from reference, clamp to max distance, then add back.
+                let dx = raw_x - ref_x;
+                let dy = raw_y - ref_y;
+                let clamped_dx = dx.clamp(-CLOUD_CENTER_MAX_SKEW_DIST, CLOUD_CENTER_MAX_SKEW_DIST);
+                let clamped_dy = dy.clamp(-CLOUD_CENTER_MAX_SKEW_DIST, CLOUD_CENTER_MAX_SKEW_DIST);
+                let x = ref_x + clamped_dx;
+                let y = ref_y + clamped_dy;
+
+                cloud_sum_x += weight * x;
+                cloud_sum_y += weight * y;
+                cloud_count += weight;
+            }
         }
 
         /*
@@ -1142,8 +1218,8 @@ pub fn evaluate_bishop(
 }
 
 /// Evaluate all pawn-related positional terms in a single pass.
-/// Includes advancement bonuses, centering, promotability checks, and the endgame promotion bonus.
-/// The result is scaled based on game phase (non-pawn piece count).
+/// Includes advancement, doubled, passed, phalanx, connected pawns.
+/// Pawns past promotion rank ONLY get PAWN_PAST_PROMO_PENALTY - no other evaluation.
 #[inline(always)]
 fn evaluate_pawns(game: &GameState) -> (i32, bool, bool) {
     if game.white_pawn_count == 0 && game.black_pawn_count == 0 {
@@ -1558,8 +1634,10 @@ fn evaluate_king_shelter(game: &GameState, king: &Coordinate, color: PlayerColor
         safety -= excess * KING_EXPOSURE_PENALTY_PER_DIR;
     }
 
-    // 3. Enemy sliders attacking king zone
-    let mut enemy_slider_threats = 0;
+    // 3. Enemy sliders attacking king zone (with weighted penalties)
+    // Only counts sliders with actual line-of-sight to king - essential for infinite chess
+    let mut slider_threat_weight = 0i32;
+    let mut slider_threat_count = 0i32;
     for (cx, cy, tile) in game.board.tiles.iter() {
         let occ = if color == PlayerColor::White {
             tile.occ_black
@@ -1600,12 +1678,35 @@ fn evaluate_king_shelter(game: &GameState, king: &Coordinate, color: PlayerColor
             // Now use the O(log n) line-of-sight check via spatial indices
             let from = Coordinate { x, y };
             if is_clear_line_between_fast(&game.spatial_indices, &from, king) {
-                enemy_slider_threats += 1;
+                // Weight by piece type: Queen/Amazon > Rook/Chancellor > Bishop/Archbishop
+                let packed = tile.piece[idx];
+                let weight = if packed != 0 {
+                    let piece = crate::board::Piece::from_packed(packed);
+                    match piece.piece_type() {
+                        PieceType::Queen | PieceType::RoyalQueen | PieceType::Amazon => 4,
+                        PieceType::Rook | PieceType::Chancellor => 3,
+                        PieceType::Bishop | PieceType::Archbishop => 2,
+                        PieceType::Knightrider => 2,
+                        _ => 2,
+                    }
+                } else {
+                    2
+                };
+                slider_threat_weight += weight;
+                slider_threat_count += 1;
             }
         }
     }
-    safety -= enemy_slider_threats * KING_ENEMY_SLIDER_PENALTY;
-    bump_feat!(king_enemy_slider_penalty, -enemy_slider_threats);
+
+    // Non-linear penalty: multiple sliders attacking is exponentially worse
+    let base_penalty = slider_threat_weight * 15;
+    let coordination_bonus = if slider_threat_count >= 2 {
+        slider_threat_weight * 8
+    } else {
+        0
+    };
+    safety -= base_penalty + coordination_bonus;
+    bump_feat!(king_enemy_slider_penalty, -slider_threat_count);
 
     /*
     // 4. King virtual mobility: safe squares the king can move to
@@ -1694,61 +1795,40 @@ fn compute_pawn_structure(game: &GameState) -> i32 {
     let mut white_pawns: Vec<(i64, i64)> = Vec::new();
     let mut black_pawns: Vec<(i64, i64)> = Vec::new();
 
-    // Column masks for bitwise doubled pawn check
-    const COL_MASKS: [u64; 8] = [
-        0x0101010101010101,
-        0x0202020202020202,
-        0x0404040404040404,
-        0x0808080808080808,
-        0x1010101010101010,
-        0x2020202020202020,
-        0x4040404040404040,
-        0x8080808080808080,
-    ];
+    let w_promo = game.white_promo_rank;
+    let b_promo = game.black_promo_rank;
 
-    // BITBOARD: Use per-tile occ_pawns for faster collection and intra-tile doubled checks
+    // BITBOARD: Use per-tile occ_pawns - skip past-promo pawns for structure eval
     for (cx, cy, tile) in game.board.tiles.iter() {
-        let w_pawns = tile.occ_pawns & tile.occ_white;
-        let b_pawns = tile.occ_pawns & tile.occ_black;
+        let w_pawns_bits = tile.occ_pawns & tile.occ_white;
+        let b_pawns_bits = tile.occ_pawns & tile.occ_black;
+        let base_y = cy * 8;
 
-        if w_pawns != 0 {
-            // Intra-tile doubled pawn check
-            for mask in COL_MASKS {
-                let count = (w_pawns & mask).count_ones();
-                if count > 1 {
-                    score -= (count - 1) as i32 * DOUBLED_PAWN_PENALTY;
-                }
-                if count > 0 {
-                    white_pawn_files.push(cx * 8 + (mask.trailing_zeros() % 8) as i64);
-                }
-            }
-
-            // Collect for passed pawn check
-            let mut bits = w_pawns;
+        if w_pawns_bits != 0 {
+            let mut bits = w_pawns_bits;
             while bits != 0 {
                 let idx = bits.trailing_zeros() as usize;
                 bits &= bits - 1;
-                white_pawns.push((cx * 8 + (idx % 8) as i64, cy * 8 + (idx / 8) as i64));
+                let x = cx * 8 + (idx % 8) as i64;
+                let y = base_y + (idx / 8) as i64;
+                if y < w_promo {
+                    white_pawns.push((x, y));
+                    white_pawn_files.push(x);
+                }
             }
         }
 
-        if b_pawns != 0 {
-            // Same for black
-            for mask in COL_MASKS {
-                let count = (b_pawns & mask).count_ones();
-                if count > 1 {
-                    score += (count - 1) as i32 * DOUBLED_PAWN_PENALTY;
-                }
-                if count > 0 {
-                    black_pawn_files.push(cx * 8 + (mask.trailing_zeros() % 8) as i64);
-                }
-            }
-
-            let mut bits = b_pawns;
+        if b_pawns_bits != 0 {
+            let mut bits = b_pawns_bits;
             while bits != 0 {
                 let idx = bits.trailing_zeros() as usize;
                 bits &= bits - 1;
-                black_pawns.push((cx * 8 + (idx % 8) as i64, cy * 8 + (idx / 8) as i64));
+                let x = cx * 8 + (idx % 8) as i64;
+                let y = base_y + (idx / 8) as i64;
+                if y > b_promo {
+                    black_pawns.push((x, y));
+                    black_pawn_files.push(x);
+                }
             }
         }
     }
@@ -1819,6 +1899,103 @@ fn compute_pawn_structure(game: &GameState) -> i32 {
         // Connected pawn bonus: check if there's a friendly pawn diagonally behind
         if is_connected_pawn(game, *bx, *by, PlayerColor::Black) {
             score -= CONNECTED_PAWN_BONUS;
+        }
+    }
+
+    score
+}
+
+// ==================== Threat Evaluation ====================
+
+/// Evaluate threats: bonus for attacking higher-value pieces with lower-value pieces.
+/// Efficient on infinite boards - only checks direct attack squares for leapers (pawns, knights).
+fn evaluate_threats(game: &GameState) -> i32 {
+    let mut score: i32 = 0;
+
+    // Threat bonus constants (centipawns)
+    const PAWN_THREATENS_MINOR: i32 = 25;
+    const PAWN_THREATENS_ROOK: i32 = 40;
+    const PAWN_THREATENS_QUEEN: i32 = 60;
+    const MINOR_THREATENS_ROOK: i32 = 20;
+    const MINOR_THREATENS_QUEEN: i32 = 35;
+
+    const KNIGHT_OFFSETS: [(i64, i64); 8] = [
+        (2, 1),
+        (2, -1),
+        (-2, 1),
+        (-2, -1),
+        (1, 2),
+        (1, -2),
+        (-1, 2),
+        (-1, -2),
+    ];
+
+    for (cx, cy, tile) in game.board.tiles.iter() {
+        if crate::simd::both_zero(tile.occ_white, tile.occ_black) {
+            continue;
+        }
+
+        let mut bits = tile.occ_all;
+        while bits != 0 {
+            let idx = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+
+            let packed = tile.piece[idx];
+            if packed == 0 {
+                continue;
+            }
+            let piece = crate::board::Piece::from_packed(packed);
+            let pt = piece.piece_type();
+            let color = piece.color();
+            if color == PlayerColor::Neutral {
+                continue;
+            }
+
+            let x = cx * 8 + (idx % 8) as i64;
+            let y = cy * 8 + (idx / 8) as i64;
+
+            let sign = if color == PlayerColor::White { 1 } else { -1 };
+            let enemy = if color == PlayerColor::White {
+                PlayerColor::Black
+            } else {
+                PlayerColor::White
+            };
+
+            match pt {
+                PieceType::Pawn => {
+                    let dy = if color == PlayerColor::White { 1 } else { -1 };
+                    for dx in [-1i64, 1] {
+                        if let Some(target) = game.board.get_piece(x + dx, y + dy) {
+                            if target.color() == enemy {
+                                let tv = get_piece_value(target.piece_type());
+                                if tv >= 600 {
+                                    score += sign * PAWN_THREATENS_QUEEN;
+                                } else if tv >= 400 {
+                                    score += sign * PAWN_THREATENS_ROOK;
+                                } else if tv >= 200 {
+                                    score += sign * PAWN_THREATENS_MINOR;
+                                }
+                            }
+                        }
+                    }
+                }
+                PieceType::Knight | PieceType::Centaur | PieceType::RoyalCentaur => {
+                    for &(dx, dy) in &KNIGHT_OFFSETS {
+                        if let Some(target) = game.board.get_piece(x + dx, y + dy) {
+                            if target.color() == enemy {
+                                let tv = get_piece_value(target.piece_type());
+                                let mv = get_piece_value(pt);
+                                if tv >= 600 && mv < 600 {
+                                    score += sign * MINOR_THREATENS_QUEEN;
+                                } else if tv >= 400 && mv < 400 {
+                                    score += sign * MINOR_THREATENS_ROOK;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
