@@ -33,7 +33,7 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          # Increment the v.0.1.X version based on the run number
+          # Increment the v.1.0.X version based on the run number
           tag_name: v1.0.${{ github.run_number }}
           name: v1.0.${{ github.run_number }}
           draft: false
