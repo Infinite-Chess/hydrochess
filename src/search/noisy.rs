@@ -60,23 +60,27 @@ fn evaluate_with_noise(game: &GameState, noise_amp: i32) -> i32 {
 pub fn get_best_move_with_noise(
     game: &mut GameState,
     max_depth: usize,
-    time_limit_ms: u128,
+    opt_time_ms: u128,
+    max_time_ms: u128,
     noise_amp: i32,
     silent: bool,
+    is_soft_limit: bool,
 ) -> Option<(Move, i32, SearchStats)> {
     game.recompute_piece_counts();
     game.recompute_correction_hashes();
 
     if noise_amp <= 0 {
-        return super::get_best_move(game, max_depth, time_limit_ms, silent);
+        return super::get_best_move(game, max_depth, opt_time_ms, silent, is_soft_limit);
     }
 
     super::GLOBAL_SEARCHER.with(|cell| {
         let mut opt = cell.borrow_mut();
-        let searcher = opt.get_or_insert_with(|| super::Searcher::new(time_limit_ms));
+        let searcher = opt.get_or_insert_with(|| super::Searcher::new(max_time_ms));
 
         searcher.new_search();
-        searcher.hot.time_limit_ms = time_limit_ms;
+        searcher
+            .hot
+            .set_time_limits(opt_time_ms, max_time_ms, is_soft_limit);
         searcher.silent = silent;
         searcher.hot.timer.reset();
 
@@ -121,19 +125,33 @@ fn search_with_searcher_noisy(
 
     let mut best_move: Option<Move> = fallback_move;
     let mut best_score = -INFINITY;
-    let mut stability: usize = 0;
-    let mut prev_iter_score: i32 = 0;
-    let mut has_prev_iter_score = false;
     let mut prev_root_move_coords: Option<(i64, i64, i64, i64)> = None;
 
     for depth in 1..=max_depth {
         searcher.reset_for_iteration();
+        searcher.hot.iter_start_ms = searcher.hot.timer.elapsed_ms() as f64;
 
-        if searcher.hot.min_depth_required == 0
-            && searcher.hot.timer.elapsed_ms() >= searcher.hot.time_limit_ms
-        {
-            searcher.hot.stopped = true;
-            break;
+        // Time check at start of each iteration
+        if searcher.hot.min_depth_required == 0 && searcher.hot.time_limit_ms != u128::MAX {
+            let elapsed = searcher.hot.timer.elapsed_ms() as f64;
+
+            // Hard stop at maximum time
+            if elapsed >= searcher.hot.maximum_time_ms as f64 {
+                searcher.hot.stopped = true;
+                break;
+            }
+
+            // Proactive stop: don't start next depth if most budget spent
+            let proactive_threshold = if searcher.hot.is_soft_limit {
+                0.90
+            } else {
+                0.50
+            };
+            if searcher.hot.total_time_ms > 0.0
+                && elapsed > searcher.hot.total_time_ms * proactive_threshold
+            {
+                break;
+            }
         }
 
         let score = negamax_root_noisy(searcher, game, depth, -INFINITY, INFINITY, noise_amp);
@@ -153,13 +171,10 @@ fn search_with_searcher_noisy(
 
             let coords = (pv_move.from.x, pv_move.from.y, pv_move.to.x, pv_move.to.y);
             if let Some(prev_coords) = prev_root_move_coords {
-                if prev_coords == coords {
-                    stability += 1;
-                } else {
-                    stability = 0;
+                if prev_coords != coords {
+                    searcher.hot.best_move_changes += 1.0;
+                    searcher.hot.last_best_move_depth = depth;
                 }
-            } else {
-                stability = 0;
             }
             prev_root_move_coords = Some(coords);
         }
@@ -172,48 +187,77 @@ fn search_with_searcher_noisy(
             break;
         }
 
+        // Dynamic Time Management - Synchronized with search.rs
         if searcher.hot.time_limit_ms != u128::MAX {
-            let elapsed = searcher.hot.timer.elapsed_ms();
-            let limit = searcher.hot.time_limit_ms;
+            let elapsed = searcher.hot.timer.elapsed_ms() as f64;
 
-            if best_move.is_some() {
-                let mut factor = 1.1_f64 - 0.03_f64 * (stability as f64);
-                if factor < 0.5 {
-                    factor = 0.5;
-                }
-                if has_prev_iter_score
-                    && best_score - prev_iter_score > super::params::aspiration_max_window()
-                {
-                    factor *= 1.1;
-                }
-                if factor > 1.0 {
-                    factor = 1.0;
-                }
+            // Effort tracking: fraction of nodes spent on the best move
+            let nodes_effort = if searcher.hot.nodes > 0 {
+                (searcher.hot.best_move_nodes as f64 * 100000.0) / (searcher.hot.nodes as f64)
+            } else {
+                0.0
+            };
+            let high_best_move_effort = if nodes_effort >= 93340.0 { 0.76 } else { 1.0 };
 
-                let ideal_ms = (limit as f64 * factor) as u128;
-                let soft_limit = std::cmp::min(limit, ideal_ms);
+            // Accumulate instability changes from this iteration (similar to search.rs)
+            searcher.hot.tot_best_move_changes += searcher.hot.best_move_changes;
+            searcher.hot.best_move_changes = 0.0;
 
-                if elapsed >= soft_limit {
-                    break;
-                }
+            // fallingEval: spend more time when score is dropping
+            let iter_val = searcher.hot.iter_values[searcher.hot.iter_idx];
+            let prev_avg = searcher.hot.best_previous_average_score;
+            let falling_eval = (11.85
+                + 2.24 * (prev_avg - best_score) as f64
+                + 0.93 * (iter_val - best_score) as f64)
+                / 100.0;
+            let falling_eval = falling_eval.clamp(0.57, 1.70);
 
-                prev_iter_score = best_score;
-                has_prev_iter_score = true;
+            // timeReduction: spend less time when best move is stable
+            let k = 0.51;
+            let center = (searcher.hot.last_best_move_depth as f64) + 12.15;
+            let time_reduction = 0.66 + 0.85 / (0.98 + (-k * (depth as f64 - center)).exp());
+
+            let reduction = (1.43 + searcher.hot.prev_time_reduction) / (2.28 * time_reduction);
+
+            // bestMoveInstability: spend more time when best move keeps changing
+            let instability = (1.02 + 2.14 * searcher.hot.tot_best_move_changes).min(2.5);
+
+            // Calculate totalTime with all factors
+            let mut total_factors =
+                (falling_eval * reduction * instability * high_best_move_effort).clamp(0.5, 2.5);
+
+            // If it's a soft limit (like fixed time per move), we want to use
+            // nearly all of the time, not stop early to save time.
+            if searcher.hot.is_soft_limit {
+                total_factors = total_factors.max(0.98);
             }
 
-            let cutoff = if limit <= 300 {
-                limit / 2
-            } else if limit <= 2000 {
-                limit.saturating_sub(250)
-            } else if limit <= 8000 {
-                limit.saturating_sub(500)
-            } else {
-                limit.saturating_sub(2000)
-            };
+            let mut total_time = searcher.hot.optimum_time_ms as f64 * total_factors;
 
-            if elapsed >= cutoff {
+            // Cap for single legal move - assuming multi-move context for noisy
+            // (but we can keep it for consistency)
+            total_time = total_time.min(searcher.hot.maximum_time_ms as f64);
+
+            let effective_limit = total_time;
+            searcher.hot.total_time_ms = effective_limit;
+
+            if elapsed > effective_limit {
+                searcher.hot.stopped = true;
                 break;
             }
+
+            // Update iteration tracking
+            searcher.hot.iter_values[searcher.hot.iter_idx] = best_score;
+            searcher.hot.iter_idx = (searcher.hot.iter_idx + 1) & 3;
+
+            if searcher.hot.best_previous_average_score == 0 {
+                searcher.hot.best_previous_average_score = best_score;
+            } else {
+                searcher.hot.best_previous_average_score =
+                    (best_score + searcher.hot.best_previous_average_score) / 2;
+            }
+
+            searcher.hot.prev_time_reduction = time_reduction;
         }
     }
 
@@ -261,6 +305,10 @@ fn negamax_root_noisy(
     let mut best_score = -INFINITY;
     let mut best_move: Option<Move> = None;
     let mut legal_moves = 0;
+
+    if searcher.check_time() {
+        return 0;
+    }
 
     for m in &moves {
         if !searcher.excluded_moves.is_empty() {
@@ -412,6 +460,11 @@ fn negamax_noisy(ctx: &mut NegamaxNoisyContext) -> i32 {
 
     let in_check = game.is_in_check();
     searcher.hot.nodes += 1;
+
+    if searcher.check_time() {
+        return 0;
+    }
+
     searcher.pv_length[ply] = 0;
     searcher.killers[ply + 1][0] = None;
     searcher.killers[ply + 1][1] = None;
@@ -1262,7 +1315,7 @@ mod tests {
         assert!(!moves.is_empty(), "Should have legal moves");
 
         // Depth 2, sufficient time, some noise
-        let res = get_best_move_with_noise(&mut game, 2, 5000, 10, true);
+        let res = get_best_move_with_noise(&mut game, 2, 5000, 5000, 10, true, false);
         if res.is_none() {
             println!("Search returned None!");
         }

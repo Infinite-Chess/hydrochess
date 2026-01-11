@@ -78,12 +78,12 @@ pub struct GameRules {
     pub promotion_types: Option<Vec<PieceType>>, // Pre-converted promotion piece types (fast)
     pub promotions_allowed: Option<Vec<String>>, // Piece type codes (only for serialization)
     pub move_rule_limit: Option<u32>,            // 50-move rule limit in halfmoves (default 100)
-    /// Win condition for White: what Black must do to defeat White.
-    /// E.g., "checkmate" means Black must checkmate White to win.
+    /// Win condition for White: what White must do to beat Black.
+    /// E.g., "checkmate" means White must checkmate Black to win.
     #[serde(skip)]
     pub white_win_condition: WinCondition,
-    /// Win condition for Black: what White must do to defeat Black.
-    /// E.g., "allpiecescaptured" means White must capture all of Black's pieces to win.
+    /// Win condition for Black: what Black must do to beat White.
+    /// E.g., "allpiecescaptured" means Black must capture all of White's pieces to win.
     #[serde(skip)]
     pub black_win_condition: WinCondition,
 }
@@ -223,7 +223,7 @@ pub struct GameState {
     /// Material configuration hash for correction history.
     #[serde(skip)]
     pub material_hash: u64,
-    /// Stockfish-style repetition info: distance to previous occurrence of same position.
+    /// Repetition information: distance to previous occurrence of same position.
     /// 0 = no repetition, positive = distance to first occurrence, negative = threefold.
     /// Computed during make_move for O(1) is_repetition check.
     #[serde(skip)]
@@ -966,73 +966,104 @@ impl GameState {
         true
     }
 
-    /// Get blocking squares for non-linear checkers (Rose, etc.)
-    /// Returns a list of intermediate squares that can be blocked to stop the attack.
-    /// For Rose: finds the spiral path used to attack and returns intermediate squares.
+    /// Compute blocking squares for non-linear checkers (Rose).
     ///
-    /// This is the generalized equivalent of `is_on_check_ray` for pieces that don't
-    /// attack in straight lines.
+    /// Algorithm:
+    /// 1. Find ALL spiral paths that can reach the target offset
+    /// 2. For each path, check if it's currently blocked by any piece
+    /// 3. If blocked, skip that path
+    /// 4. Collect ALL intermediate squares from unblocked paths
+    /// 5. If 1 path: return all intermediates (any block works)
+    /// 6. If N paths: return intersection (must block all)
     fn get_nonlinear_blocking_squares(
         &self,
         checker_sq: &Coordinate,
         king_sq: &Coordinate,
         checker_type: PieceType,
-    ) -> arrayvec::ArrayVec<Coordinate, 8> {
+    ) -> arrayvec::ArrayVec<Coordinate, 64> {
         use crate::moves::ROSE_SPIRALS;
 
-        let mut blocking = arrayvec::ArrayVec::<Coordinate, 8>::new();
+        let mut result = arrayvec::ArrayVec::<Coordinate, 64>::new();
 
-        // Rose blocking squares: find the spiral path from checker to king
-        // and return the intermediate squares
-        // NOTE: Other non-linear piece types can be added here in the future
-        // with their own blocking square logic
-        if checker_type == PieceType::Rose {
-            // Find which spiral the Rose used to reach the king
-            let dx = king_sq.x - checker_sq.x;
-            let dy = king_sq.y - checker_sq.y;
+        if checker_type != PieceType::Rose {
+            return result;
+        }
 
-            // Search through all spirals to find one that matches
-            for spiral_dirs in &ROSE_SPIRALS {
-                for spiral in spiral_dirs {
-                    for (hop_idx, &(cum_dx, cum_dy)) in spiral.iter().enumerate() {
-                        if cum_dx == dx && cum_dy == dy {
-                            // Found the spiral path! Verify it's unblocked and collect
-                            // intermediate squares
-                            let mut valid = true;
-                            for (i, &(prev_dx, prev_dy)) in spiral.iter().take(hop_idx).enumerate()
-                            {
-                                let check_x = checker_sq.x + prev_dx;
-                                let check_y = checker_sq.y + prev_dy;
+        let dx = king_sq.x - checker_sq.x;
+        let dy = king_sq.y - checker_sq.y;
 
-                                // Check if this intermediate square is blocked
-                                if self.board.get_piece(check_x, check_y).is_some() {
-                                    // This path is blocked, try next spiral
-                                    valid = false;
-                                    break;
-                                }
+        // Collect all unblocked paths with their intermediate squares
+        // Each path is a list of (absolute) intermediate coordinates
+        let mut valid_paths: arrayvec::ArrayVec<arrayvec::ArrayVec<Coordinate, 8>, 16> =
+            arrayvec::ArrayVec::new();
 
-                                // Collect intermediate squares (excluding if i == hop_idx-1
-                                // since that's the one already covered, but we take(hop_idx))
-                                if i < hop_idx {
-                                    blocking.push(Coordinate::new(check_x, check_y));
-                                }
-                            }
-
-                            if valid && !blocking.is_empty() {
-                                return blocking;
-                            } else if valid {
-                                // Direct hit (hop 0), no blocking squares
-                                return blocking;
-                            }
-                            // Clear and try next spiral
-                            blocking.clear();
-                        }
+        // Search all 16 spirals (8 start directions × 2 rotations)
+        for spiral_dirs in &ROSE_SPIRALS {
+            for spiral in spiral_dirs {
+                // Find which hop reaches target offset (if any)
+                let mut target_hop: Option<usize> = None;
+                for (hop_idx, &(cum_dx, cum_dy)) in spiral.iter().enumerate() {
+                    if cum_dx == dx && cum_dy == dy {
+                        target_hop = Some(hop_idx);
+                        break;
                     }
+                }
+
+                let target_hop = match target_hop {
+                    Some(h) => h,
+                    None => continue,
+                };
+
+                // Collect intermediate squares and check if path is blocked
+                let mut path_blocked = false;
+                let mut intermediates = arrayvec::ArrayVec::<Coordinate, 8>::new();
+
+                for &(int_dx, int_dy) in spiral.iter().take(target_hop) {
+                    let sq = Coordinate::new(checker_sq.x + int_dx, checker_sq.y + int_dy);
+
+                    // Check if this intermediate square is occupied
+                    if self.board.get_piece(sq.x, sq.y).is_some() {
+                        path_blocked = true;
+                        break;
+                    }
+
+                    intermediates.push(sq);
+                }
+
+                if !path_blocked {
+                    valid_paths.push(intermediates);
                 }
             }
         }
 
-        blocking
+        // No unblocked paths - shouldn't happen if we're in check
+        if valid_paths.is_empty() {
+            return result;
+        }
+
+        // Single path: return ALL its intermediate squares
+        if valid_paths.len() == 1 {
+            for sq in &valid_paths[0] {
+                result.push(*sq);
+            }
+            return result;
+        }
+
+        // Multiple paths: return INTERSECTION of all paths
+        // Only squares common to all paths can block all attacks
+        if let Some((first, rest)) = valid_paths.split_first() {
+            for sq in first {
+                let on_all_paths = rest
+                    .iter()
+                    .all(|path| path.iter().any(|p| p.x == sq.x && p.y == sq.y));
+
+                if on_all_paths && result.len() < 64 {
+                    result.push(*sq);
+                }
+            }
+        }
+
+        result
     }
 
     /// Initialize starting_squares from the current board: all non-pawn,
@@ -1094,52 +1125,59 @@ impl GameState {
     /// the opponent wins by capturing pieces, not by giving checkmate, so checks
     /// don't need to be escaped (the king can be captured).
     ///
-    /// The logic: YOUR OWN win condition determines if YOU must escape check.
-    /// - Your win condition specifies what the opponent must do to beat you.
-    /// - If your win condition is Checkmate → opponent beats you via checkmate → you must escape
-    /// - If your win condition is capture-based → opponent beats you via capture → you don't need to escape
+    /// The logic: The OPPONENT's win condition determines if WE must escape check.
+    /// - white_win_condition = how White beats Black (what White must do to win)
+    /// - black_win_condition = how Black beats White (what Black must do to win)
+    /// - If White is to move: Black beats White via black_win_condition → if Checkmate, White must escape
+    /// - If Black is to move: White beats Black via white_win_condition → if Checkmate, Black must escape
     #[inline]
     pub fn must_escape_check(&self) -> bool {
-        // Our own win condition tells us how the opponent beats us
-        let our_win_condition = match self.turn {
-            PlayerColor::White => self.game_rules.white_win_condition,
-            PlayerColor::Black => self.game_rules.black_win_condition,
-            PlayerColor::Neutral => return true, // Safe default
+        // The OPPONENT's win condition tells us how they beat us
+        // If they beat us via checkmate, we must escape check
+        let opponent_win_condition = match self.turn {
+            PlayerColor::White => self.game_rules.black_win_condition, // How Black beats White
+            PlayerColor::Black => self.game_rules.white_win_condition, // How White beats Black
+            PlayerColor::Neutral => return true,                       // Safe default
         };
-        our_win_condition.requires_check_evasion()
+        opponent_win_condition.requires_check_evasion()
     }
 
     /// Returns true if the given color's king can be captured (no check evasion needed).
     /// This is the opposite of must_escape_check but for a specific color.
+    ///
+    /// The OPPONENT's win condition against this color determines if the king can be captured:
+    /// - If White's king can be captured: check black_win_condition (how Black beats White)
+    /// - If Black's king can be captured: check white_win_condition (how White beats Black)
     #[inline]
     pub fn king_capturable(&self, color: PlayerColor) -> bool {
-        // The color's own win condition tells us if their king can be captured
-        // (i.e., if their opponent wins via capture rather than checkmate)
-        let win_condition = match color {
-            PlayerColor::White => self.game_rules.white_win_condition,
-            PlayerColor::Black => self.game_rules.black_win_condition,
+        // The OPPONENT's win condition tells us how they beat this color
+        // If they beat via capture (not checkmate), the king can be captured
+        let opponent_win_condition = match color {
+            PlayerColor::White => self.game_rules.black_win_condition, // How Black beats White
+            PlayerColor::Black => self.game_rules.white_win_condition, // How White beats Black
             PlayerColor::Neutral => return false,
         };
-        !win_condition.requires_check_evasion()
+        !opponent_win_condition.requires_check_evasion()
     }
 
     /// Check if the side-to-move has lost by royal capture.
     /// This is only relevant for RoyalCapture and AllRoyalsCaptured win conditions.
     /// Returns true if the opponent (who just moved) has captured all required royals.
     ///
-    /// Zero overhead: This method checks the win condition first and returns false
-    /// immediately for Checkmate and AllPiecesCaptured variants.
+    /// The OPPONENT's win condition against us determines if we can lose by royal capture:
+    /// - If White is to move: check black_win_condition (how Black beats White)
+    /// - If Black is to move: check white_win_condition (how White beats Black)
     #[inline]
     pub fn has_lost_by_royal_capture(&self) -> bool {
-        // Get the side-to-move's win condition (what the opponent must do to beat them)
-        let our_win_condition = match self.turn {
-            PlayerColor::White => self.game_rules.white_win_condition,
-            PlayerColor::Black => self.game_rules.black_win_condition,
+        // The OPPONENT's win condition tells us how they beat us
+        let opponent_win_condition = match self.turn {
+            PlayerColor::White => self.game_rules.black_win_condition, // How Black beats White
+            PlayerColor::Black => self.game_rules.white_win_condition, // How White beats Black
             PlayerColor::Neutral => return false,
         };
 
-        // Zero overhead: only check for royal loss if win condition is royal-capture based
-        if !our_win_condition.is_royal_capture_based() {
+        // Only check for royal loss if opponent's win condition is royal-capture based
+        if !opponent_win_condition.is_royal_capture_based() {
             return false;
         }
 
@@ -1154,10 +1192,10 @@ impl GameState {
         !has_king
     }
 
-    /// Stockfish-style repetition detection for search.
+    /// Repetition detection for search.
     /// Returns true if the current position should be treated as a draw due to repetition.
     ///
-    /// Matches Stockfish's logic exactly: `repetition != 0 && repetition < ply`
+    /// Logic for draw detection: `repetition != 0 && repetition < ply`
     ///
     /// For twofold (repetition > 0): Only a draw if the repetition distance is less than ply,
     /// meaning the first occurrence is within the search tree.
@@ -1170,7 +1208,7 @@ impl GameState {
         if self.null_moves > 0 {
             return false;
         }
-        // Stockfish: return st->repetition && st->repetition < ply;
+        // Result is true if a repetition occurred within the current search tree.
         // This works for both positive (twofold) and negative (threefold) values.
         // Negative values are always < positive ply, so threefold always returns true for ply > 0.
         self.repetition != 0 && self.repetition < (ply as i32)
@@ -1565,7 +1603,7 @@ impl GameState {
         let nonlinear_blocking_squares = if is_nonlinear_checker {
             self.get_nonlinear_blocking_squares(&checker_sq, &king_sq, checker_type)
         } else {
-            arrayvec::ArrayVec::<Coordinate, 8>::new()
+            arrayvec::ArrayVec::<Coordinate, 64>::new()
         };
 
         let check_dist = dx_check.abs().max(dy_check.abs());
@@ -1800,8 +1838,43 @@ impl GameState {
                 }
             }
 
-            // Regular slider blocking for non-Huygen checkers
-            if is_slider && can_ortho && !is_huygen_checker {
+            // ==========================================
+            // OPTIMIZED SLIDER BLOCKING FOR ROSE CHECKERS
+            // For Rose checks, blocking squares are precomputed.
+            // Generate moves to each reachable blocking square.
+            // ==========================================
+            if is_nonlinear_checker && (can_ortho || can_diag) {
+                for block_sq in &nonlinear_blocking_squares {
+                    // Check if this slider can reach the blocking square
+                    if can_ortho {
+                        // Check same row or column
+                        if from.x == block_sq.x && from.y != block_sq.y {
+                            // Same column - check path clear
+                            if s.is_path_clear_for_rook(&from, block_sq) {
+                                out.push(Move::new(from, *block_sq, *piece));
+                            }
+                        } else if from.y == block_sq.y && from.x != block_sq.x {
+                            // Same row - check path clear
+                            if s.is_path_clear_for_rook(&from, block_sq) {
+                                out.push(Move::new(from, *block_sq, *piece));
+                            }
+                        }
+                    }
+                    if can_diag {
+                        // Check same diagonal
+                        let dx = block_sq.x - from.x;
+                        let dy = block_sq.y - from.y;
+                        if dx != 0 && dx.abs() == dy.abs() {
+                            if s.is_path_clear_for_bishop(&from, block_sq) {
+                                out.push(Move::new(from, *block_sq, *piece));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Regular slider blocking for non-Huygen, non-Rose checkers (linear attack patterns)
+            if is_slider && can_ortho && !is_huygen_checker && !is_nonlinear_checker {
                 // Horizontal line y=from.y intersects check ray
                 if step_y != 0 {
                     let k = (from.y - king_sq.y) / step_y;
@@ -2899,7 +2972,7 @@ impl GameState {
         self.hash ^= SIDE_KEY;
         self.turn = self.turn.opponent();
 
-        // Stockfish-style repetition detection: compute distance to previous occurrence
+        // Compute distance to previous occurrence for repetition detection:
         // of same position. 0 = no repetition, positive = distance to twofold, negative = threefold.
         self.repetition = 0;
         let end = (self.halfmove_clock as usize).min(self.hash_stack.len());
