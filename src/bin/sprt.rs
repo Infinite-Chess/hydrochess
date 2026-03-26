@@ -5,7 +5,7 @@ use std::time::Instant;
 use clap::{Parser, Subcommand};
 use hydrochess_wasm::Engine;
 use hydrochess_wasm::Variant;
-use hydrochess_wasm::board::{Coordinate, PlayerColor};
+use hydrochess_wasm::board::{Coordinate, PieceType, PlayerColor};
 use hydrochess_wasm::game::GameState;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -50,9 +50,9 @@ enum Commands {
         #[arg(long, default_value = "10+0.1")]
         tc: String,
 
-        /// Number of parallel games
-        #[arg(long, default_value_t = 16)]
-        concurrency: usize,
+        /// Number of parallel games (defaults to logical CPU count)
+        #[arg(long)]
+        concurrency: Option<usize>,
 
         /// Maximum games to run (omit for no limit)
         #[arg(long)]
@@ -187,11 +187,15 @@ struct GameOutcome {
     variant_name: String,
     game_idx: usize,
     termination_reason: String,
+    new_engine_timed_out: bool,
 }
 
 #[derive(Clone, Copy)]
 enum TerminalState {
     Checkmate { white_won: bool },
+    AllPiecesCaptured { white_won: bool },
+    AllRoyalsCaptured { white_won: bool },
+    RoyalCapture { white_won: bool },
     Draw(&'static str),
 }
 
@@ -289,12 +293,12 @@ fn parse_bestmove_to_icn(bestmove_str: &str, turn: PlayerColor) -> Option<String
     Some(result)
 }
 
-fn has_any_fully_legal_move(game: &mut GameState) -> bool {
+fn has_any_fully_legal_move(game: &GameState) -> bool {
     let moves = game.get_legal_moves();
     for m in moves {
-        let undo = game.make_move(&m);
-        let legal = !game.is_move_illegal();
-        game.undo_move(&m, undo);
+        let mut game_copy = game.clone();
+        game_copy.make_move(&m);
+        let legal = !game_copy.is_move_illegal();
         if legal {
             return true;
         }
@@ -302,15 +306,164 @@ fn has_any_fully_legal_move(game: &mut GameState) -> bool {
     false
 }
 
-fn detect_terminal_state(game: &mut GameState) -> Option<TerminalState> {
+fn make_position_key(game: &GameState) -> String {
+    // Build piece list sorted by position
+    let mut pieces: Vec<String> = game
+        .board
+        .iter()
+        .map(|(x, y, piece)| {
+            let color_char = if piece.color() == PlayerColor::White {
+                'w'
+            } else {
+                'b'
+            };
+            let piece_char = piece.piece_type().to_site_code().to_lowercase();
+            format!("{}{}{},{}", color_char, piece_char, x, y)
+        })
+        .collect();
+    pieces.sort();
+
+    // Compute effective castling rights following FIDE rules
+    let mut castling_rights = String::new();
+
+    for color in [PlayerColor::White, PlayerColor::Black] {
+        let color_char = if color == PlayerColor::White {
+            'w'
+        } else {
+            'b'
+        };
+
+        // Find king
+        let king_pos = game
+            .board
+            .iter()
+            .find(|(_, _, piece)| piece.color() == color && piece.piece_type() == PieceType::King);
+
+        if let Some((king_x, king_y, _)) = king_pos {
+            let king_coord = Coordinate::new(king_x, king_y);
+            let king_has_rights = game.has_special_right(&king_coord);
+
+            if king_has_rights {
+                // King has rights - check which castling partners have rights
+                let mut left_partner = false;
+                let mut right_partner = false;
+
+                for (px, py, piece) in game.board.iter() {
+                    if piece.color() != color {
+                        continue;
+                    }
+                    if piece.piece_type() == PieceType::Pawn
+                        || piece.piece_type() == PieceType::King
+                    {
+                        continue;
+                    }
+
+                    if py != king_y {
+                        continue;
+                    }
+
+                    let partner_coord = Coordinate::new(px, py);
+                    if game.has_special_right(&partner_coord) {
+                        if px < king_x {
+                            left_partner = true;
+                        } else {
+                            right_partner = true;
+                        }
+                    }
+                }
+
+                if left_partner {
+                    castling_rights.push_str(&format!("{}L", color_char));
+                }
+                if right_partner {
+                    castling_rights.push_str(&format!("{}R", color_char));
+                }
+            }
+        }
+    }
+
+    // Compute pawn special rights (double-push rights)
+    let mut pawn_rights = String::new();
+    let mut pawn_coords: Vec<String> = game
+        .board
+        .iter()
+        .filter_map(|(x, y, piece)| {
+            if piece.piece_type() == PieceType::Pawn {
+                let coord = Coordinate::new(x, y);
+                if game.has_special_right(&coord) {
+                    return Some(format!("{},{}", x, y));
+                }
+            }
+            None
+        })
+        .collect();
+    pawn_coords.sort();
+    if !pawn_coords.is_empty() {
+        pawn_rights = pawn_coords.join(";");
+    }
+
+    // Include en passant square if present
+    let ep = if let Some(ep_info) = game.en_passant {
+        format!("{},{}", ep_info.square.x, ep_info.square.y)
+    } else {
+        String::new()
+    };
+
+    // Combine all components
+    let turn_char = if game.turn == PlayerColor::White {
+        'w'
+    } else {
+        'b'
+    };
+    format!(
+        "{}|{}|{}|{}|{}",
+        turn_char,
+        pieces.join(";"),
+        castling_rights,
+        pawn_rights,
+        ep
+    )
+}
+
+fn detect_terminal_state(game: &GameState) -> Option<TerminalState> {
     let in_check = game.is_in_check();
     let has_legal_move = has_any_fully_legal_move(game);
     if !has_legal_move {
         let lost_by_mate = in_check && game.must_escape_check();
         let lost_by_piece_capture = !game.has_pieces(game.turn);
+        let lost_by_royal_capture = game.has_lost_by_royal_capture();
 
-        if lost_by_mate || lost_by_piece_capture {
+        if lost_by_mate {
             return Some(TerminalState::Checkmate {
+                white_won: game.turn == PlayerColor::Black,
+            });
+        }
+
+        if lost_by_royal_capture {
+            // Determine if it's RoyalCapture (one royal) or AllRoyalsCaptured (all royals)
+            let opponent_win_condition = match game.turn {
+                PlayerColor::White => game.game_rules.black_win_condition,
+                PlayerColor::Black => game.game_rules.white_win_condition,
+                PlayerColor::Neutral => return Some(TerminalState::Draw("stalemate")),
+            };
+
+            return match opponent_win_condition {
+                hydrochess_wasm::game::WinCondition::RoyalCapture => {
+                    Some(TerminalState::RoyalCapture {
+                        white_won: game.turn == PlayerColor::Black,
+                    })
+                }
+                hydrochess_wasm::game::WinCondition::AllRoyalsCaptured => {
+                    Some(TerminalState::AllRoyalsCaptured {
+                        white_won: game.turn == PlayerColor::Black,
+                    })
+                }
+                _ => Some(TerminalState::Draw("stalemate")),
+            };
+        }
+
+        if lost_by_piece_capture {
+            return Some(TerminalState::AllPiecesCaptured {
                 white_won: game.turn == PlayerColor::Black,
             });
         }
@@ -318,21 +471,12 @@ fn detect_terminal_state(game: &mut GameState) -> Option<TerminalState> {
         return Some(TerminalState::Draw("stalemate"));
     }
 
-    if game.is_draw(0, in_check) {
-        if game.is_fifty() {
-            return Some(TerminalState::Draw("fifty-move rule"));
-        }
-        if game.is_repetition(0) {
-            return Some(TerminalState::Draw("threefold repetition"));
-        }
+    if hydrochess_wasm::evaluation::insufficient_material::evaluate_insufficient_material(game) {
+        return Some(TerminalState::Draw("insufficient_material"));
     }
 
     if game.is_fifty() {
         return Some(TerminalState::Draw("fifty-move rule"));
-    }
-
-    if game.is_repetition(0) {
-        return Some(TerminalState::Draw("threefold repetition"));
     }
 
     None
@@ -349,12 +493,17 @@ fn play_game(
     game.setup_position_from_icn(variant.starting_icn());
     game.variant = Some(variant);
 
+    // Explicitly set world bounds for this variant to ensure they're correct
+    let bounds = variant.get_default_bounds();
+    hydrochess_wasm::moves::set_world_bounds(bounds.0, bounds.1, bounds.2, bounds.3);
+
     let starting_board_setup = get_board_setup_icn(&game);
 
     let mut white_clock = config.tc_base_ms;
     let mut black_clock = config.tc_base_ms;
     let mut move_info_log = Vec::new();
     let mut move_history_clean: Vec<String> = Vec::new();
+    let mut repetition_counts: HashMap<String, usize> = HashMap::new();
     let termination_reason;
 
     let get_eval = |g: &GameState| {
@@ -382,8 +531,15 @@ fn play_game(
                 variant_name: variant.to_str().to_string(),
                 game_idx,
                 termination_reason: $reason.to_string(),
+                new_engine_timed_out: false,
             }
         };
+    }
+
+    // Record initial position
+    {
+        let key = make_position_key(&game);
+        *repetition_counts.entry(key).or_insert(0) += 1;
     }
 
     for ply in 0..config.max_moves {
@@ -395,13 +551,14 @@ fn play_game(
                     variant_name: variant.to_str().to_string(),
                     game_idx,
                     termination_reason: "interrupted".to_string(),
+                    new_engine_timed_out: false,
                 };
             }
             break;
         }
 
         // Terminal state checks always run before adjudication or engine search.
-        if let Some(terminal) = detect_terminal_state(&mut game) {
+        if let Some(terminal) = detect_terminal_state(&game) {
             match terminal {
                 TerminalState::Checkmate { white_won } => {
                     let result = if white_won == new_plays_white {
@@ -415,26 +572,71 @@ fn play_game(
                         if white_won { "1-0" } else { "0-1" }
                     );
                 }
+                TerminalState::AllPiecesCaptured { white_won } => {
+                    let result = if white_won == new_plays_white {
+                        GameResult::Win
+                    } else {
+                        GameResult::Loss
+                    };
+                    return game_outcome!(
+                        result,
+                        "allpiecescaptured",
+                        if white_won { "1-0" } else { "0-1" }
+                    );
+                }
+                TerminalState::AllRoyalsCaptured { white_won } => {
+                    let result = if white_won == new_plays_white {
+                        GameResult::Win
+                    } else {
+                        GameResult::Loss
+                    };
+                    return game_outcome!(
+                        result,
+                        "allroyalscaptured",
+                        if white_won { "1-0" } else { "0-1" }
+                    );
+                }
+                TerminalState::RoyalCapture { white_won } => {
+                    let result = if white_won == new_plays_white {
+                        GameResult::Win
+                    } else {
+                        GameResult::Loss
+                    };
+                    return game_outcome!(
+                        result,
+                        "royalcapture",
+                        if white_won { "1-0" } else { "0-1" }
+                    );
+                }
                 TerminalState::Draw(reason) => {
                     return game_outcome!(GameResult::Draw, reason, "1/2-1/2");
                 }
             }
         }
 
-        //  Material adjudication (after terminal checks)
-        let eval = get_eval(&game);
-        if eval.abs() >= config.adjudication_threshold {
-            let white_winning = eval > 0;
-            let result = if white_winning == new_plays_white {
-                GameResult::Win
-            } else {
-                GameResult::Loss
-            };
-            let result_str = if white_winning { "1-0" } else { "0-1" };
-            return game_outcome!(result, "material adjudication", result_str);
+        // Check for threefold repetition using manual position key tracking
+        let current_key = make_position_key(&game);
+        let repetition_count = *repetition_counts.get(&current_key).unwrap_or(&0);
+        if repetition_count >= 3 {
+            return game_outcome!(GameResult::Draw, "threefold repetition", "1/2-1/2");
         }
 
-        //  Engine search
+        // Material adjudication (after terminal checks)
+        if variant != Variant::PawnHorde {
+            let eval = get_eval(&game);
+            if eval.abs() >= config.adjudication_threshold {
+                let white_winning = eval > 0;
+                let result = if white_winning == new_plays_white {
+                    GameResult::Win
+                } else {
+                    GameResult::Loss
+                };
+                let result_str = if white_winning { "1-0" } else { "0-1" };
+                return game_outcome!(result, "material adjudication", result_str);
+            }
+        }
+
+        // Engine search
         let is_new_turn = (game.turn == PlayerColor::White) == new_plays_white;
 
         let bin = if is_new_turn {
@@ -553,14 +755,48 @@ fn play_game(
             };
             let white_won = (result == GameResult::Win) == new_plays_white;
             let result_str = if white_won { "1-0" } else { "0-1" };
-            return game_outcome!(result, "timeout", result_str);
+            return GameOutcome {
+                result,
+                icn: generate_icn(
+                    &variant,
+                    &move_info_log,
+                    game_idx,
+                    new_plays_white,
+                    Some("timeout"),
+                    config,
+                    result_str,
+                    &starting_board_setup,
+                ),
+                variant_name: variant.to_str().to_string(),
+                game_idx,
+                termination_reason: "timeout".to_string(),
+                new_engine_timed_out: is_new_turn,
+            };
         }
 
         if let Some(move_icn) = bestmove_icn {
             // Build annotated move for the output log
             let mut comment = format!("[%clk {}]", format_clock(remaining_clock));
-            if let Some(s) = score {
-                comment.push_str(&format!(" [%eval {:+.2}]", s / 100.0));
+            if let Some(mut s) = score {
+                // Flip score to White's perspective if Black just moved
+                if game.turn == PlayerColor::White {
+                    s = -s;
+                }
+                // Convert mate scores (>= 800000 cp) to [%mate N] format
+                if s.abs() >= 800000.0 {
+                    let mate_in = if s > 0.0 {
+                        ((900000.0 - s + 1.0) / 2.0).floor() as i32
+                    } else {
+                        ((900000.0 + s + 1.0) / 2.0).floor() as i32
+                    };
+                    if s > 0.0 {
+                        comment.push_str(&format!(" [%mate {}]", mate_in));
+                    } else {
+                        comment.push_str(&format!(" [%mate -{}]", mate_in));
+                    }
+                } else {
+                    comment.push_str(&format!(" [%eval {:+.2}]", s / 100.0));
+                }
             }
             move_info_log.push(format!("{}{{{}}}", move_icn, comment));
             move_history_clean.push(move_icn);
@@ -584,6 +820,12 @@ fn play_game(
                 return game_outcome!(result, "illegal move", result_str);
             }
 
+            // Record the new position for threefold repetition tracking
+            {
+                let key = make_position_key(&game);
+                *repetition_counts.entry(key).or_insert(0) += 1;
+            }
+
             // Update clocks (after the move, it's now the other side's turn)
             if game.turn == PlayerColor::Black {
                 // White just moved
@@ -593,7 +835,7 @@ fn play_game(
                 black_clock = remaining_clock;
             }
         } else {
-            if let Some(terminal) = detect_terminal_state(&mut game) {
+            if let Some(terminal) = detect_terminal_state(&game) {
                 match terminal {
                     TerminalState::Checkmate { white_won } => {
                         let result = if white_won == new_plays_white {
@@ -604,6 +846,42 @@ fn play_game(
                         return game_outcome!(
                             result,
                             "checkmate",
+                            if white_won { "1-0" } else { "0-1" }
+                        );
+                    }
+                    TerminalState::AllPiecesCaptured { white_won } => {
+                        let result = if white_won == new_plays_white {
+                            GameResult::Win
+                        } else {
+                            GameResult::Loss
+                        };
+                        return game_outcome!(
+                            result,
+                            "allpiecescaptured",
+                            if white_won { "1-0" } else { "0-1" }
+                        );
+                    }
+                    TerminalState::AllRoyalsCaptured { white_won } => {
+                        let result = if white_won == new_plays_white {
+                            GameResult::Win
+                        } else {
+                            GameResult::Loss
+                        };
+                        return game_outcome!(
+                            result,
+                            "allroyalscaptured",
+                            if white_won { "1-0" } else { "0-1" }
+                        );
+                    }
+                    TerminalState::RoyalCapture { white_won } => {
+                        let result = if white_won == new_plays_white {
+                            GameResult::Win
+                        } else {
+                            GameResult::Loss
+                        };
+                        return game_outcome!(
+                            result,
+                            "royalcapture",
                             if white_won { "1-0" } else { "0-1" }
                         );
                     }
@@ -620,6 +898,7 @@ fn play_game(
                     variant_name: variant.to_str().to_string(),
                     game_idx,
                     termination_reason: "interrupted".to_string(),
+                    new_engine_timed_out: false,
                 };
             }
 
@@ -645,9 +924,71 @@ fn play_game(
                 variant_name: variant.to_str().to_string(),
                 game_idx,
                 termination_reason: termination_reason.unwrap_or("engine failure").to_string(),
+                new_engine_timed_out: false,
             };
         }
     }
+
+    // Final check: all terminal conditions before declaring max_moves draw
+    if let Some(terminal) = detect_terminal_state(&game) {
+        match terminal {
+            TerminalState::Checkmate { white_won } => {
+                let result = if white_won == new_plays_white {
+                    GameResult::Win
+                } else {
+                    GameResult::Loss
+                };
+                return game_outcome!(result, "checkmate", if white_won { "1-0" } else { "0-1" });
+            }
+            TerminalState::AllPiecesCaptured { white_won } => {
+                let result = if white_won == new_plays_white {
+                    GameResult::Win
+                } else {
+                    GameResult::Loss
+                };
+                return game_outcome!(
+                    result,
+                    "allpiecescaptured",
+                    if white_won { "1-0" } else { "0-1" }
+                );
+            }
+            TerminalState::AllRoyalsCaptured { white_won } => {
+                let result = if white_won == new_plays_white {
+                    GameResult::Win
+                } else {
+                    GameResult::Loss
+                };
+                return game_outcome!(
+                    result,
+                    "allroyalscaptured",
+                    if white_won { "1-0" } else { "0-1" }
+                );
+            }
+            TerminalState::RoyalCapture { white_won } => {
+                let result = if white_won == new_plays_white {
+                    GameResult::Win
+                } else {
+                    GameResult::Loss
+                };
+                return game_outcome!(
+                    result,
+                    "royalcapture",
+                    if white_won { "1-0" } else { "0-1" }
+                );
+            }
+            TerminalState::Draw(reason) => {
+                return game_outcome!(GameResult::Draw, reason, "1/2-1/2");
+            }
+        }
+    }
+
+    // Check for threefold repetition at end of loop
+    let final_key = make_position_key(&game);
+    let final_repetition_count = *repetition_counts.get(&final_key).unwrap_or(&0);
+    if final_repetition_count >= 3 {
+        return game_outcome!(GameResult::Draw, "threefold repetition", "1/2-1/2");
+    }
+
     game_outcome!(GameResult::Draw, "max_moves", "1/2-1/2")
 }
 
@@ -695,10 +1036,43 @@ fn get_board_setup_icn(game: &GameState) -> String {
         .collect::<Vec<_>>()
         .join("|");
 
-    format!(
-        "{} 0/{} 1 {} {} {}",
-        turn_str, move_limit, promo_token, bounds_token, pieces_str
-    )
+    let variant_tag = if let Some(v) = &game.variant {
+        format!("[Variant \"{}\"] ", v.to_str())
+    } else {
+        String::new()
+    };
+
+    // Include win conditions if they differ from standard checkmate
+    let win_cond_token = if game.game_rules.white_win_condition
+        != hydrochess_wasm::game::WinCondition::Checkmate
+        || game.game_rules.black_win_condition != hydrochess_wasm::game::WinCondition::Checkmate
+    {
+        format!(
+            "{:?},{:?}",
+            game.game_rules.white_win_condition, game.game_rules.black_win_condition
+        )
+        .to_lowercase()
+    } else {
+        String::new()
+    };
+
+    if win_cond_token.is_empty() {
+        format!(
+            "{}{} 0/{} 1 {} {} {}",
+            variant_tag, turn_str, move_limit, promo_token, bounds_token, pieces_str
+        )
+    } else {
+        format!(
+            "{}{} 0/{} 1 {} {} {} {}",
+            variant_tag,
+            turn_str,
+            move_limit,
+            promo_token,
+            bounds_token,
+            win_cond_token,
+            pieces_str
+        )
+    }
 }
 
 fn generate_icn(
@@ -739,9 +1113,13 @@ fn generate_icn(
                 )
             }
             "checkmate" => "Checkmate".to_string(),
+            "allpiecescaptured" => "All pieces captured".to_string(),
+            "allroyalscaptured" => "All royals captured".to_string(),
+            "royalcapture" => "Royal capture".to_string(),
             "stalemate" => "Draw by stalemate".to_string(),
             "fifty-move rule" => "Draw by fifty-move rule".to_string(),
             "threefold repetition" => "Draw by threefold repetition".to_string(),
+            "insufficient_material" => "Draw by insufficient material".to_string(),
             "timeout" => "Loss on time".to_string(),
             "illegal move" => "Loss on illegal move".to_string(),
             "engine failure" => "Loss on engine failure".to_string(),
@@ -790,6 +1168,11 @@ fn main() {
             old_strength,
             verbose,
         }) => {
+            let concurrency = concurrency.unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+            });
             let actual_new_bin = if let Some(path) = new_bin {
                 path
             } else {
@@ -820,6 +1203,63 @@ fn main() {
                 dst
             };
 
+            let parsed_variants = if variants == "all" {
+                vec![
+                    Variant::Classical,
+                    Variant::ConfinedClassical,
+                    Variant::ClassicalPlus,
+                    Variant::CoaIP,
+                    Variant::CoaIPHO,
+                    Variant::CoaIPRO,
+                    Variant::CoaIPNO,
+                    Variant::Palace,
+                    Variant::Pawndard,
+                    Variant::Core,
+                    Variant::Standarch,
+                    Variant::SpaceClassic,
+                    Variant::Space,
+                    Variant::Abundance,
+                    Variant::PawnHorde,
+                    Variant::Knightline,
+                    Variant::Obstocean,
+                    Variant::Chess,
+                    Variant::ScatteredLeapers,
+                ]
+            } else {
+                let mut parsed = Vec::new();
+                for name in variants.split(',') {
+                    let name_lower = name.to_lowercase().replace(' ', "_");
+                    let known = matches!(
+                        name_lower.as_str(),
+                        "classical"
+                            | "confined_classical"
+                            | "classical_plus"
+                            | "coaip"
+                            | "coaip_ho"
+                            | "coaip_ro"
+                            | "coaip_no"
+                            | "palace"
+                            | "pawndard"
+                            | "core"
+                            | "standarch"
+                            | "space_classic"
+                            | "space"
+                            | "abundance"
+                            | "pawn_horde"
+                            | "knightline"
+                            | "obstocean"
+                            | "chess"
+                            | "scattered_leapers"
+                    );
+                    if !known {
+                        eprintln!("Error: Unknown variant '{}'", name);
+                        std::process::exit(1);
+                    }
+                    parsed.push(Variant::parse(name));
+                }
+                parsed
+            };
+
             let mut config = Config {
                 elo0,
                 elo1,
@@ -833,7 +1273,7 @@ fn main() {
                 concurrency,
                 max_games,
                 min_games,
-                variants: variants.split(',').map(Variant::parse).collect(),
+                variants: parsed_variants,
                 adjudication_threshold: adjudication,
                 new_bin: actual_new_bin,
                 old_bin,
@@ -989,11 +1429,11 @@ fn main() {
                         continue;
                     }
 
-                    if outcome.termination_reason == "timeout" {
+                    if outcome.termination_reason == "timeout" && outcome.new_engine_timed_out {
                         timeout_losses += 1;
                         if config.verbose {
                             println!(
-                                "\nALERT: Game {} ended by timeout [{}].",
+                                "\nALERT: Game {} ended by timeout [{}] - NEW ENGINE TIMED OUT",
                                 outcome.game_idx, outcome.variant_name
                             );
                         }
@@ -1051,7 +1491,10 @@ fn main() {
             println!("  Elo: {:.1} +/- {:.1}", elo, err);
             println!("  Record: {}W - {}L - {}D", wins, losses, draws);
             if timeout_losses > 0 {
-                println!("  ALERT: {} games ended by timeout", timeout_losses);
+                println!(
+                    "  ALERT: {} games ended by timeout (NEW ENGINE ONLY)",
+                    timeout_losses
+                );
             }
             println!("\nPer-Variant Breakdown:");
             let mut variant_names: Vec<_> = per_variant_stats.keys().collect();
@@ -1122,6 +1565,24 @@ fn main() {
                         TerminalState::Checkmate { white_won } => {
                             eprintln!(
                                 "terminal checkmate winner {}",
+                                if white_won { "white" } else { "black" }
+                            );
+                        }
+                        TerminalState::AllPiecesCaptured { white_won } => {
+                            eprintln!(
+                                "terminal allpiecescaptured winner {}",
+                                if white_won { "white" } else { "black" }
+                            );
+                        }
+                        TerminalState::AllRoyalsCaptured { white_won } => {
+                            eprintln!(
+                                "terminal allroyalscaptured winner {}",
+                                if white_won { "white" } else { "black" }
+                            );
+                        }
+                        TerminalState::RoyalCapture { white_won } => {
+                            eprintln!(
+                                "terminal royalcapture winner {}",
                                 if white_won { "white" } else { "black" }
                             );
                         }

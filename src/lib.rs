@@ -135,26 +135,27 @@ impl Variant {
     }
 
     pub fn parse(s: &str) -> Self {
-        match s {
-            "Classical" => Variant::Classical,
-            "Confined_Classical" | "Confined Classical" => Variant::ConfinedClassical,
-            "Classical_Plus" | "Classical Plus" => Variant::ClassicalPlus,
-            "CoaIP" => Variant::CoaIP,
-            "CoaIP_HO" | "Chess on an Infinite Plane - Huygens Option" => Variant::CoaIPHO,
-            "CoaIP_RO" | "Chess on an Infinite Plane - Roses Option" => Variant::CoaIPRO,
-            "CoaIP_NO" | "Chess on an Infinite Plane - Knightriders Option" => Variant::CoaIPNO,
-            "Palace" => Variant::Palace,
-            "Pawndard" => Variant::Pawndard,
-            "Core" => Variant::Core,
-            "Standarch" => Variant::Standarch,
-            "Space_Classic" | "Space Classic" => Variant::SpaceClassic,
-            "Space" => Variant::Space,
-            "Abundance" => Variant::Abundance,
-            "Pawn_Horde" | "Pawn Horde" => Variant::PawnHorde,
-            "Knightline" => Variant::Knightline,
-            "Obstocean" => Variant::Obstocean,
-            "Chess" => Variant::Chess,
-            "Scattered_Leapers" | "Scattered Leapers" => Variant::ScatteredLeapers,
+        let normalized = s.to_lowercase().replace(' ', "_");
+        match normalized.as_str() {
+            "classical" => Variant::Classical,
+            "confined_classical" => Variant::ConfinedClassical,
+            "classical_plus" => Variant::ClassicalPlus,
+            "coaip" => Variant::CoaIP,
+            "coaip_ho" | "chess_on_an_infinite_plane_-_huygens_option" => Variant::CoaIPHO,
+            "coaip_ro" | "chess_on_an_infinite_plane_-_roses_option" => Variant::CoaIPRO,
+            "coaip_no" | "chess_on_an_infinite_plane_-_knightriders_option" => Variant::CoaIPNO,
+            "palace" => Variant::Palace,
+            "pawndard" => Variant::Pawndard,
+            "core" => Variant::Core,
+            "standarch" => Variant::Standarch,
+            "space_classic" => Variant::SpaceClassic,
+            "space" => Variant::Space,
+            "abundance" => Variant::Abundance,
+            "pawn_horde" => Variant::PawnHorde,
+            "knightline" => Variant::Knightline,
+            "obstocean" => Variant::Obstocean,
+            "chess" => Variant::Chess,
+            "scattered_leapers" => Variant::ScatteredLeapers,
             _ => Variant::Classical, // Default fallback
         }
     }
@@ -423,7 +424,6 @@ impl Engine {
     }
 
     /// Set evaluation parameters from a JSON string.
-    /// Only available when the `eval_tuning` feature is enabled.
     #[cfg(any(feature = "param_tuning", feature = "eval_tuning"))]
     #[wasm_bindgen]
     pub fn set_eval_params(&self, json: &str) -> bool {
@@ -431,7 +431,6 @@ impl Engine {
     }
 
     /// Get current evaluation parameters as a JSON string.
-    /// Only available when the `eval_tuning` feature is enabled.
     #[cfg(any(feature = "param_tuning", feature = "eval_tuning"))]
     #[wasm_bindgen]
     pub fn get_eval_params(&self) -> String {
@@ -439,8 +438,6 @@ impl Engine {
     }
 
     /// Set search parameters from a JSON string.
-    /// Only available when the `search_tuning` feature is enabled.
-    /// Returns true on success, false on parse failure.
     #[cfg(any(feature = "param_tuning", feature = "search_tuning"))]
     #[wasm_bindgen]
     pub fn set_search_params(&self, json: &str) -> bool {
@@ -448,23 +445,13 @@ impl Engine {
     }
 
     /// Get current search parameters as a JSON string.
-    /// Only available when the `search_tuning` feature is enabled.
     #[cfg(any(feature = "param_tuning", feature = "search_tuning"))]
     #[wasm_bindgen]
     pub fn get_search_params(&self) -> String {
         crate::search::params::get_search_params_as_json()
     }
 
-    /// Derive an effective time limit for this move from the current clock and
-    /// game state. Returns `(time_ms, is_soft_limit)`.
-    ///
-    /// **is_soft_limit** indicates whether the returned time is a suggestion
-    /// (where exceeding it slightly is acceptable) vs a hard constraint.
-    /// - Soft limit: untimed/infinite games with a suggested per-move limit
-    /// - Hard limit: timed games where exceeding the budget risks flagging
-    ///
-    /// Uses logarithmic time formulas for proper scaling across
-    /// different time controls (blitz, rapid, classical).
+    /// Derive an effective time limit for this move from the current clock and game state.
     fn effective_time_limit_ms(&self, requested_limit_ms: u32) -> (u128, u128, bool) {
         let Some(clock) = self.clock else {
             // No clock info: use the fixed per-move limit as a soft limit.
@@ -594,7 +581,6 @@ impl Engine {
 
     /// Timed search. This also exposes the search evaluation as an `eval` field alongside the move,
     /// so callers can reuse the same search for adjudication.
-    /// thread_id is used for Lazy SMP - helper threads (id > 0) skip the first move.
     #[wasm_bindgen]
     pub fn get_best_move_with_time(
         &mut self,
@@ -707,17 +693,7 @@ impl Engine {
         serde_wasm_bindgen::to_value(&js_move).unwrap()
     }
 
-    /// MultiPV-enabled timed search. Returns an array of PV lines (best moves with their
-    /// evaluations and full PVs).
-    ///
-    /// Parameters:
-    /// - `time_limit_ms`: Maximum time to think in milliseconds
-    /// - `multi_pv`: Number of best moves to return (default 1). Must be >= 1.
-    /// - `silent`: If true, suppress info output during search
-    ///
-    /// When `multi_pv` is 1, this has zero overhead compared to `get_best_move_with_time`.
-    /// For `multi_pv` > 1, subsequent PV lines are found by re-searching the position
-    /// with previously found best moves excluded.
+    /// MultiPV-enabled timed search. Returns an array of PV lines
     #[wasm_bindgen]
     pub fn get_best_moves_multipv(
         &mut self,
@@ -806,16 +782,8 @@ impl Engine {
     }
 
     /// Returns true if either side has sufficient material to force checkmate.
-    /// Returns false if the position is a dead draw due to insufficient material.
-    /// This can be used by the SPRT harness to detect insufficient material draws.
     pub fn is_sufficient_material(&self) -> bool {
-        // Use the evaluate_insufficient_material function
-        // None = sufficient, Some(0) = dead draw, Some(n) = drawish
-        match evaluation::insufficient_material::evaluate_insufficient_material(&self.game) {
-            None => true,     // Sufficient material
-            Some(0) => false, // Dead draw (insufficient)
-            Some(_) => true,  // Drawish but not dead draw
-        }
+        !evaluation::insufficient_material::evaluate_insufficient_material(&self.game)
     }
 }
 
@@ -827,5 +795,143 @@ impl Engine {
         return crate::evaluation::evaluate(game, None);
         #[cfg(not(feature = "nnue"))]
         return crate::evaluation::evaluate(game);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::board::PlayerColor;
+
+    fn all_variants() -> Vec<Variant> {
+        vec![
+            Variant::Classical,
+            Variant::ConfinedClassical,
+            Variant::ClassicalPlus,
+            Variant::CoaIP,
+            Variant::CoaIPHO,
+            Variant::CoaIPRO,
+            Variant::CoaIPNO,
+            Variant::Palace,
+            Variant::Pawndard,
+            Variant::Core,
+            Variant::Standarch,
+            Variant::SpaceClassic,
+            Variant::Space,
+            Variant::Abundance,
+            Variant::PawnHorde,
+            Variant::Knightline,
+            Variant::Obstocean,
+            Variant::Chess,
+            Variant::ScatteredLeapers,
+        ]
+    }
+
+    #[test]
+    fn variant_round_trips_and_starting_positions_exist() {
+        for variant in all_variants() {
+            let canonical = variant.to_str();
+            assert_eq!(Variant::parse(canonical), variant);
+            assert!(!variant.starting_icn().is_empty());
+        }
+    }
+
+    #[test]
+    fn variant_aliases_and_default_bounds_are_stable() {
+        assert_eq!(
+            Variant::parse("Confined Classical"),
+            Variant::ConfinedClassical
+        );
+        assert_eq!(
+            Variant::parse("Chess on an Infinite Plane - Huygens Option"),
+            Variant::CoaIPHO
+        );
+        assert_eq!(
+            Variant::parse("Chess on an Infinite Plane - Roses Option"),
+            Variant::CoaIPRO
+        );
+        assert_eq!(
+            Variant::parse("Chess on an Infinite Plane - Knightriders Option"),
+            Variant::CoaIPNO
+        );
+        assert_eq!(Variant::parse("not a real variant"), Variant::Classical);
+
+        assert_eq!(Variant::Chess.get_default_bounds(), (1, 8, 1, 8));
+        assert_eq!(Variant::Obstocean.get_default_bounds(), (-6, 15, -3, 12));
+        assert_eq!(
+            Variant::Space.get_default_bounds(),
+            (
+                -1_000_000_000_000_000,
+                1_000_000_000_000_000,
+                -1_000_000_000_000_000,
+                1_000_000_000_000_000,
+            )
+        );
+    }
+
+    #[test]
+    fn native_engine_search_and_pv_work_on_fixed_depth() {
+        let mut engine = Engine::from_icn_native(Variant::Chess.starting_icn(), Some(2));
+        let best = engine.search_native(0, Some(1), true, Some(0), Some(1234));
+
+        assert!(best.is_some());
+        assert!(!engine.current_pv_native(1).is_empty());
+    }
+
+    #[test]
+    fn native_engine_mutation_and_position_queries_work() {
+        let mut engine = Engine::new_native(Variant::Chess.starting_icn());
+        assert_eq!(engine.perft(1), 20);
+        assert!(engine.is_sufficient_material());
+        assert!(!engine.is_in_check());
+
+        let eval = Engine::evaluate_position(engine.game_mut());
+        assert!(eval.abs() < 200);
+
+        let bare_kings = Engine::new_native("w 0/100 1 (8|1) K5,1|k5,8");
+        assert!(!bare_kings.is_sufficient_material());
+        assert!(!bare_kings.is_in_check());
+    }
+
+    #[test]
+    fn effective_time_limit_without_clock_is_soft_limit() {
+        let engine = Engine::new_native(Variant::Chess.starting_icn());
+        assert_eq!(engine.effective_time_limit_ms(250), (250, 250, true));
+    }
+
+    #[test]
+    fn effective_time_limit_handles_neutral_and_empty_clock_cases() {
+        let mut engine = Engine::new_native(Variant::Chess.starting_icn());
+        engine.set_clock(0, 0, 0, 0);
+        assert_eq!(engine.effective_time_limit_ms(300), (300, 300, true));
+
+        engine.game.turn = PlayerColor::Neutral;
+        assert_eq!(engine.effective_time_limit_ms(400), (400, 400, true));
+    }
+
+    #[test]
+    fn effective_time_limit_uses_increment_and_opening_cap() {
+        let mut engine = Engine::new_native(Variant::Chess.starting_icn());
+        engine.set_clock(0, 0, 1500, 0);
+
+        let (optimum, maximum, is_soft) = engine.effective_time_limit_ms(0);
+        assert!(!is_soft);
+        assert!(optimum >= 10);
+        assert!(maximum >= optimum);
+        assert!(maximum <= 5000);
+    }
+
+    #[test]
+    fn effective_time_limit_for_black_side_is_a_hard_limit() {
+        let mut engine = Engine::new_native(Variant::Chess.starting_icn());
+        engine.game.turn = PlayerColor::Black;
+        engine.game.fullmove_number = 12;
+        engine.set_clock(40_000, 25_000, 250, 500);
+
+        let (optimum, maximum, is_soft) = engine.effective_time_limit_ms(100);
+        assert!(!is_soft);
+        assert!(optimum >= 10);
+        assert!(maximum >= optimum);
+        assert!(maximum < 25_000);
     }
 }

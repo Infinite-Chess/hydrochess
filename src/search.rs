@@ -1,4 +1,4 @@
-﻿use crate::board::{PieceType, PlayerColor};
+use crate::board::{PieceType, PlayerColor};
 use crate::evaluation::evaluate;
 use crate::game::GameState;
 use crate::moves::{Move, MoveGenContext, MoveList, get_quiescence_captures};
@@ -112,6 +112,10 @@ fn get_noise(seed: u64, hash: u64, amp: i32) -> i32 {
 }
 
 pub const MAX_PLY: usize = 64;
+/// Maximum recursive depth within quiescence search.
+/// Bounds check/evasion chain blowup: without this, qsearch can expand exponentially
+/// on check-heavy positions (B^D nodes, B = evasion branching factor, D = chain depth).
+pub const MAX_QSEARCH_DEPTH: usize = 16;
 pub const INFINITY: i32 = 1_000_000;
 pub const MATE_VALUE: i32 = 900_000;
 pub const MATE_SCORE: i32 = 800_000;
@@ -2375,6 +2379,10 @@ fn get_best_move_threaded(
 
         // Set correction mode based on variant (zero overhead during search)
         searcher.set_corrhist_mode(game);
+        searcher.move_rule_limit = game
+            .game_rules
+            .move_rule_limit
+            .map_or(i32::MAX, |v| v as i32);
 
         let result = search_with_searcher(searcher, game, max_depth);
         let stats = build_search_stats(searcher);
@@ -3192,9 +3200,9 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
     // Leaf node: transition to quiescence search
     if depth == 0 {
         #[cfg(feature = "nnue")]
-        return quiescence(searcher, game, ply, alpha, beta, node_type, ctx.nnue);
+        return quiescence(searcher, game, ply, 0, alpha, beta, node_type, ctx.nnue);
         #[cfg(not(feature = "nnue"))]
-        return quiescence(searcher, game, ply, alpha, beta, node_type);
+        return quiescence(searcher, game, ply, 0, alpha, beta, node_type);
     }
 
     // Cap depth to prevent overflow
@@ -3490,9 +3498,9 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
         // Razoring: if eval is really low, drop to qsearch
         if !is_pv && eval < alpha - razoring_linear() - razoring_quad() * (depth * depth) as i32 {
             #[cfg(feature = "nnue")]
-            return quiescence(searcher, game, ply, alpha, beta, node_type, ctx.nnue);
+            return quiescence(searcher, game, ply, 0, alpha, beta, node_type, ctx.nnue);
             #[cfg(not(feature = "nnue"))]
-            return quiescence(searcher, game, ply, alpha, beta, node_type);
+            return quiescence(searcher, game, ply, 0, alpha, beta, node_type);
         }
 
         // Reverse Futility Pruning (RFP)
@@ -3657,6 +3665,7 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                 searcher,
                 game,
                 ply + 1,
+                0,
                 -prob_cut_beta,
                 -prob_cut_beta + 1,
                 NodeType::Cut,
@@ -3667,6 +3676,7 @@ fn negamax(ctx: &mut NegamaxContext) -> i32 {
                 searcher,
                 game,
                 ply + 1,
+                0,
                 -prob_cut_beta,
                 -prob_cut_beta + 1,
                 NodeType::Cut,
@@ -4606,6 +4616,7 @@ fn quiescence(
     searcher: &mut Searcher,
     game: &mut GameState,
     ply: usize,
+    qs_ply: usize,
     mut alpha: i32,
     beta: i32,
     node_type: NodeType,
@@ -4797,6 +4808,21 @@ fn quiescence(
         return best_value;
     }
 
+    // Qsearch depth limit: prevents exponential blowup from check/evasion chains.
+    // When must_escape, stand-pat is disabled and ALL evasions recurse.
+    if qs_ply >= MAX_QSEARCH_DEPTH {
+        if must_escape {
+            // Stand-pat was suppressed; return static eval as an approximation.
+            #[cfg(feature = "nnue")]
+            {
+                return evaluate(game, nnue);
+            }
+            #[cfg(not(feature = "nnue"))]
+            return evaluate(game);
+        }
+        return best_value; // stand-pat
+    }
+
     let mut tactical_moves: MoveList = MoveList::new();
     std::mem::swap(&mut tactical_moves, &mut searcher.move_buffers[ply]);
     tactical_moves.clear();
@@ -4895,6 +4921,7 @@ fn quiescence(
             searcher,
             game,
             ply + 1,
+            qs_ply + 1,
             -beta,
             -alpha,
             node_type,
@@ -5660,9 +5687,18 @@ mod tests {
         let alpha = -10000;
         let beta = 10000;
         #[cfg(feature = "nnue")]
-        let score = quiescence(&mut searcher, &mut game, 0, alpha, beta, NodeType::PV, None);
+        let score = quiescence(
+            &mut searcher,
+            &mut game,
+            0,
+            0,
+            alpha,
+            beta,
+            NodeType::PV,
+            None,
+        );
         #[cfg(not(feature = "nnue"))]
-        let score = quiescence(&mut searcher, &mut game, 0, alpha, beta, NodeType::PV);
+        let score = quiescence(&mut searcher, &mut game, 0, 0, alpha, beta, NodeType::PV);
         assert!(score.abs() < 500); // Should be near zero for balanced empty board
         assert_eq!(searcher.hot.qnodes, 1);
     }
