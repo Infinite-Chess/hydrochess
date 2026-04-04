@@ -78,7 +78,7 @@ impl Mat {
     }
 }
 
-/// Helper: checks if all "exotic" pieces (uncommon in most positions) are zero.
+/// Helper: checks if all "exotic" pieces are zero.
 #[inline]
 fn no_exotic_pieces(m: &Mat) -> bool {
     m.chancellors == 0
@@ -93,104 +93,6 @@ fn no_exotic_pieces(m: &Mat) -> bool {
 // Decision tree for insufficient material detection.
 #[inline]
 fn is_insufficient(m: &Mat) -> bool {
-    // ===== SUFFICIENT CASES (return false - can deliver mate) =====
-    // Ordered most specific to less specific within sufficient cases.
-
-    // R+B+N (specific combo)
-    if m.rooks == 1
-        && m.bishops_maj >= 1
-        && m.knights == 1
-        && m.queens == 0
-        && m.bishops_min == 0
-        && no_exotic_pieces(m)
-    {
-        return false;
-    }
-    // R+2N (specific combo)
-    if m.rooks == 1
-        && m.knights == 2
-        && m.queens == 0
-        && m.bishops_maj == 0
-        && m.bishops_min == 0
-        && no_exotic_pieces(m)
-    {
-        return false;
-    }
-    // R+opposite-color bishops (specific combo)
-    if m.rooks == 1
-        && m.bishops_maj >= 1
-        && m.bishops_min >= 1
-        && m.queens == 0
-        && m.knights == 0
-        && no_exotic_pieces(m)
-    {
-        return false;
-    }
-    // Q+2B (specific combo)
-    if m.queens == 1 && m.bishops_maj >= 2 && m.rooks == 0 && m.knights == 0 && no_exotic_pieces(m)
-    {
-        return false;
-    }
-    // 2H+B (specific combo)
-    if m.hawks == 2
-        && m.bishops_maj >= 1
-        && m.queens == 0
-        && m.rooks == 0
-        && m.knights == 0
-        && no_exotic_pieces(m)
-    {
-        return false;
-    }
-    // 3+ Hawks
-    if m.hawks >= 3
-        && m.queens == 0
-        && m.rooks == 0
-        && m.knights == 0
-        && m.bishops_maj == 0
-        && m.bishops_min == 0
-        && no_exotic_pieces(m)
-    {
-        return false;
-    }
-    // 3+ Knightriders
-    if m.knightriders >= 3
-        && m.queens == 0
-        && m.rooks == 0
-        && m.knights == 0
-        && m.bishops_maj == 0
-        && no_exotic_pieces(m)
-    {
-        return false;
-    }
-    // 3+ Archbishops
-    if m.archbishops >= 3
-        && m.queens == 0
-        && m.rooks == 0
-        && m.knights == 0
-        && m.bishops_maj == 0
-        && m.bishops_min == 0
-        && no_exotic_pieces(m)
-    {
-        return false;
-    }
-    // 2+ Chancellors
-    if m.chancellors >= 2
-        && m.queens == 0
-        && m.rooks == 0
-        && m.knights == 0
-        && m.bishops_maj == 0
-        && m.bishops_min == 0
-        && m.archbishops == 0
-        && m.hawks == 0
-        && m.guards == 0
-        && m.pawns == 0
-        && m.amazons == 0
-        && m.knightriders == 0
-        && m.huygens == 0
-    {
-        return false;
-    }
-
     // ===== INSUFFICIENT CASES (return true - cannot deliver mate) =====
     // Only royals - no other pieces
     if no_exotic_pieces(m)
@@ -204,7 +106,7 @@ fn is_insufficient(m: &Mat) -> bool {
         return true;
     }
 
-    // Single strong pieces
+    // Single queen
     if m.queens == 1
         && m.rooks == 0
         && m.knights == 0
@@ -215,8 +117,9 @@ fn is_insufficient(m: &Mat) -> bool {
     {
         return true;
     }
-    // Single Knight alone
-    if m.knights == 1
+
+    // Less than 4 knights
+    if m.knights < 4
         && m.queens == 0
         && m.rooks == 0
         && m.bishops_maj == 0
@@ -226,6 +129,18 @@ fn is_insufficient(m: &Mat) -> bool {
     {
         return true;
     }
+
+    // Less than 4 bishops
+    if m.bishops_maj + m.bishops_min < 4
+        && m.queens == 0
+        && m.rooks == 0
+        && m.knights == 0
+        && m.pawns == 0
+        && no_exotic_pieces(m)
+    {
+        return true;
+    }
+
     // Single Chancellor alone
     if m.chancellors == 1
         && m.queens == 0
@@ -243,8 +158,9 @@ fn is_insufficient(m: &Mat) -> bool {
     {
         return true;
     }
-    // Single Guard alone
-    if m.guards >= 1
+
+    // Less than 3 guards
+    if m.guards <= 2
         && m.queens == 0
         && m.rooks == 0
         && m.knights == 0
@@ -261,76 +177,10 @@ fn is_insufficient(m: &Mat) -> bool {
         return true;
     }
 
-    // Quick checks for clear single-piece thresholds
-    if m.pawns >= 3 {
-        return true;
-    }
-    if m.knights >= 3 {
-        return true;
-    }
-
-    // Only royals (K and/or royal_centaurs) - cannot mate anything
-    if m.queens == 0
-        && m.rooks == 0
-        && m.knights == 0
-        && m.bishops_maj == 0
-        && m.bishops_min == 0
-        && m.chancellors == 0
-        && m.archbishops == 0
-        && m.hawks == 0
-        && m.guards == 0
-        && m.pawns == 0
-        && m.amazons == 0
-        && m.knightriders == 0
-        && m.huygens == 0
-    {
-        return true;
-    }
-
-    // Single strong pieces: Q alone (not 2+ queens)
-    if m.queens == 1
-        && m.rooks == 0
-        && m.knights == 0
-        && m.bishops_maj == 0
-        && m.bishops_min == 0
-        && m.chancellors == 0
-        && m.archbishops == 0
-        && m.hawks == 0
-        && m.guards == 0
-        && m.pawns == 0
-        && m.amazons == 0
-        && m.knightriders == 0
-        && m.huygens == 0
-    {
-        return true;
-    }
-    if m.pawns >= 3 {
-        return true;
-    } // 3+ pawns
-    if m.knights >= 3 {
-        return true;
-    } // 3+ knights
-
-    // 2N alone or with bishops (doesn't include rooks/pawns)
-    if m.knights == 2 && m.rooks == 0 && m.pawns == 0 && no_exotic_pieces(m) {
-        return true;
-    }
-
-    // N with bishops (specific combos, most specific first)
-    if m.knights == 1
+    // N with bishops
+    if m.knights <= 2
         && m.bishops_maj >= 1
-        && m.bishops_min >= 1
-        && m.queens == 0
-        && m.rooks == 0
-        && m.pawns == 0
-        && no_exotic_pieces(m)
-    {
-        return true;
-    }
-    // N+B (any bishops_maj, no bishops_min)
-    if m.knights == 1
-        && m.bishops_maj >= 1
-        && m.bishops_min == 0
+        && m.bishops_min <= 1
         && m.queens == 0
         && m.rooks == 0
         && m.pawns == 0
@@ -342,11 +192,17 @@ fn is_insufficient(m: &Mat) -> bool {
     // H+B
     if m.hawks == 1
         && m.bishops_maj >= 1
+        && m.bishops_min <= 1
         && m.queens == 0
         && m.rooks == 0
         && m.knights == 0
+        && m.chancellors == 0
+        && m.archbishops == 0
+        && m.guards == 0
         && m.pawns == 0
-        && no_exotic_pieces(m)
+        && m.amazons == 0
+        && m.knightriders == 0
+        && m.huygens == 0
     {
         return true;
     }
@@ -354,27 +210,38 @@ fn is_insufficient(m: &Mat) -> bool {
     // AB with pieces
     if m.archbishops == 1
         && m.bishops_maj >= 1
+        && m.bishops_min == 0
         && m.queens == 0
         && m.rooks == 0
         && m.knights == 0
+        && m.chancellors == 0
+        && m.hawks == 0
+        && m.guards == 0
         && m.pawns == 0
-        && no_exotic_pieces(m)
+        && m.amazons == 0
+        && m.knightriders == 0
+        && m.huygens == 0
     {
         return true;
     }
     if m.archbishops == 1
-        && m.knights >= 1
+        && m.knights <= 2
         && m.queens == 0
         && m.rooks == 0
         && m.bishops_maj == 0
         && m.bishops_min == 0
+        && m.chancellors == 0
+        && m.hawks == 0
+        && m.guards == 0
         && m.pawns == 0
-        && no_exotic_pieces(m)
+        && m.amazons == 0
+        && m.knightriders == 0
+        && m.huygens == 0
     {
         return true;
     }
 
-    // R alone (no companions)
+    // R alone
     if m.rooks == 1
         && m.queens == 0
         && m.knights == 0
@@ -386,7 +253,7 @@ fn is_insufficient(m: &Mat) -> bool {
         return true;
     }
 
-    // R+N alone (insufficient on unbounded board)
+    // R+N alone
     if m.rooks == 1
         && m.knights == 1
         && m.queens == 0
@@ -398,22 +265,10 @@ fn is_insufficient(m: &Mat) -> bool {
         return true;
     }
 
-    // R+single bishop (insufficient on unbounded board)
+    // R+single bishop
     if m.rooks == 1
         && m.bishops_maj + m.bishops_min == 1
         && m.queens == 0
-        && m.knights == 0
-        && m.pawns == 0
-        && no_exotic_pieces(m)
-    {
-        return true;
-    }
-
-    // Bishops alone or with specific patterns
-    if (m.bishops_maj >= 1 || m.bishops_min >= 1)
-        && m.bishops_min <= 1
-        && m.queens == 0
-        && m.rooks == 0
         && m.knights == 0
         && m.pawns == 0
         && no_exotic_pieces(m)
@@ -434,49 +289,51 @@ fn is_insufficient(m: &Mat) -> bool {
         return true;
     }
 
-    false
-}
-
-/// Bordered variant (smaller map).
-#[inline]
-fn is_insufficient_bordered(m: &Mat) -> bool {
-    // ===== SUFFICIENT CASES (return false) =====
-    // 3+ Archbishops
-    if m.archbishops >= 3
+    // Huygens 1-4 alone
+    if m.huygens >= 1
+        && m.huygens <= 4
         && m.queens == 0
         && m.rooks == 0
         && m.knights == 0
         && m.bishops_maj == 0
         && m.bishops_min == 0
         && m.chancellors == 0
-        && m.hawks == 0
-        && m.guards == 0
-        && m.pawns == 0
-        && m.amazons == 0
-        && m.knightriders == 0
-        && m.huygens == 0
-    {
-        return false;
-    }
-    // 2+ Chancellors
-    if m.chancellors >= 2
-        && m.queens == 0
-        && m.rooks == 0
-        && m.knights == 0
-        && m.bishops_maj == 0
-        && m.bishops_min == 0
         && m.archbishops == 0
         && m.hawks == 0
         && m.guards == 0
         && m.pawns == 0
         && m.amazons == 0
         && m.knightriders == 0
-        && m.huygens == 0
     {
-        return false;
+        return true;
     }
 
+    false
+}
+
+/// Bordered variant (smaller map).
+#[inline]
+fn is_insufficient_bordered(m: &Mat) -> bool {
     // ===== INSUFFICIENT CASES (return true) =====
+    // Huygens 1-4 alone (less than 5 is insufficient)
+    if m.huygens >= 1
+        && m.huygens <= 4
+        && m.queens == 0
+        && m.rooks == 0
+        && m.knights == 0
+        && m.bishops_maj == 0
+        && m.bishops_min == 0
+        && m.chancellors == 0
+        && m.archbishops == 0
+        && m.hawks == 0
+        && m.guards == 0
+        && m.pawns == 0
+        && m.amazons == 0
+        && m.knightriders == 0
+    {
+        return true;
+    }
+    
     // Only royals
     if no_exotic_pieces(m)
         && m.queens == 0
@@ -489,19 +346,24 @@ fn is_insufficient_bordered(m: &Mat) -> bool {
         return true;
     }
 
-    // Bishops only (any count)
-    if m.bishops_maj >= 1
+    // Bishops only (same color - insufficient; opposite color - sufficient)
+    if (m.bishops_maj >= 1 || m.bishops_min >= 1)
         && m.queens == 0
         && m.rooks == 0
         && m.knights == 0
         && m.pawns == 0
         && no_exotic_pieces(m)
     {
+        // Opposite-color bishops (both maj and min) are sufficient
+        if m.bishops_maj >= 1 && m.bishops_min >= 1 {
+            return false;
+        }
+        // Same-color bishops only are insufficient
         return true;
     }
 
     // 2 knights
-    if m.knights == 2
+    if m.knights <= 2
         && m.queens == 0
         && m.rooks == 0
         && m.bishops_maj == 0
@@ -520,7 +382,6 @@ fn is_insufficient_bordered(m: &Mat) -> bool {
 fn count_both(
     board: &Board,
     rules: &crate::game::GameRules,
-    best_promo: Option<PieceType>,
 ) -> (Mat, Mat) {
     let mut w = Mat::default();
     let mut b = Mat::default();
@@ -528,6 +389,8 @@ fn count_both(
     let mut w_db: u8 = 0;
     let mut b_lb: u8 = 0;
     let mut b_db: u8 = 0;
+    
+    let best_promo = get_best_promotion_piece(rules);
 
     for (x, y, piece) in board.iter() {
         let color = piece.color();
@@ -543,10 +406,9 @@ fn count_both(
         };
 
         let pt = piece.piece_type();
-        let ept = if pt == PieceType::Pawn {
-            best_promo
-                .filter(|_| can_pawn_promote(y, color, rules))
-                .unwrap_or(PieceType::Pawn)
+        let ept = if pt == PieceType::Pawn && can_pawn_promote(y, color, rules) {
+            // Pawn can promote: count as best promotion piece
+            best_promo.unwrap_or(PieceType::Queen)
         } else {
             pt
         };
@@ -637,8 +499,7 @@ pub fn evaluate_insufficient_material(game: &crate::game::GameState) -> bool {
 #[inline(always)]
 fn compute(game: &crate::game::GameState) -> bool {
     let bordered = crate::moves::get_world_size() <= 200;
-    let promo = get_best_promotion_piece(&game.game_rules);
-    let (w, b) = count_both(&game.board, &game.game_rules, promo);
+    let (w, b) = count_both(&game.board, &game.game_rules);
 
     let w_nr = w.non_royal();
     let b_nr = b.non_royal();
@@ -714,6 +575,361 @@ fn compute(game: &crate::game::GameState) -> bool {
     };
 
     w_insuff && b_insuff
+}
+
+/// Returns true if the combination of (attacker, defender) material represents
+/// a helpmate-possible endgame that game handlers should NOT auto-declare as a draw.
+/// Both `a` and `b` are already "individually insufficient" at this point.
+/// Detects cross-board combinations where helpmate is theoretically possible
+/// despite both sides being individually insufficient.
+#[inline]
+fn is_helpmate_only_combo(a: &Mat, b: &Mat, bordered: bool) -> bool {
+    // R+B vs Q (either direction)
+    let rb_vs_q = |x: &Mat, y: &Mat| {
+        x.rooks == 1
+            && (x.bishops_maj + x.bishops_min) == 1
+            && x.queens == 0
+            && x.knights == 0
+            && x.pawns == 0
+            && no_exotic_pieces(x)
+            && x.non_royal() == 2
+            && y.queens == 1
+            && y.rooks == 0
+            && y.knights == 0
+            && (y.bishops_maj + y.bishops_min) == 0
+            && y.pawns == 0
+            && no_exotic_pieces(y)
+            && y.non_royal() == 1
+    };
+    if rb_vs_q(a, b) || rb_vs_q(b, a) {
+        return true;
+    }
+
+    // R+N vs Q (either direction)
+    let rn_vs_q = |x: &Mat, y: &Mat| {
+        x.rooks == 1
+            && x.knights == 1
+            && x.queens == 0
+            && (x.bishops_maj + x.bishops_min) == 0
+            && x.pawns == 0
+            && no_exotic_pieces(x)
+            && x.non_royal() == 2
+            && y.queens == 1
+            && y.rooks == 0
+            && y.knights == 0
+            && (y.bishops_maj + y.bishops_min) == 0
+            && y.pawns == 0
+            && no_exotic_pieces(y)
+            && y.non_royal() == 1
+    };
+    if rn_vs_q(a, b) || rn_vs_q(b, a) {
+        return true;
+    }
+
+    // R+N vs R (either direction)
+    let rn_vs_r = |x: &Mat, y: &Mat| {
+        x.rooks == 1
+            && x.knights == 1
+            && x.queens == 0
+            && (x.bishops_maj + x.bishops_min) == 0
+            && x.pawns == 0
+            && no_exotic_pieces(x)
+            && x.non_royal() == 2
+            && y.rooks == 1
+            && y.queens == 0
+            && y.knights == 0
+            && (y.bishops_maj + y.bishops_min) == 0
+            && y.pawns == 0
+            && no_exotic_pieces(y)
+            && y.non_royal() == 1
+    };
+    if rn_vs_r(a, b) || rn_vs_r(b, a) {
+        return true;
+    }
+
+    // R+B vs R (either direction)
+    let rb_vs_r = |x: &Mat, y: &Mat| {
+        x.rooks == 1
+            && (x.bishops_maj + x.bishops_min) == 1
+            && x.queens == 0
+            && x.knights == 0
+            && x.pawns == 0
+            && no_exotic_pieces(x)
+            && x.non_royal() == 2
+            && y.rooks == 1
+            && y.queens == 0
+            && y.knights == 0
+            && (y.bishops_maj + y.bishops_min) == 0
+            && y.pawns == 0
+            && no_exotic_pieces(y)
+            && y.non_royal() == 1
+    };
+    if rb_vs_r(a, b) || rb_vs_r(b, a) {
+        return true;
+    }
+
+    // R+B vs B (either direction)
+    let rb_vs_b = |x: &Mat, y: &Mat| {
+        x.rooks == 1
+            && (x.bishops_maj + x.bishops_min) == 1
+            && x.queens == 0
+            && x.knights == 0
+            && x.pawns == 0
+            && no_exotic_pieces(x)
+            && x.non_royal() == 2
+            && (y.bishops_maj + y.bishops_min) == 1
+            && y.queens == 0
+            && y.rooks == 0
+            && y.knights == 0
+            && y.pawns == 0
+            && no_exotic_pieces(y)
+            && y.non_royal() == 1
+    };
+    if rb_vs_b(a, b) || rb_vs_b(b, a) {
+        return true;
+    }
+
+    // R+N vs B (either direction)
+    let rn_vs_b = |x: &Mat, y: &Mat| {
+        x.rooks == 1
+            && x.knights == 1
+            && x.queens == 0
+            && (x.bishops_maj + x.bishops_min) == 0
+            && x.pawns == 0
+            && no_exotic_pieces(x)
+            && x.non_royal() == 2
+            && (y.bishops_maj + y.bishops_min) == 1
+            && y.queens == 0
+            && y.rooks == 0
+            && y.knights == 0
+            && y.pawns == 0
+            && no_exotic_pieces(y)
+            && y.non_royal() == 1
+    };
+    if rn_vs_b(a, b) || rn_vs_b(b, a) {
+        return true;
+    }
+
+    // Two pieces vs pawn (pawn not yet promoted)
+    let rb_vs_p = |x: &Mat, y: &Mat| {
+        x.rooks == 1
+            && (x.bishops_maj + x.bishops_min) == 1
+            && x.queens == 0
+            && x.knights == 0
+            && x.pawns == 0
+            && no_exotic_pieces(x)
+            && x.non_royal() == 2
+            && y.pawns >= 1
+            && y.queens == 0
+            && y.rooks == 0
+            && y.knights == 0
+            && (y.bishops_maj + y.bishops_min) == 0
+            && no_exotic_pieces(y)
+            && y.non_royal() == y.pawns as u8
+    };
+    if rb_vs_p(a, b) || rb_vs_p(b, a) {
+        return true;
+    }
+
+    // Two pieces vs pawn (pawn not yet promoted)
+    let rn_vs_p = |x: &Mat, y: &Mat| {
+        x.rooks == 1
+            && x.knights == 1
+            && x.queens == 0
+            && (x.bishops_maj + x.bishops_min) == 0
+            && x.pawns == 0
+            && no_exotic_pieces(x)
+            && x.non_royal() == 2
+            && y.pawns >= 1
+            && y.queens == 0
+            && y.rooks == 0
+            && y.knights == 0
+            && (y.bishops_maj + y.bishops_min) == 0
+            && no_exotic_pieces(y)
+            && y.non_royal() == y.pawns as u8
+    };
+    if rn_vs_p(a, b) || rn_vs_p(b, a) {
+        return true;
+    }
+
+    // Bounded-only helpmate combos
+    if bordered {
+        // B vs B opposite colors (either direction)
+        let b_vs_b_opposite = |x: &Mat, y: &Mat| {
+            x.queens == 0
+                && x.rooks == 0
+                && x.knights == 0
+                && x.pawns == 0
+                && no_exotic_pieces(x)
+                && x.non_royal() == 1
+                && y.queens == 0
+                && y.rooks == 0
+                && y.knights == 0
+                && y.pawns == 0
+                && no_exotic_pieces(y)
+                && y.non_royal() == 1
+                && ((x.bishops_maj == 1 && x.bishops_min == 0 && y.bishops_maj == 0 && y.bishops_min == 1)
+                    || (x.bishops_maj == 0 && x.bishops_min == 1 && y.bishops_maj == 1 && y.bishops_min == 0))
+        };
+        if b_vs_b_opposite(a, b) || b_vs_b_opposite(b, a) {
+            return true;
+        }
+
+        // N vs B (either direction)
+        let n_vs_b = |x: &Mat, y: &Mat| {
+            x.knights == 1
+                && x.queens == 0
+                && x.rooks == 0
+                && (x.bishops_maj + x.bishops_min) == 0
+                && x.pawns == 0
+                && no_exotic_pieces(x)
+                && x.non_royal() == 1
+                && (y.bishops_maj + y.bishops_min) == 1
+                && y.queens == 0
+                && y.rooks == 0
+                && y.knights == 0
+                && y.pawns == 0
+                && no_exotic_pieces(y)
+                && y.non_royal() == 1
+        };
+        if n_vs_b(a, b) || n_vs_b(b, a) {
+            return true;
+        }
+
+        // N vs N (either direction)
+        let n_vs_n = |x: &Mat, y: &Mat| {
+            x.knights == 1
+                && x.queens == 0
+                && x.rooks == 0
+                && (x.bishops_maj + x.bishops_min) == 0
+                && x.pawns == 0
+                && no_exotic_pieces(x)
+                && x.non_royal() == 1
+                && y.knights == 1
+                && y.queens == 0
+                && y.rooks == 0
+                && (y.bishops_maj + y.bishops_min) == 0
+                && y.pawns == 0
+                && no_exotic_pieces(y)
+                && y.non_royal() == 1
+        };
+        if n_vs_n(a, b) || n_vs_n(b, a) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Game-handler variant of `compute`.  Uses raw pawn counts (no pawn→promotion
+/// substitution) and excludes cross-board combinations where helpmate is possible
+/// despite both sides being individually insufficient.
+#[inline(always)]
+fn compute_game_handler(game: &crate::game::GameState) -> bool {
+    let bordered = crate::moves::get_world_size() <= 200;
+    let (w, b) = count_both(&game.board, &game.game_rules);
+
+    let w_nr = w.non_royal();
+    let b_nr = b.non_royal();
+
+    // Special: only royals on both sides
+    if w_nr == 0 && b_nr == 0 {
+        if w.kings > 0 && b.kings > 0 && w.royal_centaurs == 0 && b.royal_centaurs == 0 {
+            return true;
+        }
+        if w.royal_centaurs > 0 && b.royal_centaurs > 0 && w.kings == 0 && b.kings == 0 {
+            return true;
+        }
+    }
+
+    // Special: royal centaur vs amazon (unbounded)
+    if !bordered {
+        if b.royal_centaurs == 1
+            && w.amazons == 1
+            && w_nr == 1
+            && b_nr == 0
+            && w.kings == 0
+            && w.royal_centaurs == 0
+            && b.kings == 0
+        {
+            return true;
+        }
+        if w.royal_centaurs == 1
+            && b.amazons == 1
+            && b_nr == 1
+            && w_nr == 0
+            && b.kings == 0
+            && b.royal_centaurs == 0
+            && w.kings == 0
+        {
+            return true;
+        }
+    }
+
+    // Cross-color: K+R vs K+R (unbounded)
+    if !bordered
+        && w.kings >= 1
+        && b.kings >= 1
+        && w.rooks == 1
+        && b.rooks == 1
+        && w_nr == 1
+        && b_nr == 1
+    {
+        return true;
+    }
+
+    // Special: 2K + R vs K
+    if w.kings >= 2 && w.rooks == 1 && w_nr == 1 && b.kings >= 1 && b_nr == 0 {
+        return false;
+    }
+    if b.kings >= 2 && b.rooks == 1 && b_nr == 1 && w.kings >= 1 && w_nr == 0 {
+        return false;
+    }
+
+    let w_insuff = if bordered {
+        is_insufficient_bordered(&w)
+    } else {
+        is_insufficient(&w)
+    };
+    if !w_insuff {
+        return false;
+    }
+    let b_insuff = if bordered {
+        is_insufficient_bordered(&b)
+    } else {
+        is_insufficient(&b)
+    };
+    if !b_insuff {
+        return false;
+    }
+
+    // Both sides are individually insufficient. Check for helpmate-only combos
+    // that game handlers must not auto-declare as draws.
+    if is_helpmate_only_combo(&w, &b, bordered) {
+        return false;
+    }
+
+    true
+}
+
+/// Returns true if the position is a draw by insufficient material for game
+/// handler purposes.  Unlike `evaluate_insufficient_material`, this function:
+///   - does NOT substitute pawns with their best promotion piece, and
+///   - does NOT classify helpmate-only endgames (R+B vs Q, R+N vs R,
+///     R+B vs unpromotable/non-queen-promotable P, R+N vs P) as draws.
+#[inline]
+pub fn evaluate_insufficient_material_game_handler(game: &crate::game::GameState) -> bool {
+    if (game.white_piece_count + game.black_piece_count) >= 6 {
+        return false;
+    }
+
+    if game.game_rules.white_win_condition != crate::game::WinCondition::Checkmate
+        || game.game_rules.black_win_condition != crate::game::WinCondition::Checkmate
+    {
+        return false;
+    }
+    
+    compute_game_handler(game)
 }
 
 #[cfg(test)]

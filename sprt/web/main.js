@@ -110,7 +110,7 @@ const CONFIG = {
     minGames: 500,
     maxMoves: 300,
     concurrency: navigator.hardwareConcurrency || 1,
-    materialThreshold: 2000,
+    materialThreshold: 0,
 
     searchNoise: 50,
 };
@@ -432,15 +432,15 @@ function generateICNFromWorkerLog(workerLog, gameIndex, result, newPlaysWhite, e
         } else if (endReason === 'checkmate') {
             termination = 'Checkmate';
         } else if (endReason === 'stalemate') {
-            termination = 'Draw by stalemate';
+            termination = 'Stalemate';
         } else if (endReason === 'threefold') {
-            termination = 'Draw by threefold repetition';
+            termination = 'Threefold repetition';
         } else if (endReason === 'fifty_move') {
-            termination = 'Draw by fifty-move rule';
+            termination = '50-move rule';
         } else if (endReason === 'insufficient_material') {
-            termination = 'Draw by insufficient material';
+            termination = 'Insufficient material';
         } else if (endReason === 'max_moves') {
-            termination = 'Draw by maximum moves reached';
+            termination = 'Maximum moves reached';
         }
 
         if (termination) {
@@ -843,7 +843,8 @@ async function runSprt() {
         CONFIG.concurrency = parseInt(rawConcurrency, 10) || 1;
     }
     CONFIG.minGames = parseInt(sprtMinGames.value, 10) || 500;
-    CONFIG.maxGames = parseInt(sprtMaxGames.value, 10) || 1000;
+    const maxGamesVal = (sprtMaxGames.value || '').trim().toLowerCase();
+    CONFIG.maxGames = (maxGamesVal === 'unlimited' || maxGamesVal === '') ? null : (Number.isFinite(parseInt(maxGamesVal, 10)) ? parseInt(maxGamesVal, 10) : null);
     const valMoves = parseInt(sprtMaxMoves.value, 10);
     CONFIG.maxMoves = (Number.isFinite(valMoves) && valMoves > 0) ? valMoves : Infinity;
     {
@@ -935,7 +936,8 @@ async function runSprt() {
     sprtStatusEl.textContent = 'Status: running...';
     sprtStatusEl.className = 'sprt-status';
     const sprtBaseSeed = Date.now() ^ ((Math.random() * 0xFFFFFFFF) | 0);
-    log('Starting SPRT: ' + maxGames + ' games (' + (maxGames / 2) + ' pairs), Mode=' + runConfig.tcMode + ', TC=' + displayTcString + ', Seed=' + sprtBaseSeed, 'info');
+    const gamesDisplay = maxGames === null ? 'unlimited' : maxGames + ' games (' + (maxGames / 2) + ' pairs)';
+    log('Starting SPRT: ' + gamesDisplay + ', Mode=' + runConfig.tcMode + ', TC=' + displayTcString + ', Seed=' + sprtBaseSeed, 'info');
     sprtLog('SPRT Test Started (noisy opening moves for first 8 ply, paired games)');
 
     const maxConcurrent = Math.max(1, runConfig.concurrency | 0);
@@ -945,7 +947,7 @@ async function runSprt() {
 
     function startWorker(worker, id) {
         const gameIndex = nextGameIndex++;
-        if (gameIndex >= maxGames) return false;
+        if (maxGames !== null && gameIndex >= maxGames) return false;
         activeWorkers++;
 
         // Get next variant from the LOCAL SNAPSHOT queue

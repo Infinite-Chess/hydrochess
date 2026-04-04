@@ -6,7 +6,7 @@ use crate::moves::{
     Move, MoveList, SpatialIndices, get_legal_moves, get_legal_moves_into,
     get_pseudo_legal_moves_for_piece_into, is_square_attacked,
 };
-use crate::utils::{is_prime_fast, is_prime_i64};
+use crate::utils::{PRIMES_UNDER_128, is_prime_fast, is_prime_i64};
 use arrayvec::ArrayVec;
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
@@ -1462,10 +1462,6 @@ impl GameState {
             return false;
         }
 
-        if crate::evaluation::insufficient_material::evaluate_insufficient_material(self) {
-            return true;
-        }
-
         // Draw by fifty-move rule: only if we aren't in checkmate
         if let Some(limit) = self.game_rules.move_rule_limit {
             // If not in check, rule50 draw is immediate.
@@ -2031,8 +2027,8 @@ impl GameState {
         let step_y = dy_check.signum();
 
         // SPECIAL CASE: Huygen checker - Fast Path
-        // Always active. Checks the first 128 primes from the checker towards the king.
-        // Handles both Huygens between and Huygens outside (jumping over checker).
+        // Always active. Checks all squares between king and checker for valid blocking.
+        // A square blocks if it's at a prime distance from the Huygen AND no closer prime-distance piece blocks it.
         if is_huygen_checker {
             use crate::utils::PRIMES_UNDER_128;
 
@@ -2043,8 +2039,6 @@ impl GameState {
                 checker_sq.y
             };
             let king_coord = if is_horizontal { king_sq.x } else { king_sq.y };
-            let dir_from_checker_to_king = (king_coord - checker_coord).signum();
-
             let line_vec = if is_horizontal {
                 self.spatial_indices.rows.get(&checker_sq.y)
             } else {
@@ -2067,8 +2061,9 @@ impl GameState {
                         Coordinate::new(checker_sq.x, our_huygen_coord)
                     };
 
-                    'outer_huygen_fast: for &p_from_checker in &PRIMES_UNDER_128 {
-                        let block_coord = checker_coord + dir_from_checker_to_king * p_from_checker;
+                    // Iterate through all primes from the Huygen to find valid blocking squares
+                    'outer_huygen_fast: for &p_from_huygen in &PRIMES_UNDER_128 {
+                        let block_coord = our_huygen_coord + (if our_huygen_coord < king_coord { 1 } else { -1 }) * p_from_huygen;
 
                         // Must be between king and checker
                         let block_between = if checker_coord > king_coord {
@@ -2077,14 +2072,6 @@ impl GameState {
                             block_coord < king_coord && block_coord > checker_coord
                         };
                         if !block_between {
-                            let past_king = if checker_coord > king_coord {
-                                block_coord <= king_coord
-                            } else {
-                                block_coord >= king_coord
-                            };
-                            if past_king {
-                                break;
-                            }
                             continue;
                         }
 
@@ -2103,17 +2090,7 @@ impl GameState {
                             continue;
                         }
 
-                        let dist_from_huygen = (block_coord - our_huygen_coord).abs();
-                        if dist_from_huygen == 0 {
-                            continue;
-                        }
-
-                        // Use robust prime check for distance from Huygen
-                        if !is_prime_i64(dist_from_huygen) {
-                            continue;
-                        }
-
-                        // Blocker check (ignore checker since it's the checker)
+                        // Blocker check: verify no closer prime-distance piece blocks this square
                         let dir_to_block = (block_coord - our_huygen_coord).signum();
                         for j in 0..vec.len() {
                             let other_coord = vec.coords[j];
@@ -2127,7 +2104,7 @@ impl GameState {
                             }
 
                             let other_dist = (other_coord - our_huygen_coord).abs();
-                            if other_dist >= dist_from_huygen {
+                            if other_dist >= p_from_huygen {
                                 continue;
                             }
 
@@ -2201,7 +2178,6 @@ impl GameState {
 
                 if is_horizontal_check {
                     // Check ray is horizontal at y = king_sq.y = checker_sq.y
-                    // Ortho slider can block by moving vertically to y = king_sq.y
                     if from.y != king_sq.y {
                         // Slider is NOT on the check ray - can it move to it?
                         // Destination is (from.x, king_sq.y) if path is clear
@@ -2216,23 +2192,35 @@ impl GameState {
                         };
 
                         if between {
-                            // Check if distance from checker is prime
+                            // Must be at a prime distance from the checker (Huygen)
                             let dist_from_checker = (checker_sq.x - tx).abs();
                             if is_prime_fast(dist_from_checker) {
-                                // Check path is clear (vertical move)
                                 if s.is_path_clear_for_rook(&from, &Coordinate::new(tx, ty)) {
                                     out.push(Move::new(from, Coordinate::new(tx, ty), *piece));
                                 }
                             }
                         }
                     } else {
-                        // Slider IS on the check ray - can slide horizontally to prime distance
-                        // Already handled by general Huygen blocking below
+                        // Slider IS on the check ray - iterate primes from checker to find blocking squares
+                        for &prime in &PRIMES_UNDER_128 {
+                            if prime >= check_dist {
+                                break;
+                            }
+                            // Blocking square is at prime distance from checker, toward king
+                            let tx = checker_sq.x - step_x * prime;
+                            let ty = king_sq.y;
+                            if tx == from.x {
+                                continue;
+                            }
+                            if s.is_path_clear_for_rook(&from, &Coordinate::new(tx, ty)) {
+                                out.push(Move::new(from, Coordinate::new(tx, ty), *piece));
+                            }
+                        }
                     }
                 } else {
                     // Check ray is vertical at x = king_sq.x = checker_sq.x
-                    // Ortho slider can block by moving horizontally to x = king_sq.x
                     if from.x != king_sq.x {
+                        // Slider is NOT on the check ray - can it move to it?
                         let tx = king_sq.x;
                         let ty = from.y;
 
@@ -2247,6 +2235,22 @@ impl GameState {
                             if is_prime_fast(dist_from_checker)
                                 && s.is_path_clear_for_rook(&from, &Coordinate::new(tx, ty))
                             {
+                                out.push(Move::new(from, Coordinate::new(tx, ty), *piece));
+                            }
+                        }
+                    } else {
+                        // Slider IS on the check ray - iterate primes from checker to find blocking squares
+                        for &prime in &PRIMES_UNDER_128 {
+                            if prime >= check_dist {
+                                break;
+                            }
+                            // Blocking square is at prime distance from checker, toward king
+                            let tx = king_sq.x;
+                            let ty = checker_sq.y - step_y * prime;
+                            if ty == from.y {
+                                continue;
+                            }
+                            if s.is_path_clear_for_rook(&from, &Coordinate::new(tx, ty)) {
                                 out.push(Move::new(from, Coordinate::new(tx, ty), *piece));
                             }
                         }
@@ -4247,13 +4251,42 @@ impl GameState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    static BOUNDS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn get_bounds_lock() -> &'static Mutex<()> {
+        BOUNDS_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Helper to reset world bounds to defaults
+    fn reset_world_bounds() {
+        crate::moves::set_world_bounds(
+            -1_000_000_000_000_000,
+            1_000_000_000_000_000,
+            -1_000_000_000_000_000,
+            1_000_000_000_000_000,
+        );
+    }
+
+    /// Helper to acquire bounds lock for tests that modify bounds
+    fn with_bounds_lock<F, R>(f: F) -> R
+    where
+        F: FnOnce() -> R,
+    {
+        let _guard = get_bounds_lock().lock().unwrap_or_else(|e| e.into_inner());
+        f()
+    }
 
     /// Helper to create a minimal game state for testing
     fn create_test_game() -> GameState {
+        reset_world_bounds();
         create_test_game_from_icn("w (8;q|1;q) K5,1|k5,8")
     }
 
     fn create_test_game_from_icn(icn: &str) -> GameState {
+        reset_world_bounds();
         let mut game = GameState::new();
         game.setup_position_from_icn(icn);
         game
@@ -4261,45 +4294,49 @@ mod tests {
 
     #[test]
     fn test_parse_icn_full() {
-        let icn = "[Event \"Complex Game\"] w 10,3 5/100 1 (8;am,q|1;am,q) -100,500,-35,100 checkmate,royalcapture,allroyalscaptured,allpiecescaptured K5,1+|k5,8+";
+        with_bounds_lock(|| {
+            reset_world_bounds();
+            let icn = "[Event \"Complex Game\"] w 10,3 5/100 1 (8;am,q|1;am,q) -100,500,-35,100 checkmate,royalcapture,allroyalscaptured,allpiecescaptured K5,1+|k5,8+";
+            let mut game = GameState::new();
+            game.setup_position_from_icn(icn);
 
-        let mut game = GameState::new();
-        game.setup_position_from_icn(icn);
+            // Check header info
+            assert_eq!(game.turn, PlayerColor::White);
+            assert_eq!(game.halfmove_clock, 5);
+            assert_eq!(game.game_rules.move_rule_limit, Some(100));
+            assert_eq!(game.fullmove_number, 1);
+            assert_eq!(game.white_promo_rank, 8);
+            assert_eq!(game.black_promo_rank, 1);
 
-        // Check header info
-        assert_eq!(game.turn, PlayerColor::White);
-        assert_eq!(game.halfmove_clock, 5);
-        assert_eq!(game.game_rules.move_rule_limit, Some(100));
-        assert_eq!(game.fullmove_number, 1);
-        assert_eq!(game.white_promo_rank, 8);
-        assert_eq!(game.black_promo_rank, 1);
+            // En passant square (10,3). White turn, so Black pawn just moved 10,4->10,2.
+            // Pawn being captured is at 10,2.
+            let ep = game.en_passant.unwrap();
+            assert_eq!(ep.square, Coordinate::new(10, 3));
+            assert_eq!(ep.pawn_square, Coordinate::new(10, 2));
 
-        // En passant square (10,3). White turn, so Black pawn just moved 10,4->10,2.
-        // Pawn being captured is at 10,2.
-        let ep = game.en_passant.unwrap();
-        assert_eq!(ep.square, Coordinate::new(10, 3));
-        assert_eq!(ep.pawn_square, Coordinate::new(10, 2));
+            // Check world bounds
+            let (min_x, max_x, min_y, max_y) = crate::moves::get_coord_bounds();
+            assert_eq!(min_x, -100);
+            assert_eq!(max_x, 500);
+            assert_eq!(min_y, -35);
+            assert_eq!(max_y, 100);
 
-        // Check world bounds
-        let (min_x, max_x, min_y, max_y) = crate::moves::get_coord_bounds();
-        assert_eq!(min_x, -100);
-        assert_eq!(max_x, 500);
-        assert_eq!(min_y, -35);
-        assert_eq!(max_y, 100);
+            // Check win conditions
+            // Priority: Checkmate
+            assert_eq!(game.game_rules.white_win_condition, WinCondition::Checkmate);
+            assert_eq!(game.game_rules.black_win_condition, WinCondition::Checkmate);
 
-        // Check win conditions
-        // Priority: Checkmate
-        assert_eq!(game.game_rules.white_win_condition, WinCondition::Checkmate);
-        assert_eq!(game.game_rules.black_win_condition, WinCondition::Checkmate);
+            // Check allowed promotions
+            let allowed = game.game_rules.promotions_allowed.as_ref().unwrap();
+            assert!(allowed.contains(&"am".to_string()));
+            assert!(allowed.contains(&"q".to_string()));
 
-        // Check allowed promotions
-        let allowed = game.game_rules.promotions_allowed.as_ref().unwrap();
-        assert!(allowed.contains(&"am".to_string()));
-        assert!(allowed.contains(&"q".to_string()));
-
-        // Check pieces
-        let k = game.board.get_piece(5, 1).unwrap();
-        assert_eq!(k.piece_type(), PieceType::King);
+            // Check pieces
+            let k = game.board.get_piece(5, 1).unwrap();
+            assert_eq!(k.piece_type(), PieceType::King);
+            
+            reset_world_bounds();
+        });
     }
 
     // ======================== 50-Move Rule Tests ========================
@@ -4763,29 +4800,32 @@ mod tests {
 
     #[test]
     fn test_setup_standard_chess() {
-        let mut game = GameState::new();
-        game.setup_standard_chess();
+        with_bounds_lock(|| {
+            reset_world_bounds();
+            let mut game = GameState::new();
+            game.setup_standard_chess();
 
-        // Check piece counts
-        assert_eq!(game.white_piece_count, 16);
-        assert_eq!(game.black_piece_count, 16);
+            // Check piece counts
+            assert_eq!(game.white_piece_count, 16);
+            assert_eq!(game.black_piece_count, 16);
 
-        // Check king positions
-        assert_eq!(
-            game.white_royals.first().copied(),
-            Some(Coordinate::new(5, 1))
-        );
-        assert_eq!(
-            game.black_royals.first().copied(),
-            Some(Coordinate::new(5, 8))
-        );
+            // Check king positions
+            assert_eq!(
+                game.white_royals.first().copied(),
+                Some(Coordinate::new(5, 1))
+            );
+            assert_eq!(
+                game.black_royals.first().copied(),
+                Some(Coordinate::new(5, 8))
+            );
 
-        // Check it's white's turn
-        assert_eq!(game.turn, PlayerColor::White);
+            // Check it's white's turn
+            assert_eq!(game.turn, PlayerColor::White);
 
-        // Check promotion ranks set
-        assert_eq!(game.white_promo_rank, 8);
-        assert_eq!(game.black_promo_rank, 1);
+            // Check promotion ranks set
+            assert_eq!(game.white_promo_rank, 8);
+            assert_eq!(game.black_promo_rank, 1);
+        });
     }
 
     #[test]
@@ -5091,25 +5131,25 @@ mod tests {
 
     #[test]
     fn test_is_draw_king_vs_king() {
-        let mut game = create_test_game_from_icn("w (8;q|1;q) K5,1|k5,8");
+        let game = create_test_game_from_icn("w (8;q|1;q) K5,1|k5,8");
 
-        assert!(game.is_draw(5, false));
+        assert!(crate::evaluation::insufficient_material::evaluate_insufficient_material(&game));
     }
 
     #[test]
     fn test_is_draw_with_non_pawn_material() {
-        let mut game = create_test_game_from_icn("w (8;q|1;q) K5,1|k5,8|R4,1");
+        let game = create_test_game_from_icn("w (8;q|1;q) K5,1|k5,8|R4,1");
 
         // With rook material, not a draw
-        let result = game.is_draw(5, false);
+        let result = crate::evaluation::insufficient_material::evaluate_insufficient_material(&game);
         // Just verify it returns a boolean without panicking
         let _ = result;
     }
 
     #[test]
     fn test_is_draw_returns_boolean() {
-        let mut game = create_test_game_from_icn("w (8;q|1;q) K5,1|k5,8");
-        let is_draw = game.is_draw(5, false);
+        let game = create_test_game_from_icn("w (8;q|1;q) K5,1|k5,8");
+        let is_draw = crate::evaluation::insufficient_material::evaluate_insufficient_material(&game);
 
         // Should return true for K vs K
         assert_eq!(is_draw, true);
