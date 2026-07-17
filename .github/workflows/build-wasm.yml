@@ -3,7 +3,7 @@ name: Build & Release WASM Engine
 # Run this when code is pushed to the main branch
 on:
   push:
-    branches: ['main']
+    branches: ["main"]
   # Also allow clicking a button to run manually
   workflow_dispatch:
 
@@ -24,22 +24,33 @@ jobs:
       - name: Build WASM (Web Target)
         run: wasm-pack build --target web
 
+      - name: Read version from Cargo.toml
+        id: version
+        run: |
+          # Read the crate version so the release tag carries the real Cargo version,
+          # and suffix +build.<run_number> so every rebuild is a unique staleness key.
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/^version *= *"([^"]+)".*/\1/')
+          echo "tag=v${VERSION}+build.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          # Increment the v.1.0.X version based on the run number
-          tag_name: v1.0.${{ github.run_number }}
-          name: v1.0.${{ github.run_number }}
+          # e.g. v2.0.0+build.47 — the consumer strips the leading v and everything from
+          # + onward for the display version, and uses the full tag as the staleness key.
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
           draft: false
           prerelease: false
+          # snippets/** carries the rayon worker helper needed for the multithreaded build.
           files: |
-            pkg/hydrochess_wasm_bg.wasm
-            pkg/hydrochess_wasm.js
-            
+            pkg/apeiron_bg.wasm
+            pkg/apeiron.js
+            pkg/snippets/**
+
       - name: Trigger infinitechess.org deploy
         run: |
-            curl -s -X POST \
-              -H "Authorization: Bearer ${{ secrets.INFINITECHESS_DISPATCH_TOKEN }}" \
-              -H "Accept: application/vnd.github.v3+json" \
-              https://api.github.com/repos/Infinite-Chess/infinitechess.org/actions/workflows/deploy.yml/dispatches \
-              -d '{"ref":"prod"}'
+          curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.INFINITECHESS_DISPATCH_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/Infinite-Chess/infinitechess.org/actions/workflows/deploy.yml/dispatches \
+            -d '{"ref":"prod"}'
