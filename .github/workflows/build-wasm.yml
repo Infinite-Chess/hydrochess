@@ -32,6 +32,12 @@ jobs:
           VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/^version *= *"([^"]+)".*/\1/')
           echo "tag=v${VERSION}+build.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
 
+      - name: Zip pkg/
+        run: |
+          # One zip preserves the snippets/ tree that apeiron.js imports; loose release
+          # assets are flat and would drop it. -x drops dotfiles (e.g. pkg/.gitignore).
+          cd pkg && zip -r ../apeiron-wasm.zip . -x ".*"
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
@@ -41,11 +47,10 @@ jobs:
           name: ${{ steps.version.outputs.tag }}
           draft: false
           prerelease: false
-          # snippets/** carries the rayon worker helper needed for the multithreaded build.
+          # Single archive of the full pkg/ (apeiron.js, apeiron_bg.wasm, snippets/, …).
+          # Fixed name — the version lives in the tag, so no need to embed it here.
           files: |
-            pkg/apeiron_bg.wasm
-            pkg/apeiron.js
-            pkg/snippets/**
+            apeiron-wasm.zip
 
       - name: Trigger infinitechess.org deploy
         run: |
